@@ -1,0 +1,17 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended"],
+  // O manager "dockerfile" do Renovate reconhece nativamente linhas
+  // `FROM imagem:tag@sha256:digest` e abre PR quando o digest upstream
+  // muda — é o mesmo mecanismo que o dakota-prime usa para acompanhar
+  // o dakota-gaming:stable. O CI (build.yml) builda e publica a partir
+  // desse PR; não há rebuild automático "silencioso" sem PR revisável.
+  packageRules: [
+    {
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["ghcr.io/projectbluefin/dakota"],
+      groupName: "dakota base image",
+      commitMessagePrefix: "chore(base):",
+    },
+  ],
+}

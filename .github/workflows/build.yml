@@ -1,0 +1,41 @@
+name: Build and publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Cobre o caso do Renovate ter atualizado o digest do dakota:stable
+    # (ver renovate.json5) — sem isso, o kmod NVIDIA ficaria compilado
+    # contra um kernel velho até alguém abrir um push manual.
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: ghcr.io/lbssousa/dakota-nvidia-580
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          podman build \
+            --file Containerfile \
+            --tag "${IMAGE_NAME}:stable" \
+            .
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        run: podman push "${IMAGE_NAME}:stable"
