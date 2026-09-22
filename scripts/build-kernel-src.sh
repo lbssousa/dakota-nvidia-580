@@ -50,6 +50,14 @@ cd "${workdir}"
 if [[ "${kver}" == *-ogc* ]]; then
     echo "==> ${kver} looks like an Open Gaming Collective (OGC) kernel; cloning github.com/OpenGamingCollective/linux.git"
     git clone --branch "v${kver}" --depth 1 https://github.com/OpenGamingCollective/linux.git src
+    # scripts/setlocalversion appends a '+' to kernelrelease whenever a
+    # .git directory is present and the tree doesn't look like a clean
+    # checkout of an exact tag -- confirmed by actually hitting this in
+    # CI: a --depth 1 clone still tripped it ('7.2.6-ogc1+' vs. the
+    # running kernel's '7.2.6-ogc1'), failing the vermagic-match check
+    # below. Removing .git makes this identical to the tarball path
+    # below, which never had this problem (no git metadata to inspect).
+    rm -rf src/.git
 else
     series="${kver%%.*}"
     echo "==> ${kver} looks like a plain upstream release; downloading vanilla kernel.org source (series ${series}.x)"
@@ -126,18 +134,27 @@ make -j"$(nproc)" vmlinux
 # here -- confirmed by actually hitting this: it builds every vendor GPU
 # driver enabled in this everything-enabled .config too (amdgpu alone is
 # one of the largest drivers in the kernel tree), and OOM-killed this
-# stage. On Dakota's shipped .config, CONFIG_DRM=y and
-# CONFIG_DRM_KMS_HELPER=y are both built-in already (so `make vmlinux`
-# above already covers their exports; also confirmed by hitting this --
-# `make drm.ko drm_kms_helper.ko` fails outright with "no rule to make
-# target drm.o", since a =y option has no .ko to build at all). Only
-# CONFIG_DRM_TTM_HELPER=m is an actual loadable module, and
-# drm_fbdev_ttm.o (the file providing the undefined symbol) belongs to
-# it (`drm_ttm_helper-$(CONFIG_DRM_FBDEV_EMULATION) += drm_fbdev_ttm.o`
-# in drivers/gpu/drm/Makefile upstream) -- so it's the only target
-# actually needed here.
-echo "==> Building drm_ttm_helper.ko so nvidia-drm.ko's DRM-core dependency lands in Module.symvers..."
-make -j"$(nproc)" drivers/gpu/drm/drm_ttm_helper.ko
+# stage on a memory-constrained machine. On Dakota's shipped .config,
+# CONFIG_DRM=y and CONFIG_DRM_KMS_HELPER=y are both built-in already (so
+# `make vmlinux` above already covers their exports; also confirmed by
+# hitting this -- `make drm.ko drm_kms_helper.ko` fails outright with
+# "no rule to make target drm.o", since a =y option has no .ko to build
+# at all). CONFIG_DRM_TTM_HELPER=m is an actual loadable module, and
+# drm_fbdev_ttm.o (the file providing nvidia-drm.ko's undefined symbol)
+# belongs to it (`drm_ttm_helper-$(CONFIG_DRM_FBDEV_EMULATION) +=
+# drm_fbdev_ttm.o` in drivers/gpu/drm/Makefile upstream).
+#
+# drm_ttm_helper.ko itself then needs drivers/gpu/drm/ttm/ttm.ko
+# (CONFIG_DRM_TTM=m too) -- confirmed by hitting this next: modpost
+# reported ttm_bo_vunmap/ttm_bo_mmap_obj/ttm_bo_vmap undefined in
+# drm_ttm_helper.ko, all from drivers/gpu/drm/ttm/ttm_bo_vm.o (per
+# drivers/gpu/drm/ttm/Makefile's `ttm-y := ... ttm_bo_vm.o ...`, built
+# under obj-$(CONFIG_DRM_TTM) += ttm.o). Same shape of fix as
+# drm_ttm_helper.ko itself: find the owning module from the kernel's own
+# subsystem Makefile, add it as another scoped target -- not a blanket
+# `make modules`.
+echo "==> Building ttm.ko + drm_ttm_helper.ko so nvidia-drm.ko's DRM-core dependencies land in Module.symvers..."
+make -j"$(nproc)" drivers/gpu/drm/ttm/ttm.ko drivers/gpu/drm/drm_ttm_helper.ko
 
 # Modern kbuild (confirmed on 7.2.6) names `make vmlinux`'s modpost output
 # vmlinux.symvers, not Module.symvers -- the latter is only materialized
@@ -169,9 +186,9 @@ mkdir -p "${targetdir}"
 # Mirrors freedesktop-sdk's own linux.bst / linux-ogc.bst install-commands
 # 'to_copy' list exactly — this is the artifact shape nvidia-drivers.bst
 # itself compiles against upstream. Module.symvers here comes from `make
-# vmlinux` + drm_ttm_helper.ko above (vmlinux's built-in exports plus that
-# one module's — not every loadable module — see README.md for what
-# that still doesn't cover).
+# vmlinux` + ttm.ko + drm_ttm_helper.ko above (vmlinux's built-in
+# exports plus those two modules' — not every loadable module — see
+# README.md for what that still doesn't cover).
 to_copy=(
     Makefile
     .config

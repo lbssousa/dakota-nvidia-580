@@ -90,11 +90,12 @@ shipped `.config`, runs `make olddefconfig` + `make modules_prepare`,
 then **actually builds `vmlinux`** (needed for a real `Module.symvers`
 — see ["Known risks"](#known-risks-not-fully-validated) for why a
 lighter `modules_prepare`-only tree turned out not to be enough) plus
-`drivers/gpu/drm/drm_ttm_helper.ko` (the one DRM subsystem piece that's
-a loadable module rather than built into `vmlinux` on Dakota's shipped
-`.config`), and assembles `/usr/src/linux-<kver>/` with the same file
-list `linux.bst`/`linux-ogc.bst` themselves copy — reproducing their
-exact artifact shape.
+`drivers/gpu/drm/ttm/ttm.ko` and `drivers/gpu/drm/drm_ttm_helper.ko`
+(the DRM subsystem pieces that are loadable modules rather than built
+into `vmlinux` on Dakota's shipped `.config`), and assembles
+`/usr/src/linux-<kver>/` with the same file list
+`linux.bst`/`linux-ogc.bst` themselves copy — reproducing their exact
+artifact shape.
 
 Run this to confirm a given image still ships the `.config` this
 approach depends on (it's a much weaker requirement than the old
@@ -212,26 +213,34 @@ compilation at all.
 
 ## Known risks, not fully validated
 
-- **The last validation step (linking `vmlinux`, and therefore a true
-  end-to-end build) could not be completed in the session that wrote
-  this section, purely due to machine memory — not a remaining code
-  gap.** `make vmlinux` on Dakota's shipped, everything-enabled
-  `.config` needs several GB of RAM for its single (non-parallel)
-  final link step; on a 15 GB desktop machine with normal desktop
-  usage running alongside it, this repeatedly got OOM-killed at
-  exactly that step, even with other memory freed up beforehand.
-  Everything **upstream** of that link (fetching the right kernel
-  source, `olddefconfig`, `modules_prepare`, and — separately —
-  actually compiling and linking all four NVIDIA kernel modules
-  against a tree assembled this same way in an earlier, successful
-  run) was individually confirmed working by actually running it.
-  **Treat the current `Containerfile` as: all identified build/compile
-  issues diagnosed and fixed with real evidence, but the full pipeline
-  has not been run to completion in one pass.** Confirm this on a
-  machine with more headroom, or in CI (GitHub-hosted runners
-  currently ship 16 GB, which should clear this) before trusting a
-  published image. If you hit the same OOM building locally, close
-  memory-heavy applications first or add swap.
+- **`make vmlinux` needs several GB of RAM for its single
+  (non-parallel) final link step** — confirmed repeatedly OOM-killing
+  on a 15 GB desktop machine with normal desktop usage running
+  alongside it, but linking cleanly in ~30s on GitHub Actions'
+  GitHub-hosted runners (16 GB) in CI. If you hit this building
+  locally, close memory-heavy applications first, add swap, or just
+  let CI do it.
+- **Gaming variant: a shallow `git clone` of the OGC kernel leaves
+  `kernelrelease` with a trailing `+`** (`7.2.6-ogc1+` instead of
+  `7.2.6-ogc1`) — confirmed hitting this in CI. `scripts/setlocalversion`
+  appends `+` whenever a `.git` directory is present and the tree
+  doesn't look like a clean tag checkout, regardless of
+  `CONFIG_LOCALVERSION_AUTO` (unset for the OGC variant) — even a
+  `--depth 1` clone of the exact tag trips it. `build-kernel-src.sh`
+  now deletes `.git` right after cloning, matching the vanilla
+  kernel.org tarball path (no `.git` there either, and it never had
+  this problem) — the kernelrelease-matches-`<kver>` check right after
+  is exactly what caught this.
+- **`drivers/gpu/drm/drm_ttm_helper.ko` itself needed
+  `drivers/gpu/drm/ttm/ttm.ko`** (`CONFIG_DRM_TTM=m` too) — confirmed
+  hitting this next, in CI, once the OGC fix above got past the
+  previous error: modpost reported `ttm_bo_vunmap`/`ttm_bo_mmap_obj`/
+  `ttm_bo_vmap` undefined in `drm_ttm_helper.ko`, all from
+  `drivers/gpu/drm/ttm/ttm_bo_vm.o`. Both are now built explicitly.
+  This dependency-discovery process (build, read the next
+  undefined-symbol error, find its owning module in the kernel's own
+  subsystem `Makefile`, add one more scoped target) might not be fully
+  exhausted yet — see the next point.
 - **NVIDIA's legacy 580.xxx driver needs patching for kernel 7.x, and
   the exact set of fixes is pinned to driver 580.173.02 — re-derive
   them if you bump `NVIDIA_VERSION`.** Confirmed by actually building
@@ -262,21 +271,23 @@ compilation at all.
     an unrelated `vm_fault_t` conflict on a file that otherwise builds
     clean — header-inclusion order for out-of-tree NVIDIA sources is
     apparently fragile enough that global `-include` isn't safe here.
-  - `drivers/gpu/drm/drm_ttm_helper.ko` built explicitly in
-    `kernel-src-builder` (see above) — `nvidia-drm.ko` needs
+  - `drivers/gpu/drm/ttm/ttm.ko` and `drivers/gpu/drm/drm_ttm_helper.ko`
+    built explicitly in `kernel-src-builder` (see above and "Known
+    risks" below) — `nvidia-drm.ko` needs
     `drm_fbdev_ttm_driver_fbdev_probe`, exported only by that module on
     Dakota's `.config` (`CONFIG_DRM=y`, `CONFIG_DRM_KMS_HELPER=y` are
-    both built into `vmlinux` already; only `CONFIG_DRM_TTM_HELPER=m`
-    is a real loadable module). Building the whole `drivers/gpu/drm/`
-    directory instead (a first attempt) OOM-killed the build outright
-    — it compiles every vendor GPU driver enabled in this
-    everything-enabled `.config` too, `amdgpu` included.
-- **`kernel-src-builder` covers `vmlinux` + `drm_ttm_helper.ko`'s
-  exports, not literally every loadable module's.** If a future NVIDIA
-  driver version (or a kernel bump) needs a symbol from some *other*
-  loadable module, the fix is the same shape as the `drm_ttm_helper.ko`
-  one above: find the owning module from the undefined-symbol name and
-  the kernel's own subsystem `Makefile`, then add a scoped
+    both built into `vmlinux` already; only `CONFIG_DRM_TTM=m` and
+    `CONFIG_DRM_TTM_HELPER=m` are real loadable modules). Building the
+    whole `drivers/gpu/drm/` directory instead (a first attempt)
+    OOM-killed the build outright on a memory-constrained machine — it
+    compiles every vendor GPU driver enabled in this everything-enabled
+    `.config` too, `amdgpu` included.
+- **`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
+  `drm_ttm_helper.ko`'s exports, not literally every loadable module's.**
+  If a future NVIDIA driver version (or a kernel bump) needs a symbol
+  from some *other* loadable module, the fix is the same shape as those
+  two: find the owning module from the undefined-symbol name and the
+  kernel's own subsystem `Makefile`, then add a scoped
   `make path/to/that.ko` — not a blanket `make modules`, which is
   prohibitively slow and memory-hungry against this `.config`.
 - **`CONFIG_RUST` is force-disabled** in the reconstructed tree
