@@ -42,13 +42,14 @@ Like the upstream project, this repo builds two variants from the same
 
 Both variants build and publish successfully end-to-end in CI
 (`.github/workflows/build.yml`) — see run
-[`35776779473`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35776779473).
-The container image builds and all four NVIDIA kernel modules
+[`35787487801`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35787487801).
+The container image builds, all four NVIDIA kernel modules
 (`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
-compile and link. Image signing and SBOM generation/attestation (see
-["Verification"](#verification)) were added after that run and haven't
-been exercised in CI yet. **Nothing here has been booted on real
-Dakota hardware yet** — see ["Known limitations"](#known-limitations)
+compile and link, and both images are signed with a valid SBOM
+attestation (see ["Verification"](#verification)) — confirmed with
+`cosign verify`/`cosign verify-attestation` against the published
+images. **Nothing here has been booted on real Dakota hardware yet**
+— see ["Known limitations"](#known-limitations)
 below.
 
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
@@ -399,14 +400,19 @@ and baked into the image itself at
 the signature automatically, reporting `ostree-image-signed:` instead
 of `ostree-unverified-registry:`, and refuses an unsigned image.
 
-To verify manually:
+To verify manually (`--insecure-ignore-tlog` is required: signing runs
+with `--tlog-upload=false`, so there's no Rekor transparency-log entry
+to check against — the name is misleading here, verification against
+`cosign.pub` still happens and still fails on a bad signature):
 
 ```bash
-cosign verify --key cosign.pub ghcr.io/lbssousa/dakota-nvidia-580:stable
-cosign verify --key cosign.pub ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
+cosign verify --key cosign.pub --insecure-ignore-tlog=true \
+  ghcr.io/lbssousa/dakota-nvidia-580:stable
+cosign verify --key cosign.pub --insecure-ignore-tlog=true \
+  ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
 
 # SBOM attestation:
-cosign verify-attestation --key cosign.pub --type spdxjson \
+cosign verify-attestation --key cosign.pub --type spdxjson --insecure-ignore-tlog=true \
   ghcr.io/lbssousa/dakota-nvidia-580:stable
 ```
 
