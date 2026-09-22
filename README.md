@@ -211,15 +211,34 @@ upstream source + the image's own shipped `.config` (see above) — plus
 unpacking Epson's binary `epson-printer-utility` RPM, which needs no
 compilation at all.
 
-## Known risks, not fully validated
+## Build status
+
+**Both variants build and publish successfully end-to-end in CI as of
+this writing** — `.github/workflows/build.yml` run
+[`35776779473`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35776779473)
+completed `Build image` → `Log in to GHCR` → `Push image` for both
+`standard` and `gaming` cleanly. That's the only claim this section
+makes: the container image builds and the four NVIDIA kernel modules
+(`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
+compile and link. **Nothing below has been booted on real Dakota
+hardware yet** — see the hardware-validation risks further down.
+
+Getting here took several rounds of "build it, read the exact error,
+fix that one thing" against real CI runs, not guesswork — kept below
+as a debugging trail, both for future-you when a base image or driver
+version bump breaks something, and because the same *shape* of fix
+(find the undefined symbol's owning module in the kernel's own
+subsystem `Makefile`, add one more scoped `make path/to/that.ko`
+target) is exactly what the next dependency gap, whenever it shows up,
+will need again:
 
 - **`make vmlinux` needs several GB of RAM for its single
   (non-parallel) final link step** — confirmed repeatedly OOM-killing
   on a 15 GB desktop machine with normal desktop usage running
-  alongside it, but linking cleanly in ~30s on GitHub Actions'
-  GitHub-hosted runners (16 GB) in CI. If you hit this building
-  locally, close memory-heavy applications first, add swap, or just
-  let CI do it.
+  alongside it, but linking cleanly in well under a minute on
+  GitHub Actions' hosted runners (16 GB) in CI. If you hit this
+  building locally, close memory-heavy applications first, add swap,
+  or just let CI do it.
 - **Gaming variant: a shallow `git clone` of the OGC kernel leaves
   `kernelrelease` with a trailing `+`** (`7.2.6-ogc1+` instead of
   `7.2.6-ogc1`) — confirmed hitting this in CI. `scripts/setlocalversion`
@@ -237,10 +256,14 @@ compilation at all.
   previous error: modpost reported `ttm_bo_vunmap`/`ttm_bo_mmap_obj`/
   `ttm_bo_vmap` undefined in `drm_ttm_helper.ko`, all from
   `drivers/gpu/drm/ttm/ttm_bo_vm.o`. Both are now built explicitly.
-  This dependency-discovery process (build, read the next
-  undefined-symbol error, find its owning module in the kernel's own
-  subsystem `Makefile`, add one more scoped target) might not be fully
-  exhausted yet — see the next point.
+- **Gaming variant: `openssl` (the CLI) was missing from
+  `kernel-src-builder`** — `CONFIG_MODULE_SIG_ALL=y` on that leg only
+  makes `make vmlinux` generate a self-signed `certs/signing_key.pem`
+  via `openssl req`; only `openssl-devel` (headers/libs) was installed,
+  so this failed with "command not found" until fixed. Confirmed
+  hitting this in CI as the gaming leg's last failure before it passed.
+
+## Known risks, not fully validated
 - **NVIDIA's legacy 580.xxx driver needs patching for kernel 7.x, and
   the exact set of fixes is pinned to driver 580.173.02 — re-derive
   them if you bump `NVIDIA_VERSION`.** Confirmed by actually building
@@ -318,19 +341,12 @@ compilation at all.
   repo actually needs — but this is a deliberate fidelity gap, not a
   verified equivalence.
 - **Gaming variant: `CONFIG_MODULE_SIG_ALL=y`** (standard variant has
-  `CONFIG_MODULE_SIG` unset). This has both a build-time and a
-  runtime consequence:
-  - Build time: `make vmlinux` generates a self-signed
-    `certs/signing_key.pem` via `openssl req`, which needs the
-    `openssl` CLI (not just `openssl-devel`'s headers/libs) in
-    `kernel-src-builder` — confirmed by actually hitting this in CI on
-    the gaming leg only (`Error 127`, command not found); the standard
-    variant never exercises this path since `CONFIG_MODULE_SIG` is
-    unset there.
-  - Runtime: if the real machine has Secure Boot enabled and kernel
-    lockdown active, this makes it *more* likely an unsigned
-    out-of-tree module gets rejected at load time on `-gaming`
-    specifically, on top of the general Secure Boot risk below.
+  `CONFIG_MODULE_SIG` unset; see ["Build status"](#build-status) above
+  for the build-time consequence this already had). At runtime, if the
+  real machine has Secure Boot enabled and kernel lockdown active, this
+  makes it *more* likely an unsigned out-of-tree module gets rejected
+  at load time on `-gaming` specifically, on top of the general Secure
+  Boot risk below.
 - **Secure Boot / module signing** — Dakota uses a UKI
   (`systemd-boot` + unified kernel image). An unsigned out-of-tree
   module can be rejected at boot under kernel lockdown with Secure
