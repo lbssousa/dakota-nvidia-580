@@ -102,12 +102,15 @@ jobs:
         if: github.event_name != 'pull_request'
         id: sbom
         run: |
+          # Scans the pushed image straight from the registry (already
+          # authenticated via the docker login above), rather than
+          # mounting the local image -- the build/push steps run as the
+          # unprivileged runner user, whose podman storage a `sudo
+          # podman image mount` can't see.
           OUTPUT_PATH="$(mktemp -d)/sbom.spdx.json"
-          IMAGE_REF="${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
-          MOUNT_PATH=$(sudo podman image mount "${IMAGE_REF}")
-          trap "sudo podman image umount '${IMAGE_REF}'" EXIT
-          sudo ${{ steps.syft.outputs.cmd }} scan "dir:${MOUNT_PATH}" -o spdx-json="${OUTPUT_PATH}"
-          sudo chown "$(id -u):$(id -g)" "${OUTPUT_PATH}"
+          ${{ steps.syft.outputs.cmd }} scan \
+            "registry:${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.push.outputs.digest }}" \
+            -o spdx-json="${OUTPUT_PATH}"
           echo "output_path=${OUTPUT_PATH}" >> "$GITHUB_OUTPUT"
 
       - name: Attest SBOM (${{ matrix.variant }})
