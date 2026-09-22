@@ -63,6 +63,10 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # cosign (via go-containerregistry) reads ~/.docker/config.json
+          # for registry credentials, not podman's separate auth file.
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push image (${{ matrix.variant }})
         if: github.event_name != 'pull_request'
