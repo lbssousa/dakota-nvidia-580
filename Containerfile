@@ -10,15 +10,25 @@
 # downstream instead of a BuildStream fork, and the risks that haven't
 # been validated on real hardware yet).
 #
-# PREREQUISITE NOT VERIFIED BY THIS FILE ALONE: the pinned Dakota image
-# below must expose a complete kernel build tree at
-# /usr/lib/modules/<kver>/build. The kernel-headers stage checks this
-# and fails loudly if it's missing — run `scripts/check-kernel-headers.sh`
-# BEFORE setting up anything else (GHCR secrets, Renovate, etc.),
-# because if this is missing the whole approach doesn't work and the
-# only alternative is forking the BuildStream build (see README.md).
+# CONFIRMED (not just suspected — see README.md "Why
+# /usr/lib/modules/<kver>/build is missing"): the published Dakota
+# images do NOT expose a usable kernel build tree at
+# /usr/lib/modules/<kver>/build — the symlink is there, but its target
+# (/usr/src/linux-<kver>) is empty. Upstream's own nvidia-drivers.bst
+# never hits this because it builds inside BuildStream, where
+# freedesktop-sdk.bst:components/linux.bst (or, for -gaming,
+# elements/core/linux-ogc.bst) is staged as an ordinary build-dependency.
+#
+# The kernel-src-builder stage below reconstructs that same tree
+# ourselves outside BuildStream: it fetches the matching upstream
+# kernel source (vanilla kernel.org for the standard variant,
+# OpenGamingCollective/linux.git for -gaming — auto-detected from the
+# kernel version string) and configures it with the exact .config the
+# running kernel was built with, which the runtime image DOES ship at
+# /usr/lib/modules/<kver>/config. See scripts/build-kernel-src.sh and
+# README.md for the full derivation and its residual risks.
 
-ARG NVIDIA_VERSION=580.65.06
+ARG NVIDIA_VERSION=580.173.02
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
 
@@ -41,9 +51,9 @@ ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
 # Containerfile changes needed. Keeping both pins here, not only in
 # the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:stable@sha256:0000000000000000000000000000000000000000000000000000000000000
-ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:0000000000000000000000000000000000000000000000000000000000000
-# ^ replace both with the real digests before the first build:
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:stable@sha256:ddab2e2d816976a8f181603987e76d1c992109f435b2abdf1eae76f40f7139f8
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:e0670ab927e6762e175a73a1ed47b54215163170a5efe407472640c1ac9951ea
+# ^ resolved via (re-run before every build — these drift):
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
 
@@ -51,20 +61,42 @@ FROM ${BASE_IMAGE} AS dakota-base
 
 # ---------------------------------------------------------------------
 # kernel-headers — extracts this specific image's kernel version and
-# build tree for the nvidia-builder stage to use. Fails loudly and
-# early if the image doesn't have the headers.
+# its shipped .config (the ground truth kernel-src-builder reconstructs
+# a build tree from). Fails loudly and early if the image doesn't even
+# ship the .config — that would mean Dakota's kernel packaging changed
+# more deeply than the missing-build-tree issue this repo works around.
 # ---------------------------------------------------------------------
 FROM dakota-base AS kernel-headers
 RUN set -eux; \
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"; \
     echo "$kver" > /kernel-version; \
-    if [ ! -f "/usr/lib/modules/$kver/build/Makefile" ]; then \
-        echo "ERROR: /usr/lib/modules/$kver/build is missing or incomplete" >&2; \
-        echo "in this Dakota image — can't build the NVIDIA kmod" >&2; \
-        echo "out-of-tree without it. See README.md, section" >&2; \
-        echo "'If the headers don't exist'." >&2; \
+    if [ ! -f "/usr/lib/modules/$kver/config" ]; then \
+        echo "ERROR: /usr/lib/modules/$kver/config is missing from this" >&2; \
+        echo "Dakota image — can't reconstruct a matching kernel build" >&2; \
+        echo "tree without the exact .config the running kernel used." >&2; \
+        echo "See README.md, section 'Why /usr/lib/modules/<kver>/build" >&2; \
+        echo "is missing'." >&2; \
         exit 1; \
-    fi
+    fi; \
+    cp "/usr/lib/modules/$kver/config" /kernel-config
+
+# ---------------------------------------------------------------------
+# kernel-src-builder — Fedora used only as a build environment;
+# reconstructs a real /lib/modules/<kver>/build tree (Makefile,
+# headers, scripts, objtool) from upstream kernel source + the exact
+# .config extracted above, via scripts/build-kernel-src.sh. See that
+# script and README.md for the full rationale.
+# ---------------------------------------------------------------------
+FROM fedora:42 AS kernel-src-builder
+RUN dnf install -y gcc make bison flex bc elfutils-libelf-devel \
+        openssl-devel perl findutils diffutils ncurses-devel git \
+        curl tar xz which hostname && \
+    dnf clean all
+COPY --from=kernel-headers /kernel-version /kernel-version
+COPY --from=kernel-headers /kernel-config /kernel-config
+COPY scripts/build-kernel-src.sh /build-kernel-src.sh
+RUN chmod +x /build-kernel-src.sh && \
+    /build-kernel-src.sh "$(cat /kernel-version)" /kernel-config /out
 
 # ---------------------------------------------------------------------
 # libfprint-probe — locates the exact path of the libfprint shared
@@ -94,7 +126,7 @@ ARG NVIDIA_VERSION
 RUN dnf install -y gcc make kmod elfutils-libelf-devel perl-interpreter \
         tar xz curl which && \
     dnf clean all
-COPY --from=kernel-headers /usr/lib/modules /kernel-src/lib/modules
+COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY scripts/build-nvidia.sh /build-nvidia.sh
 RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out

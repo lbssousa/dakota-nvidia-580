@@ -38,34 +38,72 @@ Like the upstream project, this repo builds two variants from the same
   base (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
   mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
 
-## ⚠️ Before anything else: validate the kernel headers
+## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
-The single biggest unresolved risk in this whole project is this:
-**it is not confirmed that the published `dakota:stable` image exposes
-a complete kernel build tree** at `/usr/lib/modules/<kver>/build`.
-Dakota is assembled from scratch via Apache BuildStream (not from RPM
-`kernel-devel` packages), as a space-optimized image with dedup via
-Chunkah — there's no guarantee that tree survives in the runtime image
-rather than only existing in BuildStream's own intermediate build
-artifacts.
+Confirmed by directly inspecting both published images
+(`ghcr.io/projectbluefin/dakota:stable` and `dakota-gaming:stable`):
+**`/usr/lib/modules/<kver>/build` is a dangling symlink.** It points
+to `/usr/src/linux-<kver>`, which is empty:
 
-Run this **before** setting up GHCR secrets, Renovate, etc. — check both
-variants, since the gaming variant runs a different kernel (the Open
-Gaming Collective/OGC kernel) and can pass or fail independently of
-the standard one:
+```
+/usr/lib/modules/7.2.6/build -> ../../../src/linux-7.2.6
+/usr/src/  →  (empty — only . and ..)
+```
+
+This isn't a packaging bug. Dakota's own BuildStream element that
+compiles the NVIDIA driver
+([`nvidia-drivers.bst`](https://github.com/projectbluefin/dakota/blob/testing/elements/bluefin-nvidia/nvidia-drivers.bst))
+pulls in `freedesktop-sdk.bst:components/linux.bst` (or, for the
+gaming variant,
+[`elements/core/linux-ogc.bst`](https://github.com/projectbluefin/dakota/blob/testing/elements/core/linux-ogc.bst))
+as an ordinary **build-time** dependency — BuildStream stages that
+element's own package output (which genuinely contains
+`/usr/src/linux-<kver>/` with a real `Makefile`, headers, `scripts/`,
+and `Module.symvers`) into the sandbox for that one build step. But
+`linux.bst` is deliberately **not** a runtime-dependency of the
+composed OS (GNOME OS boots from a separately-staged kernel +
+initramfs), so it's absent from what actually gets published. The
+`build` symlink under `/usr/lib/modules/` survives because it's copied
+from a sibling directory ([`unsigned-modules.bst`](https://github.com/projectbluefin/dakota/blob/testing/elements/bluefin/unsigned-modules.bst)
+only stages `/usr/lib/modules`, never `/usr/src`) — hence a symlink
+pointing at nothing.
+
+**This repo's `kernel-src-builder` Containerfile stage reconstructs
+that same tree itself**, from two things the *runtime* image genuinely
+does ship:
+
+- `/usr/lib/modules/<kver>/config` — the exact `.config` the running
+  kernel was built with (present on both variants; this is the ground
+  truth, no guessing).
+- `<kver>` — which source to fetch: a plain version (e.g. `7.2.6`)
+  means the standard variant's kernel, and matches
+  [freedesktop-sdk's own source pin](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/blob/master/elements/include/linux.yml)
+  — vanilla `kernel.org` at tag `v<kver>` (its two patches only touch
+  riscv/powerpc code, irrelevant on x86_64). A `-ogc<N>` suffix (e.g.
+  `7.2.6-ogc1`) means the gaming variant's [Open Gaming Collective
+  kernel](https://github.com/OpenGamingCollective/linux) fork, at the
+  matching tag — `linux-ogc.bst` pins it explicitly
+  (`ogc-localversion: '-ogc1'`, not autodetected).
+
+`scripts/build-kernel-src.sh` fetches that source, drops in the
+shipped `.config`, runs `make olddefconfig` + `make modules_prepare`,
+then **actually builds `vmlinux`** (needed for a real `Module.symvers`
+— see ["Known risks"](#known-risks-not-fully-validated) for why a
+lighter `modules_prepare`-only tree turned out not to be enough) plus
+`drivers/gpu/drm/drm_ttm_helper.ko` (the one DRM subsystem piece that's
+a loadable module rather than built into `vmlinux` on Dakota's shipped
+`.config`), and assembles `/usr/src/linux-<kver>/` with the same file
+list `linux.bst`/`linux-ogc.bst` themselves copy — reproducing their
+exact artifact shape.
+
+Run this to confirm a given image still ships the `.config` this
+approach depends on (it's a much weaker requirement than the old
+`build/Makefile` check, and both variants pass it today):
 
 ```bash
 ./scripts/check-kernel-headers.sh stable dakota
 ./scripts/check-kernel-headers.sh stable dakota-gaming
 ```
-
-If it fails, this whole approach (downstream Containerfile) doesn't
-work, and the only alternative is forking the BuildStream build of
-[`projectbluefin/dakota`](https://github.com/projectbluefin/dakota)
-itself and pinning the driver version there — much heavier (requires
-the full BuildStream + freedesktop-sdk + gnome-build-meta toolchain),
-but it's the "native" path the project itself uses. See
-`docs/oci-assembly.md` and `docs/patches.md` in the Dakota repo.
 
 ## Architecture
 
@@ -81,12 +119,22 @@ per-variant changes.
 dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha256:...
              or ghcr.io/projectbluefin/dakota-gaming:stable@sha256:... for the gaming variant)
   │
-  ├─→ kernel-headers          extracts kernel version + /usr/lib/modules/<kver>/build
+  ├─→ kernel-headers            extracts kernel version + its shipped .config
+  │     │                       (NOT /usr/lib/modules/<kver>/build — see above)
   │     │
-  │     └─→ nvidia-builder    (Fedora, build environment only)
-  │           builds the out-of-tree kmod against the headers above,
-  │           runs nvidia-installer --no-kernel-module, and packages
-  │           the result via a filesystem diff (scripts/build-nvidia.sh)
+  │     └─→ kernel-src-builder  (Fedora, build environment only)
+  │           fetches matching upstream kernel source (kernel.org or
+  │           OpenGamingCollective/linux.git, auto-detected from the
+  │           kernel version string), configures it with the shipped
+  │           .config, runs modules_prepare + objtool, assembles a
+  │           real /src/linux-<kver>/ + /lib/modules/<kver>/build
+  │           (scripts/build-kernel-src.sh)
+  │           │
+  │           └─→ nvidia-builder    (Fedora, build environment only)
+  │                 builds the out-of-tree kmod against the reconstructed
+  │                 tree above, runs nvidia-installer --no-kernel-module,
+  │                 and packages the result via a filesystem diff
+  │                 (scripts/build-nvidia.sh)
   │
   ├─→ libfprint-probe         locates libfprint-2.so's exact libdir
   │     │                     in the Dakota base image
@@ -107,12 +155,12 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
         enable, /etc/services entry), bootc container lint
 ```
 
-The `nvidia-builder`, `libfprint-builder` and `epson-builder` stages
-use Fedora **only as a build environment** (it has `dnf`, `gcc`,
-`meson`, `rpm2cpio`...) — nothing from them ends up in the final image
-except what the scripts explicitly package into `/out`. The final
-image is still plain Dakota (GNOME OS, no RPMs) with these three
-payloads layered on top.
+The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder` and
+`epson-builder` stages use Fedora **only as a build environment** (it
+has `dnf`, `gcc`, `meson`, `rpm2cpio`...) — nothing from them ends up
+in the final image except what the scripts explicitly package into
+`/out`. The final image is still plain Dakota (GNOME OS, no RPMs) with
+these payloads layered on top.
 
 ## How the libfprint overwrite works
 
@@ -157,20 +205,112 @@ security/GNOME updates.
 This repo takes the cheaper path to maintain for a single-user setup:
 a `Containerfile` that starts `FROM` the already-published image and
 only compiles what actually needs compiling (the out-of-tree kmod +
-the libfprint fork) against headers extracted from that specific
-image — plus unpacking Epson's binary `epson-printer-utility` RPM,
-which needs no compilation at all.
+the libfprint fork) against a kernel tree it reconstructs itself from
+upstream source + the image's own shipped `.config` (see above) — plus
+unpacking Epson's binary `epson-printer-utility` RPM, which needs no
+compilation at all.
 
 ## Known risks, not fully validated
 
-- **Kernel headers missing from the published image** — see the
-  section above. Blocking; check this first.
-- **Kernel API drift vs. the legacy driver branch** — Dakota tracks
-  the upstream kernel closely; NVIDIA's 580.xxx branch is legacy and
-  may lack compatibility patches for very recent kernels (the kind of
-  patch RPM Fusion carries for legacy NVIDIA drivers on Fedora). If
-  the kmod build fails on kernel API mismatches, look for community
-  compatibility patches before trying to hand-patch it yourself.
+- **The last validation step (linking `vmlinux`, and therefore a true
+  end-to-end build) could not be completed in the session that wrote
+  this section, purely due to machine memory — not a remaining code
+  gap.** `make vmlinux` on Dakota's shipped, everything-enabled
+  `.config` needs several GB of RAM for its single (non-parallel)
+  final link step; on a 15 GB desktop machine with normal desktop
+  usage running alongside it, this repeatedly got OOM-killed at
+  exactly that step, even with other memory freed up beforehand.
+  Everything **upstream** of that link (fetching the right kernel
+  source, `olddefconfig`, `modules_prepare`, and — separately —
+  actually compiling and linking all four NVIDIA kernel modules
+  against a tree assembled this same way in an earlier, successful
+  run) was individually confirmed working by actually running it.
+  **Treat the current `Containerfile` as: all identified build/compile
+  issues diagnosed and fixed with real evidence, but the full pipeline
+  has not been run to completion in one pass.** Confirm this on a
+  machine with more headroom, or in CI (GitHub-hosted runners
+  currently ship 16 GB, which should clear this) before trusting a
+  published image. If you hit the same OOM building locally, close
+  memory-heavy applications first or add swap.
+- **NVIDIA's legacy 580.xxx driver needs patching for kernel 7.x, and
+  the exact set of fixes is pinned to driver 580.173.02 — re-derive
+  them if you bump `NVIDIA_VERSION`.** Confirmed by actually building
+  it: `580.65.06` (this repo's original pin) doesn't compile against
+  kernel 7.x at all (`vm_fault_t` redefinition, several removed/renamed
+  kernel functions). `580.173.02` (the latest 580.xxx point release at
+  the time of writing) already fixes most of that upstream, but still
+  needed three fixes from this repo, applied in `build-nvidia.sh`:
+  - `KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion
+    -Wno-incompatible-pointer-types"` — GCC 14+ (Fedora 42, the build
+    stage) promotes these to hard errors unconditionally, not just via
+    `-Werror`; delivered via `KCFLAGS`, not `EXTRA_CFLAGS` appended to
+    `kernel/Kbuild` — confirmed the latter is silently ignored on
+    kernel 7.2.6's top-level `Makefile`.
+  - A small `strncpy()` → `sized_strscpy()` compatibility shim,
+    `#include`-injected into the exact four source files that call it
+    (`nvidia/os-interface.c`, `nvidia/linux_nvswitch.c`,
+    `nvidia-uvm/uvm_pmm_gpu.c`, `nvidia-modeset/nvidia-modeset-linux.c`
+    — re-grep this list, `grep -rln '\bstrncpy(' kernel/nvidia*`, if
+    the version changes). `strncpy()` was fully removed from the
+    kernel's public string API on 7.x (only mentioned in comments
+    pointing at `strscpy()` now); silencing the warnings above isn't
+    enough by itself — modpost then reports it `undefined` in three of
+    the four kernel modules, since an implicit declaration compiles to
+    a real external call instead of an inlined one. A first attempt at
+    force-including `<linux/string.h>` globally for every source file
+    (rather than scoping to just the four that need it) backfired with
+    an unrelated `vm_fault_t` conflict on a file that otherwise builds
+    clean — header-inclusion order for out-of-tree NVIDIA sources is
+    apparently fragile enough that global `-include` isn't safe here.
+  - `drivers/gpu/drm/drm_ttm_helper.ko` built explicitly in
+    `kernel-src-builder` (see above) — `nvidia-drm.ko` needs
+    `drm_fbdev_ttm_driver_fbdev_probe`, exported only by that module on
+    Dakota's `.config` (`CONFIG_DRM=y`, `CONFIG_DRM_KMS_HELPER=y` are
+    both built into `vmlinux` already; only `CONFIG_DRM_TTM_HELPER=m`
+    is a real loadable module). Building the whole `drivers/gpu/drm/`
+    directory instead (a first attempt) OOM-killed the build outright
+    — it compiles every vendor GPU driver enabled in this
+    everything-enabled `.config` too, `amdgpu` included.
+- **`kernel-src-builder` covers `vmlinux` + `drm_ttm_helper.ko`'s
+  exports, not literally every loadable module's.** If a future NVIDIA
+  driver version (or a kernel bump) needs a symbol from some *other*
+  loadable module, the fix is the same shape as the `drm_ttm_helper.ko`
+  one above: find the owning module from the undefined-symbol name and
+  the kernel's own subsystem `Makefile`, then add a scoped
+  `make path/to/that.ko` — not a blanket `make modules`, which is
+  prohibitively slow and memory-hungry against this `.config`.
+- **`CONFIG_RUST` is force-disabled** in the reconstructed tree
+  (`scripts/config --disable RUST` before `olddefconfig`). Both
+  variants ship `CONFIG_RUST=y` for unrelated in-tree Rust drivers;
+  with it on, `make modules_prepare` hard-requires a matching
+  `rustc`/`bindgen` toolchain (`scripts/rust_is_available.sh`) that
+  Fedora's `kernel-src-builder` doesn't provide and NVIDIA's C-only
+  module doesn't need. This doesn't change any C struct layout,
+  calling convention, or the kernel release string (vermagic).
+- **Compiler version mismatch** — Dakota's kernels are built with GCC
+  16.2.0 (confirmed via `CONFIG_CC_VERSION_TEXT` in the shipped
+  `.config`); `kernel-src-builder` uses whatever GCC Fedora 42 ships.
+  `RANDSTRUCT` and `LTO` are both off in the shipped config (confirmed
+  — the two configs most likely to make a cross-compiler build
+  genuinely ABI-incompatible), which meaningfully de-risks this, but
+  it isn't a byte-for-byte guarantee. `build-nvidia.sh` already builds
+  with `IGNORE_CC_MISMATCH=1` for the same reason — a real
+  incompatibility would show up as a module load failure, not a build
+  failure. Test `modprobe nvidia` before trusting a build.
+- **Gaming variant: Dakota's own fixup patches to the OGC kernel are
+  not applied.** `linux-ogc.bst` applies three small patches from
+  `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an
+  `aw87xxx` DSP-only fix, an `asus` backlight fix) on top of the OGC
+  tree before configuring it. `build-kernel-src.sh` clones the OGC
+  tree as-is. All three are narrow, unrelated hardware-driver fixups —
+  unlikely to affect the reconstructed headers/scripts/objtool this
+  repo actually needs — but this is a deliberate fidelity gap, not a
+  verified equivalence.
+- **Gaming variant: `CONFIG_MODULE_SIG_ALL=y`** (standard variant has
+  `CONFIG_MODULE_SIG` unset). If the real machine has Secure Boot
+  enabled and kernel lockdown active, this makes it *more* likely an
+  unsigned out-of-tree module gets rejected at load time on `-gaming`
+  specifically, on top of the general Secure Boot risk below.
 - **Secure Boot / module signing** — Dakota uses a UKI
   (`systemd-boot` + unified kernel image). An unsigned out-of-tree
   module can be rejected at boot under kernel lockdown with Secure
@@ -199,14 +339,23 @@ which needs no compilation at all.
 
 ## Local build
 
+**Memory:** `kernel-src-builder`'s `make vmlinux` step needs several
+GB of free RAM for its final link (confirmed: this repeatedly OOM-
+killed on a 15 GB desktop machine with normal desktop usage running
+alongside it). Close memory-heavy applications first, or build on a
+machine with more headroom — GitHub Actions' hosted runners (16 GB)
+should clear this comfortably, which is one more reason to let CI do
+the definitive build rather than fighting it on a laptop.
+
 ```bash
 # 1. Confirm the current digests and paste them into the Containerfile
 #    (the `ARG BASE_IMAGE=...` / `ARG BASE_IMAGE_GAMING=...` lines):
 skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
 skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
 
-# 2. Validate the kernel headers BEFORE building (see the section
-#    above) — for whichever variant(s) you're about to build:
+# 2. Confirm the image still ships the .config kernel-src-builder
+#    needs (see the section above) — for whichever variant(s) you're
+#    about to build:
 ./scripts/check-kernel-headers.sh stable dakota
 ./scripts/check-kernel-headers.sh stable dakota-gaming
 
@@ -222,6 +371,9 @@ podman build --file Containerfile \
 
 # 4. Basic smoke test before installing on any real machine:
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
+podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-drm
+podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-uvm
+podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-modeset
 podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
 podman run --rm localhost/dakota-nvidia-580:dev sh -c \
   'readlink -f /usr/bin/epson-printer-utility && test -x /usr/bin/epson-printer-utility'
