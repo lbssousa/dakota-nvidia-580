@@ -45,8 +45,11 @@ Both variants build and publish successfully end-to-end in CI
 [`35776779473`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35776779473).
 The container image builds and all four NVIDIA kernel modules
 (`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
-compile and link. **Nothing here has been booted on real Dakota
-hardware yet** — see ["Known limitations"](#known-limitations) below.
+compile and link. Image signing and SBOM generation/attestation (see
+["Verification"](#verification)) were added after that run and haven't
+been exercised in CI yet. **Nothing here has been booted on real
+Dakota hardware yet** — see ["Known limitations"](#known-limitations)
+below.
 
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
@@ -167,7 +170,9 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
         COPY of all three /out trees (libfprint's overwrites the
         stock library in place), nouveau blacklist, depmod +
         ldconfig -r, Epson post-install steps (symlink, systemd
-        enable, /etc/services entry), bootc container lint
+        enable, /etc/services entry), signing policy
+        (scripts/configure-signing-policy.sh — see "Verification"),
+        bootc container lint
 ```
 
 The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder` and
@@ -378,6 +383,37 @@ ecbd.service`, launching "Epson Printer Utility" from the app grid, or
 migration done — and keep a way back (`bootc switch` to the original
 `dakota:stable`/`dakota-gaming:stable` image) until you've validated
 it on real hardware.
+
+## Verification
+
+Images are signed with [cosign](https://github.com/sigstore/cosign),
+the same as [lbssousa/bluefin](https://github.com/lbssousa/bluefin):
+CI signs every image it pushes (key-pair signing, not keyless/Fulcio),
+and generates + attests an SPDX SBOM via
+[syft](https://github.com/anchore/syft), also signed with the same
+key. The public key is committed at `cosign.pub` in this repository,
+and baked into the image itself at
+`/usr/lib/pki/containers/lbssousa.pub` with a matching
+`/etc/containers/policy.json` entry for `ghcr.io/lbssousa`
+(`scripts/configure-signing-policy.sh`) — so `bootc upgrade` verifies
+the signature automatically, reporting `ostree-image-signed:` instead
+of `ostree-unverified-registry:`, and refuses an unsigned image.
+
+To verify manually:
+
+```bash
+cosign verify --key cosign.pub ghcr.io/lbssousa/dakota-nvidia-580:stable
+cosign verify --key cosign.pub ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
+
+# SBOM attestation:
+cosign verify-attestation --key cosign.pub --type spdxjson \
+  ghcr.io/lbssousa/dakota-nvidia-580:stable
+```
+
+The signing key itself is never committed — CI holds it as the
+`SIGNING_SECRET` (private key) and `COSIGN_PASSWORD` (its passphrase)
+repository secrets, set once with `cosign generate-key-pair` +
+`gh secret set`.
 
 ## CI and automatic updates
 

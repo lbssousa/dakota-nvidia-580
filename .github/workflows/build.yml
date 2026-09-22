@@ -21,6 +21,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -65,4 +66,55 @@ jobs:
 
       - name: Push image (${{ matrix.variant }})
         if: github.event_name != 'pull_request'
-        run: podman push "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
+        id: push
+        run: |
+          podman push --digestfile /tmp/push-digest \
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
+          echo "digest=$(cat /tmp/push-digest)" >> "$GITHUB_OUTPUT"
+
+      # Signing and SBOM generation mirror lbssousa/bluefin's own
+      # build.yml (cosign key-pair signing + syft/cosign attest, not
+      # keyless/Fulcio — cosign.pub in the repo root is what a consumer
+      # verifies against: `cosign verify --key cosign.pub <image>`).
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3
+
+      - name: Sign image (${{ matrix.variant }})
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign sign -y --key env://COSIGN_PRIVATE_KEY --tlog-upload=false \
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.push.outputs.digest }}"
+
+      - name: Setup Syft
+        if: github.event_name != 'pull_request'
+        id: syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24
+
+      - name: Generate SBOM (${{ matrix.variant }})
+        if: github.event_name != 'pull_request'
+        id: sbom
+        run: |
+          OUTPUT_PATH="$(mktemp -d)/sbom.spdx.json"
+          IMAGE_REF="${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
+          MOUNT_PATH=$(sudo podman image mount "${IMAGE_REF}")
+          trap "sudo podman image umount '${IMAGE_REF}'" EXIT
+          sudo ${{ steps.syft.outputs.cmd }} scan "dir:${MOUNT_PATH}" -o spdx-json="${OUTPUT_PATH}"
+          sudo chown "$(id -u):$(id -g)" "${OUTPUT_PATH}"
+          echo "output_path=${OUTPUT_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest SBOM (${{ matrix.variant }})
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          cosign attest -y \
+            --predicate "${{ steps.sbom.outputs.output_path }}" \
+            --type spdxjson \
+            --key env://COSIGN_PRIVATE_KEY \
+            --tlog-upload=false \
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.push.outputs.digest }}"

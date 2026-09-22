@@ -197,6 +197,20 @@ COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
+# Signing policy — mirrors lbssousa/bluefin's build_files/00-signing.sh
+# and Dakota's own convention for verified registries (its shipped
+# /usr/lib/pki/containers/ublue-os*.pub + registries.d/ublue-os.yaml).
+# Requires images at ghcr.io/lbssousa to carry a valid cosign signature
+# (CI signs every push — see .github/workflows/build.yml) before
+# `bootc upgrade`/`podman pull` accepts them; without this, bootc
+# reports "ostree-unverified-registry:" instead of
+# "ostree-image-signed:" and applies unsigned images unchecked.
+COPY cosign.pub /cosign.pub
+COPY scripts/configure-signing-policy.sh /configure-signing-policy.sh
+RUN chmod +x /configure-signing-policy.sh && \
+    /configure-signing-policy.sh /cosign.pub && \
+    rm -f /cosign.pub /configure-signing-policy.sh
+
 # Post-install steps. depmod is our own addition (specific to having
 # added an out-of-tree kernel module); ldconfig -r is the same step
 # that Dakota's own docs/oci-assembly.md describes as "load-bearing —
