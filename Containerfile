@@ -88,9 +88,15 @@ RUN set -eux; \
 # script and README.md for the full rationale.
 # ---------------------------------------------------------------------
 FROM fedora:42 AS kernel-src-builder
+# openssl (the CLI, not just openssl-devel's headers/libs) is needed by
+# certs/Makefile's gen_key rule -- confirmed by actually hitting this in
+# CI: the gaming variant's CONFIG_MODULE_SIG_ALL=y (unset on standard)
+# makes `make vmlinux` generate a self-signed certs/signing_key.pem via
+# `openssl req ...`, which failed with "command not found" (Error 127)
+# until this was added.
 RUN dnf install -y gcc make bison flex bc elfutils-libelf-devel \
-        openssl-devel perl findutils diffutils ncurses-devel git \
-        curl tar xz which hostname && \
+        openssl openssl-devel perl findutils diffutils ncurses-devel \
+        git curl tar xz which hostname && \
     dnf clean all
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=kernel-headers /kernel-config /kernel-config

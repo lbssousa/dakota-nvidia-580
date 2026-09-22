@@ -318,10 +318,19 @@ compilation at all.
   repo actually needs — but this is a deliberate fidelity gap, not a
   verified equivalence.
 - **Gaming variant: `CONFIG_MODULE_SIG_ALL=y`** (standard variant has
-  `CONFIG_MODULE_SIG` unset). If the real machine has Secure Boot
-  enabled and kernel lockdown active, this makes it *more* likely an
-  unsigned out-of-tree module gets rejected at load time on `-gaming`
-  specifically, on top of the general Secure Boot risk below.
+  `CONFIG_MODULE_SIG` unset). This has both a build-time and a
+  runtime consequence:
+  - Build time: `make vmlinux` generates a self-signed
+    `certs/signing_key.pem` via `openssl req`, which needs the
+    `openssl` CLI (not just `openssl-devel`'s headers/libs) in
+    `kernel-src-builder` — confirmed by actually hitting this in CI on
+    the gaming leg only (`Error 127`, command not found); the standard
+    variant never exercises this path since `CONFIG_MODULE_SIG` is
+    unset there.
+  - Runtime: if the real machine has Secure Boot enabled and kernel
+    lockdown active, this makes it *more* likely an unsigned
+    out-of-tree module gets rejected at load time on `-gaming`
+    specifically, on top of the general Secure Boot risk below.
 - **Secure Boot / module signing** — Dakota uses a UKI
   (`systemd-boot` + unified kernel image). An unsigned out-of-tree
   module can be rejected at boot under kernel lockdown with Secure
