@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Covers the case where Renovate already bumped the dakota:stable
+    # Covers the case where Renovate already bumped a dakota base
     # digest (see renovate.json5) — without this, the NVIDIA kmod
     # would stay compiled against a stale kernel until someone opens a
     # manual push.
@@ -21,14 +21,40 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard variant — base pinned by the Containerfile's
+          # BASE_IMAGE default, so no override is passed here.
+          - variant: standard
+            tag_suffix: ""
+            base_arg_name: BASE_IMAGE
+          # Gaming variant — mirrors the upstream dakota / dakota-gaming
+          # split (Open Gaming Collective/OGC kernel). Reuses the same
+          # Containerfile; only the base image + output tag differ.
+          - variant: gaming
+            tag_suffix: "-gaming"
+            base_arg_name: BASE_IMAGE_GAMING
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build image
+      - name: Resolve base image for this variant
+        id: base
+        run: |
+          base="$(sed -n "s/^ARG ${{ matrix.base_arg_name }}=//p" Containerfile | head -n1)"
+          if [ -z "$base" ]; then
+            echo "Could not find ARG ${{ matrix.base_arg_name }} in Containerfile" >&2
+            exit 1
+          fi
+          echo "base_image=${base}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (${{ matrix.variant }})
         run: |
           podman build \
             --file Containerfile \
-            --tag "${IMAGE_NAME}:stable" \
+            --build-arg "BASE_IMAGE=${{ steps.base.outputs.base_image }}" \
+            --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable" \
             .
 
       - name: Log in to GHCR
@@ -37,6 +63,6 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Push image
+      - name: Push image (${{ matrix.variant }})
         if: github.event_name != 'pull_request'
-        run: podman push "${IMAGE_NAME}:stable"
+        run: podman push "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"

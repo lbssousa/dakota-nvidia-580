@@ -1,18 +1,30 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["config:recommended"],
-  // Renovate's "dockerfile" manager natively recognizes
-  // `FROM image:tag@sha256:digest` lines and opens a PR when the
-  // upstream digest changes — the same mechanism dakota-prime uses to
-  // track dakota-gaming:stable. CI (build.yml) builds and publishes
-  // from that PR; there's no "silent" automatic rebuild without a
-  // reviewable PR.
+  // Renovate's "dockerfile" manager recognizes `image:tag@sha256:digest`
+  // references not just in FROM but also in ARG default values (the
+  // BASE_IMAGE / BASE_IMAGE_GAMING lines in the Containerfile), and
+  // opens a PR when the upstream digest changes. CI (build.yml) builds
+  // and publishes both variants from that PR; there's no "silent"
+  // automatic rebuild without a reviewable PR.
+  //
+  // The two base images are kept in separate PRs (separate groups)
+  // because they track independent upstream streams — the gaming
+  // variant's OGC kernel can (and does) lag behind or diverge from the
+  // standard Dakota kernel, so a bump to one shouldn't block or be
+  // conflated with the other.
   packageRules: [
     {
       matchManagers: ["dockerfile"],
       matchPackageNames: ["ghcr.io/projectbluefin/dakota"],
       groupName: "dakota base image",
       commitMessagePrefix: "chore(base):",
+    },
+    {
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["ghcr.io/projectbluefin/dakota-gaming"],
+      groupName: "dakota gaming base image",
+      commitMessagePrefix: "chore(base-gaming):",
     },
   ],
 }

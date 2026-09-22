@@ -13,12 +13,17 @@
 # same check) — but running this first avoids setting up everything
 # else (GHCR secrets, Renovate, etc.) only to find this out afterwards.
 #
-# Usage: scripts/check-kernel-headers.sh [ref]
-#   ref: tag or tag@sha256:... of the Dakota image (default: stable)
+# Usage: scripts/check-kernel-headers.sh [ref] [variant]
+#   ref:     tag or tag@sha256:... of the Dakota image (default: stable)
+#   variant: "dakota" (default) or "dakota-gaming" — check the gaming
+#            variant (Open Gaming Collective/OGC kernel) separately,
+#            since it's a different kernel build than the standard one
+#            and either can regress independently.
 set -euo pipefail
 
 ref="${1:-stable}"
-image="ghcr.io/projectbluefin/dakota:${ref}"
+variant="${2:-dakota}"
+image="ghcr.io/projectbluefin/${variant}:${ref}"
 
 echo "==> Inspecting ${image}..." >&2
 podman run --rm "${image}" bash -c '

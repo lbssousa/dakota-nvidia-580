@@ -21,6 +21,14 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   image at its original path — see ["How the libfprint overwrite
   works"](#how-the-libfprint-overwrite-works) below.
 
+Like the upstream project, this repo builds two variants from the same
+`Containerfile`, both published:
+
+- `ghcr.io/lbssousa/dakota-nvidia-580:stable` — standard Dakota base.
+- `ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable` — Dakota gaming
+  base (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
+  mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
+
 ## ⚠️ Before anything else: validate the kernel headers
 
 The single biggest unresolved risk in this whole project is this:
@@ -32,10 +40,14 @@ Chunkah — there's no guarantee that tree survives in the runtime image
 rather than only existing in BuildStream's own intermediate build
 artifacts.
 
-Run this **before** setting up GHCR secrets, Renovate, etc.:
+Run this **before** setting up GHCR secrets, Renovate, etc. — check both
+variants, since the gaming variant runs a different kernel (the Open
+Gaming Collective/OGC kernel) and can pass or fail independently of
+the standard one:
 
 ```bash
-./scripts/check-kernel-headers.sh stable
+./scripts/check-kernel-headers.sh stable dakota
+./scripts/check-kernel-headers.sh stable dakota-gaming
 ```
 
 If it fails, this whole approach (downstream Containerfile) doesn't
@@ -48,8 +60,17 @@ but it's the "native" path the project itself uses. See
 
 ## Architecture
 
+The same `Containerfile` builds both variants — `dakota-base` resolves
+to whichever image `BASE_IMAGE` points at (standard Dakota by
+default; the gaming base when CI overrides it for the `-gaming` leg —
+see ["CI and automatic updates"](#ci-and-automatic-updates) below).
+Everything downstream (kernel headers, kmod build, libfprint) is
+derived from that image at build time, so it needs no per-variant
+changes.
+
 ```
-dakota-base (FROM ghcr.io/projectbluefin/dakota:stable@sha256:...)
+dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha256:...
+             or ghcr.io/projectbluefin/dakota-gaming:stable@sha256:... for the gaming variant)
   │
   ├─→ kernel-headers          extracts kernel version + /usr/lib/modules/<kver>/build
   │     │
@@ -154,16 +175,25 @@ image.
 ## Local build
 
 ```bash
-# 1. Confirm the current digest of dakota:stable and paste it into the
-#    Containerfile (the `FROM ... @sha256:...` line):
+# 1. Confirm the current digests and paste them into the Containerfile
+#    (the `ARG BASE_IMAGE=...` / `ARG BASE_IMAGE_GAMING=...` lines):
 skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
+skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
 
 # 2. Validate the kernel headers BEFORE building (see the section
-#    above):
-./scripts/check-kernel-headers.sh stable
+#    above) — for whichever variant(s) you're about to build:
+./scripts/check-kernel-headers.sh stable dakota
+./scripts/check-kernel-headers.sh stable dakota-gaming
 
-# 3. Build:
+# 3. Build the standard variant (uses the Containerfile's BASE_IMAGE
+#    default, no override needed):
 podman build --file Containerfile --tag localhost/dakota-nvidia-580:dev .
+
+#    ...or the gaming variant (override BASE_IMAGE with the pinned
+#    BASE_IMAGE_GAMING value from the Containerfile):
+podman build --file Containerfile \
+  --build-arg BASE_IMAGE=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:<digest> \
+  --tag localhost/dakota-nvidia-580-gaming:dev .
 
 # 4. Basic smoke test before installing on any real machine:
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
@@ -179,6 +209,8 @@ before pinning it).
 
 ```bash
 sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580:stable
+# or the gaming variant:
+sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
 # or, if the official image already has the ujust recipe:
 ujust rebase-helper
 ```
@@ -186,18 +218,30 @@ ujust rebase-helper
 A reboot is required afterwards. Validate `modprobe nvidia`,
 `nvidia-smi`, and the fingerprint reader (`fprintd-list $USER`,
 `fprintd-verify`) before considering the migration done — and keep a
-way back (`bootc switch` to the original `dakota:stable` image) until
-you've validated it on real hardware.
+way back (`bootc switch` to the original `dakota:stable`/
+`dakota-gaming:stable` image) until you've validated it on real
+hardware.
 
 ## CI and automatic updates
 
-- `.github/workflows/build.yml` builds and publishes
-  `ghcr.io/lbssousa/dakota-nvidia-580:stable` on push to `main`, on a
-  daily schedule (covers the case where a Renovate PR was already
-  merged without a manual rebuild), and via `workflow_dispatch`.
-- `renovate.json5` tracks the digest of
-  `ghcr.io/projectbluefin/dakota:stable` pinned in the `Containerfile`
-  and opens a PR when it changes upstream — **every bump is a
-  reviewable PR**, not a silent rebuild, because a new base image can
-  ship a new kernel and break the kmod until you confirm the build
-  still passes.
+- `.github/workflows/build.yml` runs a two-way matrix (`standard`,
+  `gaming`) from the same `Containerfile`, building and publishing
+  both `ghcr.io/lbssousa/dakota-nvidia-580:stable` and
+  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable` on push to
+  `main`, on a daily schedule (covers the case where a Renovate PR was
+  already merged without a manual rebuild), and via
+  `workflow_dispatch`. Each matrix leg resolves its base image by
+  reading the `BASE_IMAGE`/`BASE_IMAGE_GAMING` `ARG` default straight
+  out of the `Containerfile` and passing it as
+  `--build-arg BASE_IMAGE=...` — the digest lives in one place. `fail-
+  fast: false` means one variant failing (e.g. the gaming kernel
+  breaking the kmod build) doesn't cancel the other's build/publish.
+- `renovate.json5` tracks both digests — `BASE_IMAGE`
+  (`ghcr.io/projectbluefin/dakota:stable`) and `BASE_IMAGE_GAMING`
+  (`ghcr.io/projectbluefin/dakota-gaming:stable`) — pinned in the
+  `Containerfile`, and opens a **separate** PR per variant when either
+  changes upstream — **every bump is a reviewable PR**, not a silent
+  rebuild, because a new base image can ship a new kernel and break
+  the kmod until you confirm the build still passes. The two are kept
+  separate because the gaming (OGC) kernel stream updates
+  independently of, and sometimes lags, the standard one.

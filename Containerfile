@@ -26,16 +26,27 @@ ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
 # changes content over time). The NVIDIA module below is compiled
 # against this exact image's kernel; if the digest changes without a
 # rebuild, the result is a new kernel paired with a stale .ko (it won't
-# load, or worse, it loads and is unstable). Renovate
-# (renovate.json5) opens a PR when the upstream digest changes; CI
-# builds from that PR.
+# load, or worse, it loads and is unstable). Renovate (renovate.json5)
+# opens a PR when either digest below changes; CI builds both variants
+# from that PR.
 #
-# Swap to ghcr.io/projectbluefin/dakota-gaming if you want the gaming
-# variant as a base — same strategy, just change this line.
+# BASE_IMAGE is what FROM actually resolves below — the "standard"
+# Dakota variant, built by default. BASE_IMAGE_GAMING isn't consumed
+# by any FROM in this file: CI's build matrix
+# (.github/workflows/build.yml) reads it straight out of this file and
+# passes it as `--build-arg BASE_IMAGE=...` for the "-gaming" leg, so
+# the gaming variant's kernel (the Open Gaming Collective/OGC kernel —
+# see docs.projectbluefin.io/dakota) gets picked up with no
+# Containerfile changes needed. Keeping both pins here, not only in
+# the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-FROM ghcr.io/projectbluefin/dakota:stable@sha256:0000000000000000000000000000000000000000000000000000000000000 AS dakota-base
-# ^ replace with the real digest before the first build:
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:stable@sha256:0000000000000000000000000000000000000000000000000000000000000
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:0000000000000000000000000000000000000000000000000000000000000
+# ^ replace both with the real digests before the first build:
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
+#   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
+
+FROM ${BASE_IMAGE} AS dakota-base
 
 # ---------------------------------------------------------------------
 # kernel-headers — extracts this specific image's kernel version and
