@@ -38,12 +38,22 @@ Like the upstream project, this repo builds two variants from the same
   base (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
   mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
 
+## Status
+
+Both variants build and publish successfully end-to-end in CI
+(`.github/workflows/build.yml`) — see run
+[`35776779473`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35776779473).
+The container image builds and all four NVIDIA kernel modules
+(`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
+compile and link. **Nothing here has been booted on real Dakota
+hardware yet** — see ["Known limitations"](#known-limitations) below.
+
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
-Confirmed by directly inspecting both published images
-(`ghcr.io/projectbluefin/dakota:stable` and `dakota-gaming:stable`):
-**`/usr/lib/modules/<kver>/build` is a dangling symlink.** It points
-to `/usr/src/linux-<kver>`, which is empty:
+`/usr/lib/modules/<kver>/build` is a dangling symlink on both
+published images (`ghcr.io/projectbluefin/dakota:stable` and
+`dakota-gaming:stable`). It points to `/usr/src/linux-<kver>`, which
+is empty:
 
 ```
 /usr/lib/modules/7.2.6/build -> ../../../src/linux-7.2.6
@@ -64,7 +74,8 @@ and `Module.symvers`) into the sandbox for that one build step. But
 composed OS (GNOME OS boots from a separately-staged kernel +
 initramfs), so it's absent from what actually gets published. The
 `build` symlink under `/usr/lib/modules/` survives because it's copied
-from a sibling directory ([`unsigned-modules.bst`](https://github.com/projectbluefin/dakota/blob/testing/elements/bluefin/unsigned-modules.bst)
+from a sibling directory
+([`unsigned-modules.bst`](https://github.com/projectbluefin/dakota/blob/testing/elements/bluefin/unsigned-modules.bst)
 only stages `/usr/lib/modules`, never `/usr/src`) — hence a symlink
 pointing at nothing.
 
@@ -75,8 +86,9 @@ does ship:
 - `/usr/lib/modules/<kver>/config` — the exact `.config` the running
   kernel was built with (present on both variants; this is the ground
   truth, no guessing).
-- `<kver>` — which source to fetch: a plain version (e.g. `7.2.6`)
-  means the standard variant's kernel, and matches
+- `<kver>` itself, which tells us which source to fetch: a plain
+  version (e.g. `7.2.6`) means the standard variant's kernel, and
+  matches
   [freedesktop-sdk's own source pin](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/blob/master/elements/include/linux.yml)
   — vanilla `kernel.org` at tag `v<kver>` (its two patches only touch
   riscv/powerpc code, irrelevant on x86_64). A `-ogc<N>` suffix (e.g.
@@ -87,18 +99,19 @@ does ship:
 
 `scripts/build-kernel-src.sh` fetches that source, drops in the
 shipped `.config`, runs `make olddefconfig` + `make modules_prepare`,
-then **actually builds `vmlinux`** (needed for a real `Module.symvers`
-— see ["Known risks"](#known-risks-not-fully-validated) for why a
-lighter `modules_prepare`-only tree turned out not to be enough) plus
-`drivers/gpu/drm/ttm/ttm.ko` and `drivers/gpu/drm/drm_ttm_helper.ko`
-(the DRM subsystem pieces that are loadable modules rather than built
-into `vmlinux` on Dakota's shipped `.config`), and assembles
+builds `vmlinux` (needed for a real `Module.symvers` — NVIDIA's own
+`conftest.sh` greps it to pick which kernel-version-specific code path
+to compile, so an empty one silently steers it toward APIs long
+removed from modern kernels) plus `drivers/gpu/drm/ttm/ttm.ko` and
+`drivers/gpu/drm/drm_ttm_helper.ko` (the DRM subsystem pieces that are
+loadable modules rather than built into `vmlinux` on Dakota's shipped
+`.config`, and that `nvidia-drm.ko` needs symbols from), and assembles
 `/usr/src/linux-<kver>/` with the same file list
 `linux.bst`/`linux-ogc.bst` themselves copy — reproducing their exact
 artifact shape.
 
 Run this to confirm a given image still ships the `.config` this
-approach depends on (it's a much weaker requirement than the old
+approach depends on (a much weaker requirement than the old
 `build/Makefile` check, and both variants pass it today):
 
 ```bash
@@ -127,8 +140,9 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           fetches matching upstream kernel source (kernel.org or
   │           OpenGamingCollective/linux.git, auto-detected from the
   │           kernel version string), configures it with the shipped
-  │           .config, runs modules_prepare + objtool, assembles a
-  │           real /src/linux-<kver>/ + /lib/modules/<kver>/build
+  │           .config, builds vmlinux + the DRM modules nvidia-drm.ko
+  │           needs, assembles a real /src/linux-<kver>/ +
+  │           /lib/modules/<kver>/build
   │           (scripts/build-kernel-src.sh)
   │           │
   │           └─→ nvidia-builder    (Fedora, build environment only)
@@ -211,142 +225,68 @@ upstream source + the image's own shipped `.config` (see above) — plus
 unpacking Epson's binary `epson-printer-utility` RPM, which needs no
 compilation at all.
 
-## Build status
+## Known limitations
 
-**Both variants build and publish successfully end-to-end in CI as of
-this writing** — `.github/workflows/build.yml` run
-[`35776779473`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35776779473)
-completed `Build image` → `Log in to GHCR` → `Push image` for both
-`standard` and `gaming` cleanly. That's the only claim this section
-makes: the container image builds and the four NVIDIA kernel modules
-(`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
-compile and link. **Nothing below has been booted on real Dakota
-hardware yet** — see the hardware-validation risks further down.
-
-Getting here took several rounds of "build it, read the exact error,
-fix that one thing" against real CI runs, not guesswork — kept below
-as a debugging trail, both for future-you when a base image or driver
-version bump breaks something, and because the same *shape* of fix
-(find the undefined symbol's owning module in the kernel's own
-subsystem `Makefile`, add one more scoped `make path/to/that.ko`
-target) is exactly what the next dependency gap, whenever it shows up,
-will need again:
-
-- **`make vmlinux` needs several GB of RAM for its single
-  (non-parallel) final link step** — confirmed repeatedly OOM-killing
-  on a 15 GB desktop machine with normal desktop usage running
-  alongside it, but linking cleanly in well under a minute on
-  GitHub Actions' hosted runners (16 GB) in CI. If you hit this
-  building locally, close memory-heavy applications first, add swap,
-  or just let CI do it.
-- **Gaming variant: a shallow `git clone` of the OGC kernel leaves
-  `kernelrelease` with a trailing `+`** (`7.2.6-ogc1+` instead of
-  `7.2.6-ogc1`) — confirmed hitting this in CI. `scripts/setlocalversion`
-  appends `+` whenever a `.git` directory is present and the tree
-  doesn't look like a clean tag checkout, regardless of
-  `CONFIG_LOCALVERSION_AUTO` (unset for the OGC variant) — even a
-  `--depth 1` clone of the exact tag trips it. `build-kernel-src.sh`
-  now deletes `.git` right after cloning, matching the vanilla
-  kernel.org tarball path (no `.git` there either, and it never had
-  this problem) — the kernelrelease-matches-`<kver>` check right after
-  is exactly what caught this.
-- **`drivers/gpu/drm/drm_ttm_helper.ko` itself needed
-  `drivers/gpu/drm/ttm/ttm.ko`** (`CONFIG_DRM_TTM=m` too) — confirmed
-  hitting this next, in CI, once the OGC fix above got past the
-  previous error: modpost reported `ttm_bo_vunmap`/`ttm_bo_mmap_obj`/
-  `ttm_bo_vmap` undefined in `drm_ttm_helper.ko`, all from
-  `drivers/gpu/drm/ttm/ttm_bo_vm.o`. Both are now built explicitly.
-- **Gaming variant: `openssl` (the CLI) was missing from
-  `kernel-src-builder`** — `CONFIG_MODULE_SIG_ALL=y` on that leg only
-  makes `make vmlinux` generate a self-signed `certs/signing_key.pem`
-  via `openssl req`; only `openssl-devel` (headers/libs) was installed,
-  so this failed with "command not found" until fixed. Confirmed
-  hitting this in CI as the gaming leg's last failure before it passed.
-
-## Known risks, not fully validated
-- **NVIDIA's legacy 580.xxx driver needs patching for kernel 7.x, and
-  the exact set of fixes is pinned to driver 580.173.02 — re-derive
-  them if you bump `NVIDIA_VERSION`.** Confirmed by actually building
-  it: `580.65.06` (this repo's original pin) doesn't compile against
-  kernel 7.x at all (`vm_fault_t` redefinition, several removed/renamed
-  kernel functions). `580.173.02` (the latest 580.xxx point release at
-  the time of writing) already fixes most of that upstream, but still
-  needed three fixes from this repo, applied in `build-nvidia.sh`:
+- **`make vmlinux`'s final link needs several GB of RAM** in a single
+  non-parallel step. GitHub Actions' hosted runners (16 GB) handle it
+  in well under a minute; a memory-constrained machine may need swap
+  or closed applications first, or just let CI do the build.
+- **`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
+  `drm_ttm_helper.ko`'s exports, not literally every loadable module's.**
+  If a future NVIDIA driver version (or a kernel bump) needs a symbol
+  from some *other* loadable module, find the owning module from the
+  undefined-symbol name and the kernel's own subsystem `Makefile`, then
+  add a scoped `make path/to/that.ko` target — not a blanket `make
+  modules`, which is prohibitively slow and memory-hungry against this
+  `.config`.
+- **NVIDIA's legacy 580.xxx driver needs patches for kernel 7.x, and
+  the current fixes are pinned to driver 580.173.02** — re-derive them
+  if you bump `NVIDIA_VERSION`. `580.65.06` (the original pin) doesn't
+  compile against kernel 7.x at all. `build-nvidia.sh` applies:
   - `KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion
     -Wno-incompatible-pointer-types"` — GCC 14+ (Fedora 42, the build
     stage) promotes these to hard errors unconditionally, not just via
-    `-Werror`; delivered via `KCFLAGS`, not `EXTRA_CFLAGS` appended to
-    `kernel/Kbuild` — confirmed the latter is silently ignored on
-    kernel 7.2.6's top-level `Makefile`.
+    `-Werror`; delivered via `KCFLAGS` since kernel 7.2.6's top-level
+    `Makefile` no longer reads `EXTRA_CFLAGS`.
   - A small `strncpy()` → `sized_strscpy()` compatibility shim,
-    `#include`-injected into the exact four source files that call it
+    `#include`-injected into the exact source files that call it
     (`nvidia/os-interface.c`, `nvidia/linux_nvswitch.c`,
     `nvidia-uvm/uvm_pmm_gpu.c`, `nvidia-modeset/nvidia-modeset-linux.c`
     — re-grep this list, `grep -rln '\bstrncpy(' kernel/nvidia*`, if
     the version changes). `strncpy()` was fully removed from the
-    kernel's public string API on 7.x (only mentioned in comments
-    pointing at `strscpy()` now); silencing the warnings above isn't
-    enough by itself — modpost then reports it `undefined` in three of
-    the four kernel modules, since an implicit declaration compiles to
-    a real external call instead of an inlined one. A first attempt at
-    force-including `<linux/string.h>` globally for every source file
-    (rather than scoping to just the four that need it) backfired with
-    an unrelated `vm_fault_t` conflict on a file that otherwise builds
-    clean — header-inclusion order for out-of-tree NVIDIA sources is
-    apparently fragile enough that global `-include` isn't safe here.
-  - `drivers/gpu/drm/ttm/ttm.ko` and `drivers/gpu/drm/drm_ttm_helper.ko`
-    built explicitly in `kernel-src-builder` (see above and "Known
-    risks" below) — `nvidia-drm.ko` needs
-    `drm_fbdev_ttm_driver_fbdev_probe`, exported only by that module on
-    Dakota's `.config` (`CONFIG_DRM=y`, `CONFIG_DRM_KMS_HELPER=y` are
-    both built into `vmlinux` already; only `CONFIG_DRM_TTM=m` and
-    `CONFIG_DRM_TTM_HELPER=m` are real loadable modules). Building the
-    whole `drivers/gpu/drm/` directory instead (a first attempt)
-    OOM-killed the build outright on a memory-constrained machine — it
-    compiles every vendor GPU driver enabled in this everything-enabled
-    `.config` too, `amdgpu` included.
-- **`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
-  `drm_ttm_helper.ko`'s exports, not literally every loadable module's.**
-  If a future NVIDIA driver version (or a kernel bump) needs a symbol
-  from some *other* loadable module, the fix is the same shape as those
-  two: find the owning module from the undefined-symbol name and the
-  kernel's own subsystem `Makefile`, then add a scoped
-  `make path/to/that.ko` — not a blanket `make modules`, which is
-  prohibitively slow and memory-hungry against this `.config`.
+    kernel's public string API on 7.x.
 - **`CONFIG_RUST` is force-disabled** in the reconstructed tree
   (`scripts/config --disable RUST` before `olddefconfig`). Both
   variants ship `CONFIG_RUST=y` for unrelated in-tree Rust drivers;
-  with it on, `make modules_prepare` hard-requires a matching
-  `rustc`/`bindgen` toolchain (`scripts/rust_is_available.sh`) that
-  Fedora's `kernel-src-builder` doesn't provide and NVIDIA's C-only
-  module doesn't need. This doesn't change any C struct layout,
-  calling convention, or the kernel release string (vermagic).
+  with it on, `make modules_prepare` requires a matching
+  `rustc`/`bindgen` toolchain that Fedora's `kernel-src-builder`
+  doesn't provide and NVIDIA's C-only module doesn't need. This
+  doesn't change any C struct layout, calling convention, or the
+  kernel release string (vermagic).
 - **Compiler version mismatch** — Dakota's kernels are built with GCC
-  16.2.0 (confirmed via `CONFIG_CC_VERSION_TEXT` in the shipped
-  `.config`); `kernel-src-builder` uses whatever GCC Fedora 42 ships.
-  `RANDSTRUCT` and `LTO` are both off in the shipped config (confirmed
-  — the two configs most likely to make a cross-compiler build
-  genuinely ABI-incompatible), which meaningfully de-risks this, but
-  it isn't a byte-for-byte guarantee. `build-nvidia.sh` already builds
-  with `IGNORE_CC_MISMATCH=1` for the same reason — a real
-  incompatibility would show up as a module load failure, not a build
-  failure. Test `modprobe nvidia` before trusting a build.
+  16.2.0 (per `CONFIG_CC_VERSION_TEXT` in the shipped `.config`);
+  `kernel-src-builder` uses whatever GCC Fedora 42 ships. `RANDSTRUCT`
+  and `LTO` are both off in the shipped config (the two options most
+  likely to make a cross-compiler build genuinely ABI-incompatible),
+  which meaningfully de-risks this, but isn't a byte-for-byte
+  guarantee. `build-nvidia.sh` builds with `IGNORE_CC_MISMATCH=1` for
+  the same reason — a real incompatibility would show up as a module
+  load failure, not a build failure. Test `modprobe nvidia` before
+  trusting a build.
 - **Gaming variant: Dakota's own fixup patches to the OGC kernel are
   not applied.** `linux-ogc.bst` applies three small patches from
   `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an
   `aw87xxx` DSP-only fix, an `asus` backlight fix) on top of the OGC
-  tree before configuring it. `build-kernel-src.sh` clones the OGC
+  tree before configuring it; `build-kernel-src.sh` clones the OGC
   tree as-is. All three are narrow, unrelated hardware-driver fixups —
   unlikely to affect the reconstructed headers/scripts/objtool this
   repo actually needs — but this is a deliberate fidelity gap, not a
   verified equivalence.
 - **Gaming variant: `CONFIG_MODULE_SIG_ALL=y`** (standard variant has
-  `CONFIG_MODULE_SIG` unset; see ["Build status"](#build-status) above
-  for the build-time consequence this already had). At runtime, if the
-  real machine has Secure Boot enabled and kernel lockdown active, this
-  makes it *more* likely an unsigned out-of-tree module gets rejected
-  at load time on `-gaming` specifically, on top of the general Secure
-  Boot risk below.
+  `CONFIG_MODULE_SIG` unset). If the real machine has Secure Boot
+  enabled and kernel lockdown active, this makes it *more* likely an
+  unsigned out-of-tree module gets rejected at load time on `-gaming`
+  specifically, on top of the general Secure Boot risk below.
 - **Secure Boot / module signing** — Dakota uses a UKI
   (`systemd-boot` + unified kernel image). An unsigned out-of-tree
   module can be rejected at boot under kernel lockdown with Secure
@@ -376,12 +316,11 @@ will need again:
 ## Local build
 
 **Memory:** `kernel-src-builder`'s `make vmlinux` step needs several
-GB of free RAM for its final link (confirmed: this repeatedly OOM-
-killed on a 15 GB desktop machine with normal desktop usage running
-alongside it). Close memory-heavy applications first, or build on a
-machine with more headroom — GitHub Actions' hosted runners (16 GB)
-should clear this comfortably, which is one more reason to let CI do
-the definitive build rather than fighting it on a laptop.
+GB of free RAM for its final link. Close memory-heavy applications
+first, or build on a machine with more headroom — GitHub Actions'
+hosted runners (16 GB) clear this comfortably, which is one more
+reason to let CI do the definitive build rather than fighting it on a
+laptop.
 
 ```bash
 # 1. Confirm the current digests and paste them into the Containerfile

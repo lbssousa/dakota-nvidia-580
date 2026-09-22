@@ -4,16 +4,16 @@
 # stage needs to reconstruct a kernel build tree: the kernel version
 # and its exact .config at /usr/lib/modules/<kver>/config.
 #
-# CONFIRMED (see README.md, "Why /usr/lib/modules/<kver>/build is
-# missing"): /usr/lib/modules/<kver>/build itself is a dangling
-# symlink on published Dakota images — Dakota's own BuildStream
-# pipeline never ships it at runtime, by design (linux.bst is a
-# build-time-only dependency of nvidia-drivers.bst upstream). This
-# repo works around that by rebuilding the tree from upstream kernel
-# source + the shipped .config (scripts/build-kernel-src.sh) instead
-# of relying on /build being present. What actually needs to exist is
-# the .config this check looks for — if THAT'S missing, Dakota's
-# kernel packaging changed in a way this repo doesn't handle yet.
+# /usr/lib/modules/<kver>/build itself is a dangling symlink on
+# published Dakota images — Dakota's own BuildStream pipeline never
+# ships it at runtime, by design (linux.bst is a build-time-only
+# dependency of nvidia-drivers.bst upstream; see README.md, "Why
+# /usr/lib/modules/<kver>/build is missing"). This repo works around
+# that by rebuilding the tree from upstream kernel source + the shipped
+# .config (scripts/build-kernel-src.sh) instead of relying on /build
+# being present. What actually needs to exist is the .config this check
+# looks for — if THAT'S missing, Dakota's kernel packaging changed in a
+# way this repo doesn't handle yet.
 #
 # Usage: scripts/check-kernel-headers.sh [ref] [variant]
 #   ref:     tag or tag@sha256:... of the Dakota image (default: stable)

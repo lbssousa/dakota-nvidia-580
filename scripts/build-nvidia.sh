@@ -54,27 +54,25 @@ echo "==> Building the kmod against ${build_dir}..."
 # considering this validated.
 #
 # IGNORE_MISSING_MODULE_SYMVERS: belt-and-suspenders only. The tree
-# scripts/build-kernel-src.sh reconstructs now ships a real Module.symvers
-# (from `make vmlinux`, not just `modules_prepare` — see that script), so
-# this sanity check should pass on its own; this flag just avoids a hard
-# Containerfile failure in the edge case where a future Dakota .config
-# somehow produces an empty one instead. NVIDIA's own conftest.sh actually
-# *depends* on Module.symvers content, beyond what this flag's name
-# suggests — it greps it to decide which kernel-version-specific code
-# path to compile (e.g. del_timer_sync vs. timer_delete_sync in
-# nv-timer.h); an empty/missing file silently steers it toward APIs long
-# removed from modern kernels instead of just skipping a CRC check
-# (confirmed by actually hitting this with an incomplete tree).
+# scripts/build-kernel-src.sh reconstructs ships a real Module.symvers
+# (from `make vmlinux` — see that script), so this sanity check should
+# pass on its own; this flag just avoids a hard Containerfile failure
+# in the edge case where a future Dakota .config somehow produces an
+# empty one instead. NVIDIA's own conftest.sh actually *depends* on
+# Module.symvers content, beyond what this flag's name suggests — it
+# greps it to decide which kernel-version-specific code path to
+# compile (e.g. del_timer_sync vs. timer_delete_sync in nv-timer.h); an
+# empty/missing file silently steers it toward APIs long removed from
+# modern kernels instead of just skipping a CRC check.
 #
 # KCFLAGS: GCC 14+ (this Fedora 42 stage) made a small group of
-# diagnostics errors unconditionally, not just via -Werror (confirmed:
-# appending `EXTRA_CFLAGS += -Wno-...` to kernel/Kbuild had no effect at
-# all — kernel 7.2.6's top-level Makefile no longer reads EXTRA_CFLAGS,
-# only `KBUILD_CFLAGS += $(KCFLAGS)`, confirmed straight in its source).
-# These three all surface on the same underlying issue below (strncpy),
-# just differently depending on how each call site uses it:
-#   - implicit-function-declaration: the plain "used before declared"
-#     case (nvidia/os-interface.c).
+# diagnostics errors unconditionally, not just via -Werror. These three
+# all trace back to the same root cause in NVIDIA's source: several
+# files call strncpy() without including <string.h>/<linux/string.h>,
+# relying on some other kernel header to pull it in transitively, which
+# no longer holds on kernel 7.x:
+#   - implicit-function-declaration: the plain "strncpy() used before
+#     declared" case (nvidia/os-interface.c).
 #   - int-conversion: same missing declaration, but where the call site
 #     *does* use the return value — an implicit declaration defaults to
 #     an int-returning prototype, so `return strncpy(...)` (real
@@ -83,33 +81,35 @@ echo "==> Building the kmod against ${build_dir}..."
 #     error promotions; nvidia-drivers.bst upstream already demotes this
 #     one for the same reason ("NVIDIA's source still has benign
 #     mismatches" — see elements/bluefin-nvidia/nvidia-drivers.bst).
+# None of this is a real ABI/behavior risk: every case is GCC correctly
+# assuming the wrong prototype for a function that unambiguously exists
+# and behaves exactly as declared in <string.h> once actually visible.
 # Same class of fix lbssousa/bluefin's build_files/20-epson.sh applies to
 # Epson's escpr driver for the identical GCC 14+ change (that build uses
-# autotools CFLAGS, not kbuild, so it doesn't hit the KCFLAGS-vs-
-# EXTRA_CFLAGS wrinkle above).
+# autotools CFLAGS, not kbuild).
 #
-# Silencing those diagnostics isn't enough by itself: modpost then
-# reports "strncpy" undefined in nvidia.ko/nvidia-uvm.ko/nvidia-modeset.ko
-# — confirmed by actually hitting it, including after force-including
-# <linux/string.h> globally via KCFLAGS -include (which should have
-# supplied a declaration, if one still existed). It doesn't: strncpy()
-# was fully removed from Linux's public string API on kernel 7.x
-# (checked straight in include/linux/string.h upstream — only mentioned
-# in comments pointing at strscpy() as the replacement now; two of the
-# four files below already #include <linux/string.h> directly and still
-# fail the same way, confirming this). Forcing it globally also backfired
-# a different way: it reordered header inclusion for every NVIDIA source
-# file, not just the ones needing it, and reintroduced a 'conflicting
-# types for vm_fault_t' error (nv-platform.c) that the same NVIDIA
-# version otherwise builds clean without it — confirmed by hitting that
-# regression, then removing the global -include and scoping the fix
-# below to only the 4 files that actually call strncpy().
+# Delivered via KCFLAGS, not EXTRA_CFLAGS appended to kernel/Kbuild:
+# kernel 7.2.6's top-level Makefile only reads `KBUILD_CFLAGS +=
+# $(KCFLAGS)`, not EXTRA_CFLAGS.
 #
-# sized_strscpy() (lib/string.c, EXPORT_SYMBOL, always built into
-# vmlinux — never a loadable module, so this doesn't depend on
-# scripts/build-kernel-src.sh covering module-only exports) is the real
-# underlying primitive strscpy() itself wraps; the shim below
-# reimplements strncpy()'s classic signature on top of it.
+# Silencing those diagnostics isn't enough by itself to make strncpy()
+# work, though: modpost then reports it `undefined` in
+# nvidia.ko/nvidia-uvm.ko/nvidia-modeset.ko. Without a visible
+# declaration, GCC compiles the call as a real external symbol
+# reference instead of inlining it (strncpy is a kernel builtin/inline,
+# never an EXPORT_SYMBOL) — silencing the warning doesn't change that
+# generated code. strncpy() was in fact fully removed from Linux's
+# public string API on kernel 7.x (include/linux/string.h upstream only
+# mentions it in comments pointing at strscpy() as the replacement);
+# force-including <linux/string.h> globally via a compiler flag doesn't
+# help either, and reorders header inclusion for every NVIDIA source
+# file in a way that reintroduces an unrelated 'conflicting types for
+# vm_fault_t' error on files that otherwise build clean. sized_strscpy()
+# (lib/string.c, EXPORT_SYMBOL, always built into vmlinux — never a
+# loadable module) is the real underlying primitive strscpy() wraps;
+# the shim below reimplements strncpy()'s classic signature on top of
+# it, and is injected only into the specific files that call the old
+# name.
 nv_strncpy_shim="$(mktemp --suffix=.h)"
 cat > "${nv_strncpy_shim}" << 'EOF'
 #ifndef __NV_STRNCPY_COMPAT_H__

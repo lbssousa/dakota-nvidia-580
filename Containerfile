@@ -10,14 +10,14 @@
 # downstream instead of a BuildStream fork, and the risks that haven't
 # been validated on real hardware yet).
 #
-# CONFIRMED (not just suspected — see README.md "Why
-# /usr/lib/modules/<kver>/build is missing"): the published Dakota
-# images do NOT expose a usable kernel build tree at
-# /usr/lib/modules/<kver>/build — the symlink is there, but its target
-# (/usr/src/linux-<kver>) is empty. Upstream's own nvidia-drivers.bst
-# never hits this because it builds inside BuildStream, where
-# freedesktop-sdk.bst:components/linux.bst (or, for -gaming,
-# elements/core/linux-ogc.bst) is staged as an ordinary build-dependency.
+# The published Dakota images do NOT expose a usable kernel build tree
+# at /usr/lib/modules/<kver>/build — the symlink is there, but its
+# target (/usr/src/linux-<kver>) is empty (see README.md, "Why
+# /usr/lib/modules/<kver>/build is missing"). Upstream's own
+# nvidia-drivers.bst never hits this because it builds inside
+# BuildStream, where freedesktop-sdk.bst:components/linux.bst (or, for
+# -gaming, elements/core/linux-ogc.bst) is staged as an ordinary
+# build-dependency.
 #
 # The kernel-src-builder stage below reconstructs that same tree
 # ourselves outside BuildStream: it fetches the matching upstream
@@ -89,11 +89,9 @@ RUN set -eux; \
 # ---------------------------------------------------------------------
 FROM fedora:42 AS kernel-src-builder
 # openssl (the CLI, not just openssl-devel's headers/libs) is needed by
-# certs/Makefile's gen_key rule -- confirmed by actually hitting this in
-# CI: the gaming variant's CONFIG_MODULE_SIG_ALL=y (unset on standard)
-# makes `make vmlinux` generate a self-signed certs/signing_key.pem via
-# `openssl req ...`, which failed with "command not found" (Error 127)
-# until this was added.
+# certs/Makefile's gen_key rule: the gaming variant's shipped .config
+# has CONFIG_MODULE_SIG_ALL=y (unset on standard), which makes `make
+# vmlinux` generate a self-signed certs/signing_key.pem via `openssl req`.
 RUN dnf install -y gcc make bison flex bc elfutils-libelf-devel \
         openssl openssl-devel perl findutils diffutils ncurses-devel \
         git curl tar xz which hostname && \

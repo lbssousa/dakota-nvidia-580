@@ -13,19 +13,16 @@
 # scripts/, include/, and (if enabled) tools/objtool/objtool that an
 # out-of-tree module build needs — into the sandbox. That tree is
 # real, not a hack: it's the same shape a kernel-devel RPM ships,
-# assembled by linux.bst's own install-commands (fetched from
-# gitlab.com/freedesktop-sdk/freedesktop-sdk and
-# github.com/OpenGamingCollective/linux while investigating this).
-# It's just never included in the final runtime OCI image, because
-# linux.bst is deliberately NOT a runtime-dependency of the composed
-# OS (gnomeos boots from a separately-staged kernel+initramfs).
+# assembled by linux.bst's own install-commands. It's just never
+# included in the final runtime OCI image, because linux.bst is
+# deliberately NOT a runtime-dependency of the composed OS (gnomeos
+# boots from a separately-staged kernel+initramfs).
 #
 # This script reproduces that same linux.bst/linux-ogc.bst artifact
 # shape ourselves, from the two pieces of ground truth the *runtime*
 # image DOES ship:
 #   - /usr/lib/modules/<kver>/config — the exact .config the running
-#     kernel was built with (confirmed identical across both Dakota
-#     variants when this was written).
+#     kernel was built with.
 #   - <kver> itself, which tells us which upstream tree to fetch:
 #       - a plain version (e.g. "7.2.6")      -> vanilla kernel.org
 #         source at tag v<kver> (freedesktop-sdk's own linux.bst
@@ -52,11 +49,9 @@ if [[ "${kver}" == *-ogc* ]]; then
     git clone --branch "v${kver}" --depth 1 https://github.com/OpenGamingCollective/linux.git src
     # scripts/setlocalversion appends a '+' to kernelrelease whenever a
     # .git directory is present and the tree doesn't look like a clean
-    # checkout of an exact tag -- confirmed by actually hitting this in
-    # CI: a --depth 1 clone still tripped it ('7.2.6-ogc1+' vs. the
-    # running kernel's '7.2.6-ogc1'), failing the vermagic-match check
-    # below. Removing .git makes this identical to the tarball path
-    # below, which never had this problem (no git metadata to inspect).
+    # checkout of an exact tag, even for a --depth 1 clone of that tag.
+    # Removing .git makes this identical to the tarball path below,
+    # which has no git metadata to inspect.
     rm -rf src/.git
 else
     series="${kver%%.*}"
@@ -107,14 +102,10 @@ fi
 # macros alone -- it greps Module.symvers for the *exact* export line of
 # each symbol it cares about, and silently assumes "not present" (falling
 # back to APIs long removed from modern kernels) whenever that file is
-# missing or incomplete. modules_prepare alone never produces a real one
-# (confirmed by actually hitting this: NVIDIA 580.173.02 failed to build
-# on "del_timer_sync" -- removed from kernel 7.x in favor of
-# timer_delete_sync -- purely because our Module.symvers was empty, not
-# because of any real kernel/driver incompatibility). `make vmlinux`
-# builds the kernel image and runs modpost over it, populating
-# Module.symvers with every symbol exported directly from the kernel
-# (built-in, not from a loadable module) -- covers exactly this class of
+# missing or incomplete. modules_prepare alone never produces a real one.
+# `make vmlinux` builds the kernel image and runs modpost over it,
+# populating Module.symvers with every symbol exported directly from the
+# kernel (built-in, not from a loadable module) -- covers this class of
 # core-subsystem symbol NVIDIA's conftest checks for, without paying for
 # a full `make modules` across every driver in this everything-enabled
 # .config. See README.md for what this still doesn't cover.
@@ -123,51 +114,44 @@ make -j"$(nproc)" vmlinux
 
 # drivers/gpu/drm/ is built as a set of loadable modules in Dakota's
 # shipped .config (not built into vmlinux), so `make vmlinux` alone
-# leaves DRM's own exports out of Module.symvers -- confirmed by
-# actually hitting this: nvidia-drm.ko (the DRM/KMS integration module,
-# needed for accelerated Wayland/GNOME Shell output) failed at modpost
-# on "drm_fbdev_ttm_driver_fbdev_probe" undefined, a real, EXPORT_SYMBOL'd
-# symbol (drivers/gpu/drm/drm_fbdev_ttm.c) that's simply not built-in on
-# this kernel.
+# leaves DRM's own exports out of Module.symvers. nvidia-drm.ko (the
+# DRM/KMS integration module, needed for accelerated Wayland/GNOME
+# Shell output) needs drm_fbdev_ttm_driver_fbdev_probe
+# (drivers/gpu/drm/drm_fbdev_ttm.c), which belongs to
+# drivers/gpu/drm/drm_ttm_helper.ko -- CONFIG_DRM=y and
+# CONFIG_DRM_KMS_HELPER=y are both built into vmlinux already on this
+# .config, but CONFIG_DRM_TTM_HELPER=m is a real loadable module (per
+# `drm_ttm_helper-$(CONFIG_DRM_FBDEV_EMULATION) += drm_fbdev_ttm.o` in
+# drivers/gpu/drm/Makefile). drm_ttm_helper.ko itself then needs
+# drivers/gpu/drm/ttm/ttm.ko (CONFIG_DRM_TTM=m too, providing
+# ttm_bo_vunmap/ttm_bo_mmap_obj/ttm_bo_vmap).
 #
 # `make drivers/gpu/drm/` (the whole directory) is NOT the right scope
-# here -- confirmed by actually hitting this: it builds every vendor GPU
-# driver enabled in this everything-enabled .config too (amdgpu alone is
-# one of the largest drivers in the kernel tree), and OOM-killed this
-# stage on a memory-constrained machine. On Dakota's shipped .config,
-# CONFIG_DRM=y and CONFIG_DRM_KMS_HELPER=y are both built-in already (so
-# `make vmlinux` above already covers their exports; also confirmed by
-# hitting this -- `make drm.ko drm_kms_helper.ko` fails outright with
-# "no rule to make target drm.o", since a =y option has no .ko to build
-# at all). CONFIG_DRM_TTM_HELPER=m is an actual loadable module, and
-# drm_fbdev_ttm.o (the file providing nvidia-drm.ko's undefined symbol)
-# belongs to it (`drm_ttm_helper-$(CONFIG_DRM_FBDEV_EMULATION) +=
-# drm_fbdev_ttm.o` in drivers/gpu/drm/Makefile upstream).
-#
-# drm_ttm_helper.ko itself then needs drivers/gpu/drm/ttm/ttm.ko
-# (CONFIG_DRM_TTM=m too) -- confirmed by hitting this next: modpost
-# reported ttm_bo_vunmap/ttm_bo_mmap_obj/ttm_bo_vmap undefined in
-# drm_ttm_helper.ko, all from drivers/gpu/drm/ttm/ttm_bo_vm.o (per
-# drivers/gpu/drm/ttm/Makefile's `ttm-y := ... ttm_bo_vm.o ...`, built
-# under obj-$(CONFIG_DRM_TTM) += ttm.o). Same shape of fix as
-# drm_ttm_helper.ko itself: find the owning module from the kernel's own
-# subsystem Makefile, add it as another scoped target -- not a blanket
-# `make modules`.
+# for this: it builds every vendor GPU driver enabled in this
+# everything-enabled .config too (amdgpu alone is one of the largest
+# drivers in the kernel tree), which is prohibitively slow and
+# memory-hungry. Building the two specific .ko targets instead keeps
+# this to just what nvidia-drm.ko actually needs; if a future NVIDIA
+# version or kernel bump needs a symbol from some other loadable
+# module, find its owning module the same way (grep the kernel's own
+# subsystem Makefile for the file that exports it) and add one more
+# scoped target here.
 echo "==> Building ttm.ko + drm_ttm_helper.ko so nvidia-drm.ko's DRM-core dependencies land in Module.symvers..."
 make -j"$(nproc)" drivers/gpu/drm/ttm/ttm.ko drivers/gpu/drm/drm_ttm_helper.ko
 
-# Modern kbuild (confirmed on 7.2.6) names `make vmlinux`'s modpost output
-# vmlinux.symvers, not Module.symvers -- the latter is only materialized
-# by the `modules` target (merging vmlinux.symvers with every built
-# module's own exports). Since we built drivers/gpu/drm/ as modules above
-# (not the full `modules` target), check for Module.symvers first --
-# kbuild's per-directory module build does produce/update it -- and only
-# fall back to vmlinux.symvers if that somehow didn't happen.
-# External-module tooling (nvidia-installer's Kbuild, conftest.sh) only
-# ever looks for the file named Module.symvers, so install it under that
-# name -- its content is genuinely real (vmlinux + DRM subsystem)
-# exports, just missing anything exported solely by some *other*
-# loadable module we didn't also build here.
+# Modern kbuild names `make vmlinux`'s modpost output vmlinux.symvers,
+# not Module.symvers -- the latter is only materialized by the full
+# `modules` target (merging vmlinux.symvers with every built module's
+# own exports). Since we built the two DRM modules above via scoped
+# per-target invocations (not the full `modules` target), check for
+# Module.symvers first -- kbuild's per-target module build does
+# produce/update it -- and only fall back to vmlinux.symvers if that
+# somehow didn't happen. External-module tooling (nvidia-installer's
+# Kbuild, conftest.sh) only ever looks for the file named
+# Module.symvers, so install it under that name -- its content is
+# genuinely real (vmlinux + the two DRM modules') exports, just missing
+# anything exported solely by some *other* loadable module we didn't
+# also build here.
 if [ -f Module.symvers ]; then
     symvers_src="Module.symvers"
 elif [ -f vmlinux.symvers ]; then
