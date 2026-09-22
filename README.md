@@ -1,7 +1,7 @@
 # dakota-nvidia-580
 
 A customized [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
-image with two components baked in via downstream OCI image layering
+image with three components baked in via downstream OCI image layering
 (not by forking the upstream BuildStream build — see ["Why downstream
 instead of forking
 BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
@@ -20,6 +20,15 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `/usr`, overwriting the stock libfprint** shipped in the Dakota base
   image at its original path — see ["How the libfprint overwrite
   works"](#how-the-libfprint-overwrite-works) below.
+- **Epson's [`epson-printer-utility`](https://support.epson.net/linux/Printer/LSB_distribution_pages/en/utility.php)**
+  (printer setup/maintenance GUI + `ecbd` network-discovery daemon),
+  obtained and installed the same way as in
+  [ublue-os/bluefin](https://github.com/ublue-os/bluefin)
+  (`build_files/20-epson.sh`) — downloaded as a binary RPM and unpacked
+  rather than installed via `rpm`/`dnf`, since Dakota has neither. This
+  repo installs only the utility, not bluefin's
+  `epson-inkjet-printer-escpr` driver package (which needs building
+  from source against `cups-devel`/autotools, not present on Dakota).
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, both published:
@@ -64,9 +73,9 @@ The same `Containerfile` builds both variants — `dakota-base` resolves
 to whichever image `BASE_IMAGE` points at (standard Dakota by
 default; the gaming base when CI overrides it for the `-gaming` leg —
 see ["CI and automatic updates"](#ci-and-automatic-updates) below).
-Everything downstream (kernel headers, kmod build, libfprint) is
-derived from that image at build time, so it needs no per-variant
-changes.
+Everything downstream (kernel headers, kmod build, libfprint, Epson
+utility) is derived from that image at build time, so it needs no
+per-variant changes.
 
 ```
 dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha256:...
@@ -86,17 +95,24 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           builds the fork against Fedora's opencv-devel, with
   │           --prefix=/usr --libdir=<probed dir>, DESTDIR=/out
   │
+  ├─→ epson-builder           (Fedora, build environment only)
+  │         downloads Epson's binary epson-printer-utility RPM and
+  │         unpacks it (no rpm/dnf install) into /out
+  │         (scripts/install-epson-utility.sh)
+  │
   └─→ final (FROM dakota-base again)
-        COPY of both /out trees (the second one overwrites the stock
-        libfprint in place), nouveau blacklist, depmod + ldconfig -r,
-        bootc container lint
+        COPY of all three /out trees (libfprint's overwrites the
+        stock library in place), nouveau blacklist, depmod +
+        ldconfig -r, Epson post-install steps (symlink, systemd
+        enable, /etc/services entry), bootc container lint
 ```
 
-The `nvidia-builder` and `libfprint-builder` stages use Fedora **only
-as a build environment** (it has `dnf`, `gcc`, `meson`...) — nothing
-from them ends up in the final image except what the scripts
-explicitly package into `/out`. The final image is still plain Dakota
-(GNOME OS, no RPMs) with these two payloads layered on top.
+The `nvidia-builder`, `libfprint-builder` and `epson-builder` stages
+use Fedora **only as a build environment** (it has `dnf`, `gcc`,
+`meson`, `rpm2cpio`...) — nothing from them ends up in the final image
+except what the scripts explicitly package into `/out`. The final
+image is still plain Dakota (GNOME OS, no RPMs) with these three
+payloads layered on top.
 
 ## How the libfprint overwrite works
 
@@ -142,7 +158,8 @@ This repo takes the cheaper path to maintain for a single-user setup:
 a `Containerfile` that starts `FROM` the already-published image and
 only compiles what actually needs compiling (the out-of-tree kmod +
 the libfprint fork) against headers extracted from that specific
-image.
+image — plus unpacking Epson's binary `epson-printer-utility` RPM,
+which needs no compilation at all.
 
 ## Known risks, not fully validated
 
@@ -168,6 +185,14 @@ image.
   `--advanced-options` of recent versions, but they change between
   branches. Re-validate before changing `NVIDIA_VERSION`.
 - **libfprint overwrite ABI assumption** — see the section above.
+- **`epson-printer-utility` post-install steps run against Dakota
+  itself, not just verified via Fedora tooling** — `systemctl enable`,
+  the `/etc/services` edit, and the (guarded) `update-desktop-database`
+  call all run in the `final` stage, straight against the Dakota base
+  image. The file layout the RPM unpacks into was verified against a
+  real download in a Fedora build stage, but whether the daemon starts
+  cleanly, the launcher shows up in GNOME Shell, and printing actually
+  works has not been checked on real Dakota hardware.
 - **Nothing here has been validated on real Dakota hardware.** Treat
   it as a tested starting point, not a guarantee — the same caveat
   `bluefin-initial-setup` makes about Dakota in general (still alpha).
@@ -198,6 +223,9 @@ podman build --file Containerfile \
 # 4. Basic smoke test before installing on any real machine:
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
 podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
+podman run --rm localhost/dakota-nvidia-580:dev sh -c \
+  'readlink -f /usr/bin/epson-printer-utility && test -x /usr/bin/epson-printer-utility'
+podman run --rm localhost/dakota-nvidia-580:dev systemctl is-enabled ecbd.service
 ```
 
 To change the driver version: `--build-arg NVIDIA_VERSION=580.xx.xx`
@@ -216,11 +244,13 @@ ujust rebase-helper
 ```
 
 A reboot is required afterwards. Validate `modprobe nvidia`,
-`nvidia-smi`, and the fingerprint reader (`fprintd-list $USER`,
-`fprintd-verify`) before considering the migration done — and keep a
-way back (`bootc switch` to the original `dakota:stable`/
-`dakota-gaming:stable` image) until you've validated it on real
-hardware.
+`nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
+`fprintd-verify`), and the Epson utility (`systemctl status
+ecbd.service`, launching "Epson Printer Utility" from the app grid, or
+`epson-printer-utility` on the command line) before considering the
+migration done — and keep a way back (`bootc switch` to the original
+`dakota:stable`/`dakota-gaming:stable` image) until you've validated
+it on real hardware.
 
 ## CI and automatic updates
 

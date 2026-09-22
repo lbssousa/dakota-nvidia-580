@@ -4,10 +4,11 @@
 # branch (for a GPU generation no longer supported by the official
 # dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
 # branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
-# (Goodix 538d), baked in via downstream OCI image layering — not via
-# forking the upstream BuildStream build. See README.md for the full
-# reasoning (why downstream instead of a BuildStream fork, and the
-# risks that haven't been validated on real hardware yet).
+# (Goodix 538d) + Epson's epson-printer-utility, baked in via
+# downstream OCI image layering — not via forking the upstream
+# BuildStream build. See README.md for the full reasoning (why
+# downstream instead of a BuildStream fork, and the risks that haven't
+# been validated on real hardware yet).
 #
 # PREREQUISITE NOT VERIFIED BY THIS FILE ALONE: the pinned Dakota image
 # below must expose a complete kernel build tree at
@@ -130,7 +131,22 @@ RUN libdir="$(cat /libfprint-libdir)" && \
     DESTDIR=/out ninja -C /src/builddir install
 
 # ---------------------------------------------------------------------
-# final — Dakota + both payloads, baked into the image. /usr is
+# epson-builder — Fedora used only to download and unpack Epson's
+# binary epson-printer-utility RPM (printer setup/maintenance GUI +
+# ecbd network-discovery daemon), via
+# scripts/install-epson-utility.sh — adapted from lbssousa/bluefin's
+# build_files/20-epson.sh. Only rpm2cpio/cpio/curl are needed; nothing
+# here is compiled, and no dnf/rpm database ends up in the final
+# image, since Dakota (GNOME OS) has neither.
+# ---------------------------------------------------------------------
+FROM fedora:42 AS epson-builder
+RUN dnf install -y curl cpio rpm && \
+    dnf clean all
+COPY scripts/install-epson-utility.sh /install-epson-utility.sh
+RUN chmod +x /install-epson-utility.sh && /install-epson-utility.sh /out
+
+# ---------------------------------------------------------------------
+# final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
 # stock libfprint files at their original path — works, unlike the
@@ -142,6 +158,7 @@ FROM dakota-base
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
+COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Post-install steps. depmod is our own addition (specific to having
@@ -154,5 +171,38 @@ RUN kver="$(cat /kernel-version)" && \
     depmod -a "$kver" && \
     ldconfig -r / && \
     rm -f /kernel-version
+
+# Epson epson-printer-utility post-install steps (replicated from the
+# RPM's post-install scriptlet, which cannot run in a container build;
+# see scripts/install-epson-utility.sh for the file-layout half of
+# this):
+#
+# - /opt -> /var/opt compatibility symlink: bootc's /opt is a symlink
+#   to /var/opt (mutable, not part of the image layer), but the
+#   binary's resource paths are hardcoded to /opt/epson-printer-utility/.
+#   /usr/lib is replaced wholesale on 'bootc upgrade'; this symlink
+#   persists across that and always points at the current version.
+# - systemctl enable: registers the ecbd daemon (network printer
+#   discovery) to start at boot.
+# - /etc/services entry: registers the ecbd port (cbtd 35587/tcp);
+#   /etc is mutable in bootc and 3-way merged on upgrade, safe to edit.
+# - update-desktop-database: rebuilds the desktop file cache so the
+#   utility's launcher shows up immediately; guarded since Dakota
+#   (GNOME OS) may not ship desktop-file-utils.
+RUN mkdir -p /var/opt && \
+    ln -sfn /usr/lib/epson-printer-utility /var/opt/epson-printer-utility && \
+    systemctl enable ecbd.service && \
+    if ! grep -q 'cbtd' /etc/services 2>/dev/null; then \
+        printf '\ncbtd\t35587/tcp\t# Epson printer backend\n' >> /etc/services; \
+    fi && \
+    if command -v update-desktop-database >/dev/null 2>&1; then \
+        update-desktop-database /usr/share/applications; \
+    fi
+
+# Device nodes (e.g. /dev/ecblp0) created by the epson-printer-utility
+# RPM's post-install scriptlet on a real install cannot be stored in
+# OCI image layers; none should exist here since we never ran the
+# scriptlet, but clean up defensively to avoid rechunking failures.
+RUN find / -xdev \( -type c -o -type b -o -type p -o -type s \) -name 'ecblp*' -delete 2>/dev/null || true
 
 RUN bootc container lint
