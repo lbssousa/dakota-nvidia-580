@@ -1,168 +1,203 @@
 # dakota-nvidia-580
 
-Imagem [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
-personalizada, com dois componentes baked-in via layering downstream
-de imagem OCI (não via fork do BuildStream upstream — ver ["Por que
-downstream e não fork do
-BuildStream"](#por-que-downstream-e-não-fork-do-buildstream) abaixo):
+A customized [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
+image with two components baked in via downstream OCI image layering
+(not by forking the upstream BuildStream build — see ["Why downstream
+instead of forking
+BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
 
-- **Driver proprietário NVIDIA na branch legada 580.xxx** — necessário
-  porque a GPU alvo é de uma geração fora do suporte nas variantes
-  `dakota-nvidia`/`dakota-nvidia-gaming` oficiais, que seguem a branch
-  mais nova (~610.x/615.x em 2026).
-- **Fork [lbssousa/libfprint](https://github.com/lbssousa/libfprint)**
-  (branch `goodix-538d-sigfm-gtls`), com suporte ao leitor de
-  impressão digital Goodix 538d — o mesmo fork usado em
+- **Proprietary NVIDIA driver on the legacy 580.xxx branch** — needed
+  because the target GPU is from a generation no longer supported by
+  the official `dakota-nvidia`/`dakota-nvidia-gaming` variants, which
+  track the newer branch (~610.x/615.x as of 2026).
+- **[lbssousa/libfprint](https://github.com/lbssousa/libfprint) fork**
+  (`goodix-538d-sigfm-gtls` branch), adding support for the Goodix
+  538d fingerprint reader — the same fork used in
   [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
-  (`playbooks/dakota/libfprint.yml`), que o instala em **runtime** via
-  distrobox para hosts Dakota que não usam esta imagem. Aqui ele é
-  compilado no build da imagem e baked em `/usr/local` — sem precisar
-  do workaround `/var/usrlocal` que a instalação em runtime exige (ver
-  esse repositório para o porquê).
+  (`playbooks/dakota/libfprint.yml`), which installs it at **runtime**
+  via distrobox for Dakota hosts not using this custom image. Here it
+  is compiled during the image build and installed **directly into
+  `/usr`, overwriting the stock libfprint** shipped in the Dakota base
+  image at its original path — see ["How the libfprint overwrite
+  works"](#how-the-libfprint-overwrite-works) below.
 
-## ⚠️ Antes de tudo: valide os headers do kernel
+## ⚠️ Before anything else: validate the kernel headers
 
-O maior risco não resolvido deste projeto inteiro é este: **não está
-confirmado que a imagem `dakota:stable` publicada expõe uma árvore de
-build de kernel completa** em `/usr/lib/modules/<kver>/build`. O
-Dakota é montado do zero via Apache BuildStream (não via RPMs de
-`kernel-devel`), numa imagem otimizada para espaço com dedup via
-Chunkah — não há garantia de que essa árvore sobrevive no runtime
-image em vez de ficar só nos artefatos intermediários do build.
+The single biggest unresolved risk in this whole project is this:
+**it is not confirmed that the published `dakota:stable` image exposes
+a complete kernel build tree** at `/usr/lib/modules/<kver>/build`.
+Dakota is assembled from scratch via Apache BuildStream (not from RPM
+`kernel-devel` packages), as a space-optimized image with dedup via
+Chunkah — there's no guarantee that tree survives in the runtime image
+rather than only existing in BuildStream's own intermediate build
+artifacts.
 
-Rode isto **antes** de configurar segredos do GHCR, Renovate, etc.:
+Run this **before** setting up GHCR secrets, Renovate, etc.:
 
 ```bash
 ./scripts/check-kernel-headers.sh stable
 ```
 
-Se falhar, este caminho inteiro (Containerfile downstream) não
-funciona, e a única alternativa vira forkar o BuildStream do próprio
-[`projectbluefin/dakota`](https://github.com/projectbluefin/dakota) e
-pinar a versão do driver lá — bem mais pesado (exige o toolchain
-completo BuildStream + freedesktop-sdk + gnome-build-meta), mas é o
-caminho "nativo" que o próprio projeto usa. Ver `docs/oci-assembly.md`
-e `docs/patches.md` no repo do Dakota.
+If it fails, this whole approach (downstream Containerfile) doesn't
+work, and the only alternative is forking the BuildStream build of
+[`projectbluefin/dakota`](https://github.com/projectbluefin/dakota)
+itself and pinning the driver version there — much heavier (requires
+the full BuildStream + freedesktop-sdk + gnome-build-meta toolchain),
+but it's the "native" path the project itself uses. See
+`docs/oci-assembly.md` and `docs/patches.md` in the Dakota repo.
 
-## Arquitetura
+## Architecture
 
 ```
 dakota-base (FROM ghcr.io/projectbluefin/dakota:stable@sha256:...)
   │
-  ├─→ kernel-headers          extrai versão + /usr/lib/modules/<kver>/build
+  ├─→ kernel-headers          extracts kernel version + /usr/lib/modules/<kver>/build
   │     │
-  │     └─→ nvidia-builder    (Fedora, só ambiente de compilação)
-  │           compila o kmod fora da árvore contra os headers acima,
-  │           roda o nvidia-installer --no-kernel-module e empacota
-  │           via diff de filesystem (scripts/build-nvidia.sh)
+  │     └─→ nvidia-builder    (Fedora, build environment only)
+  │           builds the out-of-tree kmod against the headers above,
+  │           runs nvidia-installer --no-kernel-module, and packages
+  │           the result via a filesystem diff (scripts/build-nvidia.sh)
   │
-  ├─→ libfprint-builder       (Fedora, só ambiente de compilação)
-  │     compila o fork contra opencv-devel do dnf, DESTDIR=/out
+  ├─→ libfprint-probe         locates libfprint-2.so's exact libdir
+  │     │                     in the Dakota base image
+  │     │
+  │     └─→ libfprint-builder (Fedora, build environment only)
+  │           builds the fork against Fedora's opencv-devel, with
+  │           --prefix=/usr --libdir=<probed dir>, DESTDIR=/out
   │
-  └─→ final (FROM dakota-base outra vez)
-        COPY dos dois /out, drop-in do fprintd.service, blacklist do
-        nouveau, depmod + ldconfig -r, bootc container lint
+  └─→ final (FROM dakota-base again)
+        COPY of both /out trees (the second one overwrites the stock
+        libfprint in place), nouveau blacklist, depmod + ldconfig -r,
+        bootc container lint
 ```
 
-Os estágios `nvidia-builder` e `libfprint-builder` usam Fedora **só
-como ambiente de compilação** (tem `dnf`, `gcc`, `meson`...) — nada
-deles entra na imagem final além do que os scripts empacotam
-explicitamente em `/out`. A imagem final continua sendo Dakota puro
-(GNOME OS, sem RPMs) com esses dois payloads por cima.
+The `nvidia-builder` and `libfprint-builder` stages use Fedora **only
+as a build environment** (it has `dnf`, `gcc`, `meson`...) — nothing
+from them ends up in the final image except what the scripts
+explicitly package into `/out`. The final image is still plain Dakota
+(GNOME OS, no RPMs) with these two payloads layered on top.
 
-## Por que downstream e não fork do BuildStream
+## How the libfprint overwrite works
 
-O Dakota não tem `dnf`/`rpm`/`akmods` — não é possível fazer
-`rpm-ostree install akmod-nvidia` como no Bluefin/Aurora clássicos. O
-jeito "nativo" de mudar o que vai de fábrica na imagem é editar os
-elementos `.bst` do próprio repositório `dakota` e buildar tudo via
-BuildStream. Esse caminho é mais correto (o módulo é compilado na
-mesma árvore de fontes do kernel), mas exige manter um fork completo
-do build da distro, com todo o toolchain BuildStream + freedesktop-sdk,
-e fazer rebase contínuo em cima do upstream para não perder
-atualizações de segurança/GNOME.
+Fedora's meson defaults to `lib64` as the libdir on x86_64, but Dakota
+is a freedesktop-sdk/GNOME OS build and may not follow that same
+convention (a single `lib`, no multilib split, is common in that
+world). Building libfprint with a plain `--prefix=/usr` and Fedora's
+own libdir guess could easily land the new `.so` in a directory that
+doesn't match where Dakota's stock libfprint actually lives — you'd
+end up with two parallel installations instead of overwriting one,
+and which one `fprintd` picks up would depend on the dynamic linker's
+search order, not on anything this repo controls.
 
-Este repositório escolhe o caminho mais barato de manter para um
-usuário único: um `Containerfile` `FROM` a imagem já publicada,
-compilando só o que precisa ser compilado (o kmod fora da árvore + o
-fork do libfprint) contra os headers extraídos daquela imagem
-específica.
+The `libfprint-probe` stage avoids that by inspecting the *actual*
+Dakota base image, finding `libfprint-2.so*` with `find`, and writing
+out its containing directory. `libfprint-builder` then passes that
+exact path as `--libdir` to `meson setup`, so the build lands at
+precisely the same path the stock library occupies. The final stage's
+`COPY --from=libfprint-builder /out/usr/ /usr/` then genuinely
+replaces the original files in place — no `LD_LIBRARY_PATH` override,
+no parallel `/usr/local` tree, nothing for `fprintd` to be pointed at
+specially; it just finds the new library where it always expected the
+old one.
 
-## Riscos conhecidos, não totalmente validados
+This assumes the fork stays ABI-compatible with the stock libfprint
+(same soname/version scheme) — it's a fork for a new device driver,
+not a fork that changes the library's public API, so this should
+hold, but hasn't been verified against Dakota's exact stock version.
 
-- **Headers do kernel ausentes na imagem publicada** — ver seção
-  acima. Bloqueante; verifique primeiro.
-- **Deriva de API do kernel vs. branch legada do driver** — o Dakota
-  acompanha o kernel upstream de perto; a branch 580.xxx da NVIDIA é
-  legada e pode não ter patches de compatibilidade para kernels muito
-  recentes (o tipo de patch que a RPM Fusion mantém para drivers
-  NVIDIA legados no Fedora). Se o build do kmod falhar por API do
-  kernel, procure patches de compatibilidade da comunidade antes de
-  tentar "consertar na mão".
-- **Secure Boot / assinatura de módulo** — o Dakota usa UKI
-  (`systemd-boot` + kernel unificado). Um módulo fora da árvore, não
-  assinado, pode ser rejeitado em boot com Secure Boot habilitado
-  (lockdown do kernel). Se o `modprobe nvidia` falhar silenciosamente
-  no primeiro boot, comece por aí (desabilitar Secure Boot, ou
-  configurar MOK enrollment + assinatura do módulo no build).
-  Não testado neste repositório ainda.
-- **Blacklist do nouveau pode não ser suficiente** — se o Dakota
-  embutir o nouveau estaticamente na UKI em vez de como módulo sob
-  demanda, `files/nvidia-blacklist-nouveau.conf` sozinho não resolve.
-  Ver o comentário nesse arquivo.
-- **Flags do `nvidia-installer`** — conferidas contra `--help`/
-  `--advanced-options` de versões recentes, mas mudam entre branches.
-  Revalide antes de trocar `NVIDIA_VERSION`.
-- **Nada aqui foi validado em hardware Dakota real.** Trate como ponto
-  de partida a testar, não como garantia — mesma ressalva que
-  `bluefin-initial-setup` faz para o Dakota em geral (ainda alpha).
+## Why downstream instead of forking BuildStream
 
-## Build local
+Dakota has no `dnf`/`rpm`/`akmods` — you can't `rpm-ostree install
+akmod-nvidia` like on classic Bluefin/Aurora. The "native" way to
+change what ships by default in the image is to edit the `.bst`
+elements in the `dakota` repo itself and build everything through
+BuildStream. That path is more correct (the module is built in the
+very same kernel source tree), but it means maintaining a full fork of
+the distro's build, with the entire BuildStream + freedesktop-sdk
+toolchain, and continuously rebasing on top of upstream to not miss
+security/GNOME updates.
+
+This repo takes the cheaper path to maintain for a single-user setup:
+a `Containerfile` that starts `FROM` the already-published image and
+only compiles what actually needs compiling (the out-of-tree kmod +
+the libfprint fork) against headers extracted from that specific
+image.
+
+## Known risks, not fully validated
+
+- **Kernel headers missing from the published image** — see the
+  section above. Blocking; check this first.
+- **Kernel API drift vs. the legacy driver branch** — Dakota tracks
+  the upstream kernel closely; NVIDIA's 580.xxx branch is legacy and
+  may lack compatibility patches for very recent kernels (the kind of
+  patch RPM Fusion carries for legacy NVIDIA drivers on Fedora). If
+  the kmod build fails on kernel API mismatches, look for community
+  compatibility patches before trying to hand-patch it yourself.
+- **Secure Boot / module signing** — Dakota uses a UKI
+  (`systemd-boot` + unified kernel image). An unsigned out-of-tree
+  module can be rejected at boot under kernel lockdown with Secure
+  Boot enabled. If `modprobe nvidia` fails silently on first boot,
+  start here (disable Secure Boot, or set up MOK enrollment + module
+  signing in the build). Not tested in this repo yet.
+- **nouveau blacklist may not be enough** — if Dakota bakes nouveau
+  statically into the UKI instead of as an on-demand module,
+  `files/nvidia-blacklist-nouveau.conf` alone won't fix it. See the
+  comment in that file.
+- **`nvidia-installer` flags** — checked against `--help`/
+  `--advanced-options` of recent versions, but they change between
+  branches. Re-validate before changing `NVIDIA_VERSION`.
+- **libfprint overwrite ABI assumption** — see the section above.
+- **Nothing here has been validated on real Dakota hardware.** Treat
+  it as a tested starting point, not a guarantee — the same caveat
+  `bluefin-initial-setup` makes about Dakota in general (still alpha).
+
+## Local build
 
 ```bash
-# 1. Confirme o digest atual do dakota:stable e cole no Containerfile
-#    (linha `FROM ... @sha256:...`):
+# 1. Confirm the current digest of dakota:stable and paste it into the
+#    Containerfile (the `FROM ... @sha256:...` line):
 skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
 
-# 2. Valide os headers do kernel ANTES de buildar (ver seção acima):
+# 2. Validate the kernel headers BEFORE building (see the section
+#    above):
 ./scripts/check-kernel-headers.sh stable
 
 # 3. Build:
 podman build --file Containerfile --tag localhost/dakota-nvidia-580:dev .
 
-# 4. Smoke test básico antes de instalar em qualquer máquina real:
+# 4. Basic smoke test before installing on any real machine:
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
 podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
 ```
 
-Para trocar a versão do driver: `--build-arg NVIDIA_VERSION=580.xx.xx`
-(confirme a versão certa para sua GPU em
+To change the driver version: `--build-arg NVIDIA_VERSION=580.xx.xx`
+(confirm the right version for your GPU at
 [nvidia.com/en-us/drivers/unix](https://www.nvidia.com/en-us/drivers/unix/)
-antes de fixar).
+before pinning it).
 
-## Usar num host Dakota real
+## Using it on a real Dakota host
 
 ```bash
 sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580:stable
-# ou, se a imagem oficial já tiver o ujust:
+# or, if the official image already has the ujust recipe:
 ujust rebase-helper
 ```
 
-Reboot obrigatório depois. Valide `modprobe nvidia`, `nvidia-smi` e o
-leitor de digital (`fprintd-list $USER`, `fprintd-verify`) antes de
-considerar a migração concluída — e mantenha um jeito de voltar
-(`bootc switch` para a imagem `dakota:stable` original) até validar em
-hardware real.
+A reboot is required afterwards. Validate `modprobe nvidia`,
+`nvidia-smi`, and the fingerprint reader (`fprintd-list $USER`,
+`fprintd-verify`) before considering the migration done — and keep a
+way back (`bootc switch` to the original `dakota:stable` image) until
+you've validated it on real hardware.
 
-## CI e atualização automática
+## CI and automatic updates
 
-- `.github/workflows/build.yml` builda e publica
-  `ghcr.io/lbssousa/dakota-nvidia-580:stable` em push para `main`, em
-  schedule diário (cobre o caso de um PR do Renovate já mergeado sem
-  rebuild manual) e via `workflow_dispatch`.
-- `renovate.json5` acompanha o digest de
-  `ghcr.io/projectbluefin/dakota:stable` fixado no `Containerfile` e
-  abre PR quando ele muda upstream — **cada bump é um PR revisável**,
-  não um rebuild silencioso, porque uma imagem base nova pode ter um
-  kernel novo e quebrar o kmod até você confirmar que o build ainda
-  passa.
+- `.github/workflows/build.yml` builds and publishes
+  `ghcr.io/lbssousa/dakota-nvidia-580:stable` on push to `main`, on a
+  daily schedule (covers the case where a Renovate PR was already
+  merged without a manual rebuild), and via `workflow_dispatch`.
+- `renovate.json5` tracks the digest of
+  `ghcr.io/projectbluefin/dakota:stable` pinned in the `Containerfile`
+  and opens a PR when it changes upstream — **every bump is a
+  reviewable PR**, not a silent rebuild, because a new base image can
+  ship a new kernel and break the kmod until you confirm the build
+  still passes.

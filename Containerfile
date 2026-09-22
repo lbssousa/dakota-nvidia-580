@@ -1,62 +1,81 @@
 # syntax=docker/dockerfile:1.7
 #
-# Imagem Dakota personalizada: NVIDIA proprietário v580.xxx (GPU legada,
-# fora do suporte nas variantes dakota-nvidia/dakota-nvidia-gaming
-# oficiais, que seguem a branch mais nova, ~610.x/615.x) + fork
-# libfprint (Goodix 538d) baked-in via layering downstream de imagem
-# OCI. Ver README.md para o raciocínio completo (por que downstream e
-# não fork do BuildStream upstream, e os riscos que ainda não foram
-# validados em hardware real).
+# Custom Dakota image: proprietary NVIDIA driver on the legacy 580.xxx
+# branch (for a GPU generation no longer supported by the official
+# dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
+# branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
+# (Goodix 538d), baked in via downstream OCI image layering — not via
+# forking the upstream BuildStream build. See README.md for the full
+# reasoning (why downstream instead of a BuildStream fork, and the
+# risks that haven't been validated on real hardware yet).
 #
-# PRÉ-REQUISITO NÃO VERIFICADO POR ESTE ARQUIVO SOZINHO: a imagem
-# Dakota pinada abaixo precisa expor uma árvore de build do kernel
-# completa em /usr/lib/modules/<kver>/build. O estágio kernel-headers
-# checa isso e falha alto se faltar — mas rode
-# `scripts/check-kernel-headers.sh` ANTES de mexer no resto
-# (segredos do GHCR, Renovate etc.), porque se isso faltar este
-# caminho inteiro não funciona e a única alternativa vira o fork do
-# BuildStream (ver README.md).
+# PREREQUISITE NOT VERIFIED BY THIS FILE ALONE: the pinned Dakota image
+# below must expose a complete kernel build tree at
+# /usr/lib/modules/<kver>/build. The kernel-headers stage checks this
+# and fails loudly if it's missing — run `scripts/check-kernel-headers.sh`
+# BEFORE setting up anything else (GHCR secrets, Renovate, etc.),
+# because if this is missing the whole approach doesn't work and the
+# only alternative is forking the BuildStream build (see README.md).
 
 ARG NVIDIA_VERSION=580.65.06
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
 
 # ---------------------------------------------------------------------
-# dakota-base — SEMPRE pinada por digest, nunca por tag flutuante
-# ("stable" muda de conteúdo). O módulo NVIDIA abaixo é compilado
-# contra o kernel exato desta imagem; se o digest mudar sem recompilar,
-# o resultado é um kernel novo com um .ko velho (não carrega, ou pior,
-# carrega e é instável). O Renovate (.github/renovate.json5) abre PR
-# quando o digest upstream muda; o CI builda a partir do PR.
+# dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
+# changes content over time). The NVIDIA module below is compiled
+# against this exact image's kernel; if the digest changes without a
+# rebuild, the result is a new kernel paired with a stale .ko (it won't
+# load, or worse, it loads and is unstable). Renovate
+# (renovate.json5) opens a PR when the upstream digest changes; CI
+# builds from that PR.
 #
-# Troque para ghcr.io/projectbluefin/dakota-gaming se quiser a variante
-# gaming como base (mesma estratégia, só troca esta linha).
+# Swap to ghcr.io/projectbluefin/dakota-gaming if you want the gaming
+# variant as a base — same strategy, just change this line.
 # ---------------------------------------------------------------------
 FROM ghcr.io/projectbluefin/dakota:stable@sha256:0000000000000000000000000000000000000000000000000000000000000 AS dakota-base
-# ^ substitua pelo digest real antes do primeiro build:
+# ^ replace with the real digest before the first build:
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
 
 # ---------------------------------------------------------------------
-# kernel-headers — extrai a versão e a árvore de build do kernel desta
-# imagem específica, para o estágio nvidia-builder consumir. Falha alto
-# e cedo se a imagem não tiver os headers.
+# kernel-headers — extracts this specific image's kernel version and
+# build tree for the nvidia-builder stage to use. Fails loudly and
+# early if the image doesn't have the headers.
 # ---------------------------------------------------------------------
 FROM dakota-base AS kernel-headers
 RUN set -eux; \
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"; \
     echo "$kver" > /kernel-version; \
     if [ ! -f "/usr/lib/modules/$kver/build/Makefile" ]; then \
-        echo "ERRO: /usr/lib/modules/$kver/build ausente ou incompleto" >&2; \
-        echo "nesta imagem Dakota — não dá pra compilar o kmod NVIDIA" >&2; \
-        echo "fora da árvore sem ela. Ver README.md, seção" >&2; \
-        echo "'Se os headers não existirem'." >&2; \
+        echo "ERROR: /usr/lib/modules/$kver/build is missing or incomplete" >&2; \
+        echo "in this Dakota image — can't build the NVIDIA kmod" >&2; \
+        echo "out-of-tree without it. See README.md, section" >&2; \
+        echo "'If the headers don't exist'." >&2; \
         exit 1; \
     fi
 
 # ---------------------------------------------------------------------
-# nvidia-builder — Fedora só como ambiente de compilação (dnf/gcc/make);
-# nada daqui entra na imagem final além do que build-nvidia.sh empacota
-# explicitamente em /out.
+# libfprint-probe — locates the exact path of the libfprint shared
+# library already shipped in the Dakota base image, so the build below
+# can install to that same libdir and genuinely overwrite it instead
+# of landing in a different, distro-conventional path (Fedora defaults
+# to lib64; a freedesktop-sdk/GNOME OS build like Dakota may not).
+# ---------------------------------------------------------------------
+FROM dakota-base AS libfprint-probe
+RUN set -eux; \
+    so="$(find /usr/lib* -name 'libfprint-2.so*' 2>/dev/null | head -n1)"; \
+    if [ -z "$so" ]; then \
+        echo "ERROR: libfprint-2.so not found in this Dakota base image." >&2; \
+        echo "Can't determine the libdir to overwrite it in-place." >&2; \
+        exit 1; \
+    fi; \
+    dirname "$so" > /libfprint-libdir; \
+    echo "Found libfprint at: $so (libdir: $(cat /libfprint-libdir))" >&2
+
+# ---------------------------------------------------------------------
+# nvidia-builder — Fedora used only as a build environment (dnf/gcc/
+# make); nothing here ends up in the final image except what
+# build-nvidia.sh explicitly packages into /out.
 # ---------------------------------------------------------------------
 FROM fedora:42 AS nvidia-builder
 ARG NVIDIA_VERSION
@@ -69,13 +88,19 @@ COPY scripts/build-nvidia.sh /build-nvidia.sh
 RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out
 
 # ---------------------------------------------------------------------
-# libfprint-builder — mesmo fork/ref usado em
+# libfprint-builder — same fork/ref used in
 # lbssousa/bluefin-initial-setup (playbooks/dakota/libfprint.yml,
-# vars dakota_libfprint_repo/_ref em group_vars/all/dakota.yml), que
-# instala o mesmo fork em runtime via distrobox para hosts Dakota que
-# não usam esta imagem personalizada. Aqui builda contra o
-# opencv-devel do dnf em vez do Homebrew do host — não existe host,
-# é build de imagem.
+# dakota_libfprint_repo/_ref vars in group_vars/all/dakota.yml), which
+# installs the same fork at runtime via distrobox for Dakota hosts not
+# using this custom image. Here it's built against Fedora's
+# opencv-devel instead of the host's Homebrew — there's no host, this
+# is an image build.
+#
+# Installed straight into the libdir found by libfprint-probe, under
+# --prefix=/usr: this overwrites the stock libfprint shipped in the
+# Dakota base image in place, rather than adding a parallel copy under
+# /usr/local that would need an LD_LIBRARY_PATH override to be picked
+# up by fprintd.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS libfprint-builder
 ARG LIBFPRINT_REPO
@@ -86,32 +111,34 @@ RUN dnf install -y meson gcc gcc-c++ ninja-build pkgconf-pkg-config \
         pixman-devel gtk-doc python3-cairo python3-gobject cairo-devel \
         umockdev git cmake opencv-devel && \
     dnf clean all
+COPY --from=libfprint-probe /libfprint-libdir /libfprint-libdir
 RUN git clone --branch "${LIBFPRINT_REF}" --depth 1 "${LIBFPRINT_REPO}" /src
-RUN meson setup /src/builddir /src --prefix=/usr/local -Ddrivers=all && \
+RUN libdir="$(cat /libfprint-libdir)" && \
+    meson setup /src/builddir /src --prefix=/usr --libdir="${libdir}" -Ddrivers=all && \
     ninja -C /src/builddir && \
     DESTDIR=/out ninja -C /src/builddir install
 
 # ---------------------------------------------------------------------
-# final — Dakota + os dois payloads, baked na imagem. /usr é gravável
-# durante o build (só vira somente-leitura em runtime via composefs),
-# então dá pra escrever direto em /usr/local — sem o workaround
-# /var/usrlocal que a instalação em runtime (bluefin-initial-setup)
-# precisa.
+# final — Dakota + both payloads, baked into the image. /usr is
+# writable during the build (it only becomes read-only at runtime via
+# composefs), so writing straight into it — including overwriting the
+# stock libfprint files at their original path — works, unlike the
+# /var/usrlocal workaround the runtime install (bluefin-initial-setup)
+# needs.
 # ---------------------------------------------------------------------
 FROM dakota-base
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
-COPY --from=libfprint-builder /out/usr/local/ /usr/local/
-COPY files/fprintd-override.conf /usr/lib/systemd/system/fprintd.service.d/override.conf
+COPY --from=libfprint-builder /out/usr/ /usr/
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
-# Passos de pós-instalação. depmod é acréscimo nosso (específico de
-# termos adicionado um módulo de kernel fora da árvore); ldconfig -r é
-# o mesmo passo que docs/oci-assembly.md do próprio Dakota descreve
-# como "load-bearing — removê-lo quebra a imagem de formas que só
-# aparecem depois de um bootc switch", necessário aqui porque
-# adicionamos .so novas em /usr/local/lib64 e /usr/lib64.
+# Post-install steps. depmod is our own addition (specific to having
+# added an out-of-tree kernel module); ldconfig -r is the same step
+# that Dakota's own docs/oci-assembly.md describes as "load-bearing —
+# removing it breaks the image in ways that only show up after a
+# bootc switch", needed here because we replaced libfprint-2.so and
+# added new NVIDIA .so files.
 RUN kver="$(cat /kernel-version)" && \
     depmod -a "$kver" && \
     ldconfig -r / && \

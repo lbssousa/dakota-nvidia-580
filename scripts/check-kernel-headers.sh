@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
-# Verifica, ANTES de investir tempo no resto deste diretório, se a
-# imagem Dakota informada expõe uma árvore de build do kernel completa
-# o suficiente pra compilar um módulo fora da árvore (kmod NVIDIA).
+# Checks, BEFORE investing any more time in this repo, whether the
+# given Dakota image exposes a kernel build tree complete enough to
+# compile an out-of-tree module (the NVIDIA kmod).
 #
-# Isto é o maior risco não resolvido do caminho "Containerfile
-# downstream" descrito em image/README.md: o Dakota é buildado do
-# zero via BuildStream, não via kernel-devel de RPM, e é uma imagem
-# otimizada para espaço (dedup via chunkah) — não há garantia de que a
-# árvore completa de build do kernel sobrevive no runtime image em vez
-# de só nos artefatos de build do BuildStream. Se este script falhar,
-# o Containerfile também vai falhar (o estágio kernel-headers faz a
-# mesma checagem) — mas rodar isto primeiro evita configurar o resto
-# (segredos do GHCR, Renovate, etc.) só para descobrir isso depois.
+# This is the biggest unresolved risk of the "downstream Containerfile"
+# approach described in README.md: Dakota is built from scratch via
+# BuildStream, not from RPM kernel-devel packages, and is a
+# space-optimized image (dedup via chunkah) — there's no guarantee the
+# full kernel build tree survives in the runtime image instead of only
+# existing in BuildStream's own build artifacts. If this script fails,
+# the Containerfile will fail too (the kernel-headers stage does the
+# same check) — but running this first avoids setting up everything
+# else (GHCR secrets, Renovate, etc.) only to find this out afterwards.
 #
-# Uso: image/scripts/check-kernel-headers.sh [ref]
-#   ref: tag ou tag@sha256:... da imagem Dakota (default: stable)
+# Usage: scripts/check-kernel-headers.sh [ref]
+#   ref: tag or tag@sha256:... of the Dakota image (default: stable)
 set -euo pipefail
 
 ref="${1:-stable}"
 image="ghcr.io/projectbluefin/dakota:${ref}"
 
-echo "==> Inspecionando ${image}..." >&2
+echo "==> Inspecting ${image}..." >&2
 podman run --rm "${image}" bash -c '
     set -euo pipefail
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"
     echo "Kernel: $kver"
     if [ -f "/usr/lib/modules/$kver/build/Makefile" ]; then
-        echo "OK: /usr/lib/modules/$kver/build existe e tem Makefile."
+        echo "OK: /usr/lib/modules/$kver/build exists and has a Makefile."
         exit 0
     fi
-    echo "FALTANDO: /usr/lib/modules/$kver/build (ou Makefile dentro dele)."
-    echo "Conteúdo de /usr/lib/modules/$kver:"
+    echo "MISSING: /usr/lib/modules/$kver/build (or its Makefile)."
+    echo "Contents of /usr/lib/modules/$kver:"
     ls -la "/usr/lib/modules/$kver" || true
     exit 1
 '

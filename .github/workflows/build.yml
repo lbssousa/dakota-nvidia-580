@@ -5,9 +5,10 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Cobre o caso do Renovate ter atualizado o digest do dakota:stable
-    # (ver renovate.json5) — sem isso, o kmod NVIDIA ficaria compilado
-    # contra um kernel velho até alguém abrir um push manual.
+    # Covers the case where Renovate already bumped the dakota:stable
+    # digest (see renovate.json5) — without this, the NVIDIA kmod
+    # would stay compiled against a stale kernel until someone opens a
+    # manual push.
     - cron: "17 4 * * *"
   workflow_dispatch: {}
 
