@@ -54,58 +54,51 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   installed via `rpm`/`dnf`, since Dakota has neither. This repo does
   **not** ship the RPM's Qt5 setup/maintenance GUI (Dakota/GNOME OS has
   no Qt5 runtime, and bundling one just for an optional utility isn't
-  worth the image-size cost — confirmed on real hardware, see
-  ["Known limitations"](#known-limitations)); printing itself doesn't
-  need it. Nor does it install bluefin's `epson-inkjet-printer-escpr`
+  worth the image-size cost; printing itself doesn't need it — see
+  ["Known limitations"](#known-limitations)). Nor does it install bluefin's `epson-inkjet-printer-escpr`
   driver package, which needs building from source against
   `cups-devel`/autotools, not present on Dakota.
 
 Like the upstream project, this repo builds two variants from the same
-`Containerfile`, both published:
+`Containerfile`, both published under two tags each — mirroring
+upstream Dakota's own rolling-vs-promoted tag split (`:testing`
+promoted to `:stable` on a fixed cadence), simplified to a single
+rolling tag since this repo has no `:next`/`:testing` split of its own:
 
-- `ghcr.io/lbssousa/dakota-nvidia-580:stable` — standard Dakota base.
-- `ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable` — Dakota gaming
-  base (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
-  mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
+- `:latest` — rebuilt on every push to `main`, on the daily schedule
+  that catches a merged Renovate base-image bump, and on manual
+  dispatch. This is the rolling tag; see ["CI and automatic
+  updates"](#ci-and-automatic-updates).
+- `:stable` — a straight registry retag of whatever `:latest` digest
+  is current at promotion time (no rebuild), promoted weekly. This is
+  the tag a real machine should track.
+
+  - `ghcr.io/lbssousa/dakota-nvidia-580` — standard Dakota base.
+  - `ghcr.io/lbssousa/dakota-nvidia-580-gaming` — Dakota gaming base
+    (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
+    mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
 
 ## Status
 
 Both variants build and publish successfully end-to-end in CI
-(`.github/workflows/build.yml`) — see run
-[`35787487801`](https://github.com/lbssousa/dakota-nvidia-580/actions/runs/35787487801).
-The container image builds, all four NVIDIA kernel modules
-(`nvidia.ko`, `nvidia-uvm.ko`, `nvidia-modeset.ko`, `nvidia-drm.ko`)
-compile and link, and both images are signed with a valid SBOM
-attestation (see ["Verification"](#verification)) — confirmed with
-`cosign verify`/`cosign verify-attestation` against the published
-images.
+(`.github/workflows/build.yml`). The container image builds, all four
+NVIDIA kernel modules (`nvidia.ko`, `nvidia-uvm.ko`,
+`nvidia-modeset.ko`, `nvidia-drm.ko`) compile and link, and both images
+are signed with a valid SBOM attestation — see
+["Verification"](#verification) for how to check that yourself with
+`cosign verify`/`cosign verify-attestation`.
 
-**First real-hardware boot (2026-09-22, `dakota-nvidia-580-gaming`)**
-surfaced four issues, all now fixed in this repo:
+Open items on real hardware, tracked in detail in ["Known
+limitations"](#known-limitations) below:
 
-- NVIDIA kernel modules never bound the GPU — nouveau claimed it
-  first, during the initramfs stage, before the modprobe.d blacklist
-  ever got consulted. Fixed with kernel command-line args baked in via
-  `/usr/lib/bootc/kargs.d/` (`rd.driver.blacklist=nouveau`); needs a
-  fresh `bootc switch`/`upgrade` from this image to take effect (kargs
-  are applied when bootc writes the boot entry, not retroactively).
-- `fprintd-list` failed (D-Bus activation timeout) because
-  `fprintd.service` crashed on missing `libopencv_features2d.so.413` —
-  the libfprint fork's OpenCV dependency was never bundled into the
-  final image. Fixed upstream in the fork itself (statically vendored,
-  no runtime OpenCV/BLAS library needed at all) — see the libfprint
-  bullet above and ["Known limitations"](#known-limitations).
-- Dakota's login banner (`uwelcome`) showed the upstream
-  `ghcr.io/projectbluefin/dakota-gaming:latest` base instead of this
-  image — it reads `/etc/os-release`'s `IMAGE_NAME`/`IMAGE_VENDOR`/
-  `IMAGE_TAG` verbatim, which this repo never rewrote. Fixed: the
-  final stage now overwrites those fields (and `IMAGE_REF`) with this
-  image's own identity.
-- `epson-printer-utility` (the Qt5 GUI) failed to launch —
-  `libQt5Core.so.5: cannot open shared object file`, since Dakota ships
-  no Qt5 runtime. Fixed by dropping the GUI from the image entirely;
-  printing itself (CUPS filter + `ecbd`) doesn't need it and was
-  already working. See the Epson bullet above.
+- Fingerprint enrollment/verification issues (`enroll-duplicate` on a
+  second finger, cross-finger false negatives) are a
+  [`lbssousa/libfprint`](https://github.com/lbssousa/libfprint) fork
+  matter (the `goodixtls53xd` SIGFM matcher), not something this
+  image-build repo's `Containerfile` controls — it only bundles that
+  fork's build output.
+- Secure Boot / module signing for the out-of-tree NVIDIA kmod hasn't
+  been exercised.
 
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
@@ -394,17 +387,36 @@ reconstructs itself from upstream source + the image's own shipped
   Boot enabled. If `modprobe nvidia` fails silently on first boot,
   start here (disable Secure Boot, or set up MOK enrollment + module
   signing in the build). Not tested in this repo yet.
-- **nouveau blacklist alone is not enough** — confirmed on real
-  hardware (2026-09-22): `files/nvidia-blacklist-nouveau.conf` doesn't
-  stop nouveau from claiming the GPU, since it binds the PCI device
-  during the initramfs/plymouth stage, before `/usr/lib/modprobe.d` is
-  even consulted. Fixed via kernel command-line args
+- **nouveau blacklist alone is not enough** —
+  `files/nvidia-blacklist-nouveau.conf` doesn't stop nouveau from
+  claiming the GPU, since it binds the PCI device during the
+  initramfs/plymouth stage, before `/usr/lib/modprobe.d` is even
+  consulted. Fixed via kernel command-line args
   (`rd.driver.blacklist=nouveau`, honored inside the initramfs) baked
   in through `files/nvidia-kargs.toml` → `/usr/lib/bootc/kargs.d/`. A
   machine already running an older build of this image needs a fresh
   `bootc switch`/`upgrade` for the new kargs to take effect — they're
   applied when bootc writes the boot entry, not retroactively to an
   existing deployment.
+- **`uwelcome`'s image-identity banner reads
+  `/usr/share/ublue-os/image-info.json`, not `/etc/os-release`** — see
+  `github.com/projectbluefin/uwelcome`, `internal/system/system.go`,
+  `GetImageInfo()`. The final stage overwrites both files with this
+  image's own identity (`ghcr.io/lbssousa/dakota-nvidia-580[-gaming]`),
+  in the same JSON shape upstream's own build generates (see
+  `ublue-os/bluefin`'s `build_files/base/00-image-info.sh`); the
+  `/etc/os-release` fields are kept in sync too, as a Universal Blue
+  convention other tooling may read, but `image-info.json` is what the
+  banner itself actually uses.
+- **Fingerprint enrollment/verification on the Goodix 538d** —
+  enrolling a second finger (e.g. left index, after the right index is
+  already enrolled) can fail with `enroll-duplicate`, and verifying one
+  finger against another enrolled finger can false-negative often. This
+  is matching-algorithm/driver behavior in the
+  [`lbssousa/libfprint`](https://github.com/lbssousa/libfprint) fork
+  itself (the `goodixtls53xd` SIGFM matcher) — this image-build repo
+  only bundles that fork's build output, so it can't fix this on its
+  own; track/fix it in that repo instead.
 - **`nvidia-installer` flags** — checked against `--help`/
   `--advanced-options` of recent versions, but they change between
   branches. Re-validate before changing `NVIDIA_VERSION`.
@@ -420,23 +432,12 @@ reconstructs itself from upstream source + the image's own shipped
 - **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
   scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
   in the image; see the pam-u2f bullet near the top of this README.
-- **Epson printing confirmed working on real hardware (2026-09-22)**:
-  `ecbd.service` starts cleanly and the CUPS `rastertoepson` filter's
-  dependencies all resolve. The GUI utility is no longer shipped at
-  all (see the Epson bullet near the top of this README) — actual
-  print jobs through CUPS haven't been exercised end-to-end yet
-  (network-discovered printer + real print job), only the daemon/filter
-  wiring.
-- **First real-hardware boot validated most of this repo** (2026-09-22,
-  `dakota-nvidia-580-gaming`) — see the "Status" section above for the
-  four issues that surfaced and their fixes. Signing/SBOM verification,
-  the kernel module build itself, and libfprint/pam-u2f/Epson file
-  layout were all already confirmed; what hadn't been exercised before
-  that boot (nouveau actually losing the GPU race, fprintd staying up,
-  `uwelcome`'s banner, the Epson GUI) now has either a real-hardware
-  pass or a documented, self-contained fix. Not yet re-validated on
-  hardware *after* these fixes land in a published image — do that
-  before considering this "done."
+- **Epson printing**: `ecbd.service` and the CUPS `rastertoepson`
+  filter's dependencies are expected to resolve cleanly (the GUI
+  utility is no longer shipped at all — see the Epson bullet near the
+  top of this README). Actual print jobs through CUPS
+  (network-discovered printer + real print job) haven't been exercised
+  end-to-end, only the daemon/filter wiring.
 
 ## Local build
 
@@ -495,6 +496,11 @@ sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
 ujust rebase-helper
 ```
 
+`:stable` is the tag to track on a real machine — see ["CI and
+automatic updates"](#ci-and-automatic-updates) for what it actually
+points at and how often it moves. `:latest` also exists (rebuilt on
+every push) for testing a fix ahead of that weekly promotion.
+
 A reboot is required afterwards. Validate `modprobe nvidia`,
 `nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
 `fprintd-verify`), and the Epson utility (`systemctl status
@@ -542,19 +548,39 @@ repository secrets, set once with `cosign generate-key-pair` +
 
 ## CI and automatic updates
 
-- `.github/workflows/build.yml` runs a two-way matrix (`standard`,
-  `gaming`) from the same `Containerfile`, building and publishing
-  both `ghcr.io/lbssousa/dakota-nvidia-580:stable` and
-  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable` on push to
-  `main`, on a daily schedule (covers the case where a Renovate PR was
-  already merged without a manual rebuild), and via
-  `workflow_dispatch`. Each matrix leg resolves its base image by
-  reading the `BASE_IMAGE`/`BASE_IMAGE_GAMING` `ARG` default straight
-  out of the `Containerfile` and passing it as
-  `--build-arg BASE_IMAGE=...` — the digest lives in one place. `fail-
-  fast: false` means one variant failing (e.g. the gaming kernel
-  breaking the kmod build) doesn't cancel the other's build/publish.
-- `renovate.json5` tracks both digests — `BASE_IMAGE`
+Tagging mirrors upstream Dakota's own rolling-vs-promoted split
+(there, `:testing`/`:next` built continuously and promoted to
+`:stable` on a fixed release cadence via a separate workflow), scaled
+down to this repo's single rolling tag:
+
+- **`:latest` — `.github/workflows/build.yml`.** Runs a two-way matrix
+  (`standard`, `gaming`) from the same `Containerfile`, building and
+  publishing both `ghcr.io/lbssousa/dakota-nvidia-580:latest` and
+  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:latest` on push to `main`,
+  on a daily schedule (covers the case where a Renovate PR was already
+  merged without a manual rebuild), and via `workflow_dispatch`. Each
+  matrix leg resolves its base image by reading the
+  `BASE_IMAGE`/`BASE_IMAGE_GAMING` `ARG` default straight out of the
+  `Containerfile` and passing it as `--build-arg BASE_IMAGE=...` — the
+  digest lives in one place. `fail-fast: false` means one variant
+  failing (e.g. the gaming kernel breaking the kmod build) doesn't
+  cancel the other's build/publish. Every push builds a fresh image;
+  `IMAGE_TAG` defaults to `latest` in the `Containerfile`, matching
+  what's actually published (baked into `/etc/os-release` and
+  `image-info.json` — see ["Known limitations"](#known-limitations)),
+  so the image's own self-reported identity stays correct even after
+  it's later promoted to `:stable` below.
+- **`:stable` — `.github/workflows/promote-stable.yml`.** Runs weekly
+  (Sundays) and via `workflow_dispatch`. For each variant, resolves the
+  current `:latest` digest, `cosign verify`s it against `cosign.pub`,
+  and — only if it differs from what `:stable` currently points at —
+  retags it to `:stable` with a server-side `skopeo copy
+  --preserve-digests` (no rebuild: `:stable` is always some past
+  `:latest` digest, never new bytes). This is the tag a real machine
+  should track; a rebuild happening on `:latest` doesn't affect a host
+  already switched to `:stable` until the next weekly promotion picks
+  it up.
+- `renovate.json5` tracks both base-image digests — `BASE_IMAGE`
   (`ghcr.io/projectbluefin/dakota:stable`) and `BASE_IMAGE_GAMING`
   (`ghcr.io/projectbluefin/dakota-gaming:stable`) — pinned in the
   `Containerfile`, and opens a **separate** PR per variant when either

@@ -8,8 +8,7 @@
 # pamu2fcfg) + Epson's epson-printer-utility, baked in via downstream
 # OCI image layering — not via forking the upstream BuildStream build.
 # See README.md for the full reasoning (why downstream instead of a
-# BuildStream fork, and the risks that haven't been validated on real
-# hardware yet).
+# BuildStream fork) and known limitations.
 #
 # The published Dakota images do NOT expose a usable kernel build tree
 # at /usr/lib/modules/<kver>/build — the symlink is there, but its
@@ -50,17 +49,28 @@ ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
 # Identity this downstream image reports as, in place of the upstream
-# Dakota base it's layered on. Rewritten into /etc/os-release's
-# IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF fields in the final
-# stage below — those are what `uwelcome` (Dakota's login banner,
-# github.com/projectbluefin/uwelcome) reads to show "You're running
-# <image>"; left untouched, it shows the upstream dakota-gaming base
-# instead of this image (confirmed on real hardware, 2026-09-22).
-# CI overrides IMAGE_NAME per matrix leg (standard vs "-gaming") —
-# see .github/workflows/build.yml.
+# Dakota base it's layered on. Rewritten in the final stage below into
+# both /etc/os-release's IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF
+# fields AND /usr/share/ublue-os/image-info.json. The latter is what
+# actually matters for `uwelcome` (Dakota's login banner,
+# github.com/projectbluefin/uwelcome, internal/system/system.go
+# GetImageInfo()): it reads ONLY that JSON file for the "<oci-symbol>
+# `<ref>:<tag>`" banner line, never the os-release fields — the
+# os-release rewrite is kept as a Universal Blue convention other
+# tooling may read, but image-info.json is the one that drives the
+# banner. CI overrides IMAGE_NAME per matrix leg (standard vs
+# "-gaming") — see .github/workflows/build.yml. IMAGE_TAG default
+# matches what CI actually publishes on every build ("latest" — see
+# README.md, "CI and automatic updates"): :stable is a later,
+# unrelated registry retag of a past :latest digest, promoted weekly
+# with no rebuild, so the image never gets built with IMAGE_TAG=stable
+# — its self-reported identity correctly says "latest" even once
+# viewed through the :stable tag, the same way upstream Dakota's own
+# build always embeds "latest" as its OCI_IMAGE_VERSION regardless of
+# which stream tag (:testing/:next/:stable) ends up pointing at it.
 ARG IMAGE_NAME=dakota-nvidia-580
 ARG IMAGE_VENDOR=lbssousa
-ARG IMAGE_TAG=stable
+ARG IMAGE_TAG=latest
 
 # ---------------------------------------------------------------------
 # dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
@@ -199,11 +209,10 @@ RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-sr
 # meson.build) whenever no system OpenCV is found — installing
 # opencv-devel would make it dynamically link against Fedora's OpenCV
 # instead, which then wouldn't exist in the final Dakota image at all
-# (confirmed on real hardware, 2026-09-22: fprintd.service crashed
-# with "libopencv_features2d.so.413: cannot open shared object file"
-# — this repo had never bundled that runtime dependency). Vendoring
-# means no such runtime dependency exists to bundle in the first
-# place. cmake/ninja-build/curl/tar here are for that vendored build
+# (fprintd.service would crash on startup with
+# "libopencv_features2d.so.413: cannot open shared object file").
+# Vendoring means no such runtime dependency exists to bundle in the
+# first place. cmake/ninja-build/curl/tar here are for that vendored build
 # (fetches+compiles a minimal static OpenCV via its own native CMake
 # build), not for libfprint itself. zlib-devel is linked into the
 # result explicitly (OpenCV's persistence.cpp calls zlib's gz*
@@ -312,20 +321,21 @@ COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-no
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
 # writes on every deployment, e.g. after `bootc switch`/`upgrade`).
 # This is the actual fix for nouveau grabbing the GPU before nvidia.ko
-# ever gets a chance to (confirmed on real hardware, 2026-09-22): the
-# modprobe.d blacklist above only takes effect once /usr is mounted,
-# but nouveau binds the PCI device earlier, inside the initramfs
-# (dracut honors rd.driver.blacklist= from the kernel command line at
-# that stage; `rhgb quiet` triggers early KMS, which is what races
-# nvidia.ko). See files/nvidia-kargs.toml and README.md.
+# ever gets a chance to: the modprobe.d blacklist above only takes
+# effect once /usr is mounted, but nouveau binds the PCI device
+# earlier, inside the initramfs (dracut honors rd.driver.blacklist=
+# from the kernel command line at that stage; `rhgb quiet` triggers
+# early KMS, which is what races nvidia.ko). See files/nvidia-kargs.toml
+# and README.md. Kargs only take effect on deployments created after
+# this file lands in the image — a fresh `bootc switch`/`upgrade` is
+# required, not just a reboot.
 COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia-blacklist-nouveau.toml
 
 # Rewrite this downstream image's identity into /etc/os-release,
 # overwriting the upstream Dakota base's own IMAGE_NAME/IMAGE_VENDOR/
-# IMAGE_TAG/IMAGE_REF. Confirmed on real hardware (2026-09-22) that
-# `uwelcome` (Dakota's login banner) reads these fields verbatim to
-# show "You're running <image>" — left as-is, it advertises the
-# upstream base image this was built FROM, not this one.
+# IMAGE_TAG/IMAGE_REF fields (a Universal Blue os-release convention;
+# kept in sync, though see below for what actually drives uwelcome's
+# banner).
 RUN set -eux; \
     sed -i \
         -e "s|^IMAGE_NAME=.*|IMAGE_NAME=\"${IMAGE_NAME}\"|" \
@@ -333,6 +343,21 @@ RUN set -eux; \
         -e "s|^IMAGE_TAG=.*|IMAGE_TAG=\"${IMAGE_TAG}\"|" \
         -e "s|^IMAGE_REF=.*|IMAGE_REF=\"ostree-image-signed:docker://ghcr.io/${IMAGE_VENDOR}/${IMAGE_NAME}\"|" \
         /etc/os-release
+
+# The actual fix for uwelcome's banner (the os-release rewrite above
+# does NOT do it — see the ARG IMAGE_NAME comment near the top of this
+# file): overwrite /usr/share/ublue-os/image-info.json, the file
+# uwelcome's GetImageInfo() reads verbatim for the "<ref>:<tag>" line.
+# Format mirrors what ublue-os/bluefin's build_files/base/00-image-info.sh
+# generates (same field names/shape, confirmed by pulling the upstream
+# Dakota base and cat'ing its own copy of this file).
+RUN set -eux; \
+    image_flavor="nvidia-580"; \
+    case "${IMAGE_NAME}" in *-gaming) image_flavor="nvidia-580-gaming" ;; esac; \
+    mkdir -p /usr/share/ublue-os; \
+    printf '{\n  "image-name": "%s",\n  "image-flavor": "%s",\n  "image-vendor": "%s",\n  "image-ref": "ostree-image-signed:docker://ghcr.io/%s/%s",\n  "image-tag": "%s"\n}\n' \
+        "${IMAGE_NAME}" "${image_flavor}" "${IMAGE_VENDOR}" "${IMAGE_VENDOR}" "${IMAGE_NAME}" "${IMAGE_TAG}" \
+        > /usr/share/ublue-os/image-info.json
 
 # Signing policy — mirrors lbssousa/bluefin's build_files/00-signing.sh
 # and Dakota's own convention for verified registries (its shipped

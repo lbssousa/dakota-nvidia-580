@@ -1,4 +1,4 @@
-name: Build and publish
+name: Build and publish latest
 
 on:
   push:
@@ -53,14 +53,19 @@ jobs:
       - name: Build image (${{ matrix.variant }})
         run: |
           # IMAGE_NAME (the Containerfile ARG, not this job's env var of
-          # the same name) is what gets baked into /etc/os-release so
-          # `uwelcome` shows this image instead of the upstream Dakota
-          # base — must match the repo name half of the tag above.
+          # the same name) is what gets baked into /etc/os-release and
+          # image-info.json so `uwelcome` shows this image instead of
+          # the upstream Dakota base — must match the repo name half of
+          # the tag below. IMAGE_TAG is left at the Containerfile's own
+          # default ("latest"), matching what this workflow actually
+          # publishes — see "CI and automatic updates" in README.md for
+          # why :stable (a later, separate promotion, not a rebuild)
+          # doesn't need its own build-arg here.
           podman build \
             --file Containerfile \
             --build-arg "BASE_IMAGE=${{ steps.base.outputs.base_image }}" \
             --build-arg "IMAGE_NAME=dakota-nvidia-580${{ matrix.tag_suffix }}" \
-            --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable" \
+            --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:latest" \
             .
 
       - name: Log in to GHCR
@@ -78,7 +83,7 @@ jobs:
         id: push
         run: |
           podman push --digestfile /tmp/push-digest \
-            "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}:latest"
           echo "digest=$(cat /tmp/push-digest)" >> "$GITHUB_OUTPUT"
 
       # Signing and SBOM generation mirror lbssousa/bluefin's own

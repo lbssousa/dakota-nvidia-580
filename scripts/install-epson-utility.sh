@@ -14,15 +14,13 @@
 #
 # The GUI (/opt/epson-printer-utility/bin/epson-printer-utility) is
 # dropped on purpose: it's a Qt5 binary (libQt5Core/Gui/Widgets.so.5),
-# and Dakota (GNOME OS) ships no Qt5 runtime at all — confirmed on
-# real hardware (2026-09-22) that launching it fails with
-# "libQt5Core.so.5: cannot open shared object file". Bundling a full
-# Qt5 stack just for an optional setup/maintenance utility isn't worth
-# the image-size cost; printing itself doesn't need it — the CUPS
-# filter and ecbd both link only against libraries Dakota already
-# ships (confirmed via `ldd` against the running system), and ecbd
-# starts cleanly as a systemd service. Printer setup/maintenance is
-# available via GNOME Settings › Printers or the CUPS web UI instead.
+# and Dakota (GNOME OS) ships no Qt5 runtime at all, so launching it
+# fails with "libQt5Core.so.5: cannot open shared object file".
+# Bundling a full Qt5 stack just for an optional setup/maintenance
+# utility isn't worth the image-size cost; printing itself doesn't
+# need it — the CUPS filter and ecbd both link only against libraries
+# Dakota already ships. Printer setup/maintenance is available via
+# GNOME Settings › Printers or the CUPS web UI instead.
 #
 # We don't use 'rpm -i' (Dakota's builder stage is Fedora, but the
 # RPM's cpio payload has duplicate directory entries that make rpm/cpio
