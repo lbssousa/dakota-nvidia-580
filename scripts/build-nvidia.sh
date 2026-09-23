@@ -46,13 +46,13 @@ echo "==> Extracting installer..."
 cd "NVIDIA-Linux-x86_64-${version}"
 
 echo "==> Building the kmod against ${build_dir}..."
-# IGNORE_CC_MISMATCH: this stage's compiler (GCC 16.2.1) is still not
-# bit-for-bit the one used to build Dakota's kernel (GCC 16.2.0,
-# freedesktop-sdk) — only a micro version apart, which kbuild's own
-# mismatch check would otherwise still flag. That's tolerable for an
-# out-of-tree module; a real ABI incompatibility would show up as a
-# link/load failure, not a compile failure — test `modprobe nvidia` on
-# the final image before considering a build validated.
+# No IGNORE_CC_MISMATCH: PATH is set up (see the nvidia-builder
+# Containerfile stage) so $(CC) resolves to the toolchain-builder
+# stage's from-source GCC, matching Dakota's own kernel exactly
+# (CONFIG_CC_VERSION_TEXT) — kbuild's own mismatch check should just
+# pass. Leaving it enforced means a future toolchain drift (see
+# README.md, "Compiler/linker version mismatch") fails the build
+# loudly instead of silently producing another unloadable .ko.
 #
 # IGNORE_MISSING_MODULE_SYMVERS: belt-and-suspenders only. The tree
 # scripts/build-kernel-src.sh reconstructs ships a real Module.symvers
@@ -143,8 +143,7 @@ for f in "${nv_strncpy_callers[@]}"; do
 done
 
 KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types" \
-make -C kernel SYSSRC="${build_dir}" IGNORE_CC_MISMATCH=1 \
-    IGNORE_MISSING_MODULE_SYMVERS=1 modules
+make -C kernel SYSSRC="${build_dir}" IGNORE_MISSING_MODULE_SYMVERS=1 modules
 
 mkdir -p "${out_dir}/usr/lib/modules/${kver}/extra"
 find kernel -maxdepth 1 -name '*.ko' -exec cp {} "${out_dir}/usr/lib/modules/${kver}/extra/" \;

@@ -127,12 +127,12 @@ RUN set -eux; \
 # .config extracted above, via scripts/build-kernel-src.sh. See that
 # script and README.md for the full rationale.
 #
-# Fedora 44: Dakota's own kernel is built with GCC 16.2.0 (per
-# CONFIG_CC_VERSION_TEXT in the shipped .config), and Fedora 44 ships
-# GCC 16.2.1 — the closest match available. A module built with a
-# mismatched GCC major version can pass compilation and the vermagic
-# check yet still be rejected at load time (kernel module relocation
-# ABI). See README.md, "Compiler version mismatch".
+# Stays on Fedora 44's own gcc/binutils (unlike nvidia-builder below,
+# which needs the toolchain-builder stage instead): this stage's own
+# vmlinux/ttm.ko/drm_ttm_helper.ko are never copied into the final
+# image — they only give nvidia-builder a real Module.symvers/API
+# surface to link against, which isn't relocation-ABI sensitive the
+# way an actually-loaded .ko is.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS kernel-src-builder
 # openssl (the CLI, not just openssl-devel's headers/libs) is needed by
@@ -189,17 +189,41 @@ RUN set -eux; \
     echo "Found PAM modules at: $so (dir: $(cat /pam-u2f-libdir))" >&2
 
 # ---------------------------------------------------------------------
-# nvidia-builder — Fedora used only as a build environment (dnf/gcc/
-# make); nothing here ends up in the final image except what
-# build-nvidia.sh explicitly packages into /out. Fedora 44 — see the
-# kernel-src-builder stage comment above for why (GCC version match
-# with Dakota's own kernel).
+# toolchain-builder — builds the exact GCC + binutils that built
+# Dakota's own kernel, from official upstream source, at the same
+# pins freedesktop-sdk itself uses
+# (elements/bootstrap/gcc.bst / elements/bootstrap/binutils.bst in the
+# dakota/freedesktop-sdk repo) — not whatever Fedora happens to
+# package. Fedora's own gcc/binutils, even a version very close to the
+# kernel's own, is not good enough: `nvidia.ko` needs a real relocation
+# resolved at `insmod` time (in .gnu.linkonce.this_module, boilerplate
+# every out-of-tree module carries), and that fails with a toolchain
+# mismatch. See scripts/build-toolchain.sh and README.md,
+# "Compiler/linker version mismatch".
+# ---------------------------------------------------------------------
+FROM fedora:44 AS toolchain-builder
+RUN dnf install -y gcc gcc-c++ make bison flex texinfo git curl tar xz \
+        bzip2 gettext-devel zlib-ng-compat-devel diffutils findutils \
+        which && \
+    dnf clean all
+COPY scripts/build-toolchain.sh /build-toolchain.sh
+RUN chmod +x /build-toolchain.sh && /build-toolchain.sh /toolchain
+
+# ---------------------------------------------------------------------
+# nvidia-builder — Fedora used only as a build environment (dnf/make/
+# kmod/...); nothing here ends up in the final image except what
+# build-nvidia.sh explicitly packages into /out. The actual compiler
+# and linker come from toolchain-builder above, put first on PATH —
+# see that stage's comment for why Fedora's own gcc/binutils (even
+# Fedora 44's) aren't good enough here.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS nvidia-builder
 ARG NVIDIA_VERSION
-RUN dnf install -y gcc make kmod elfutils-libelf-devel perl-interpreter \
+RUN dnf install -y make kmod elfutils-libelf-devel perl-interpreter \
         tar xz curl which && \
     dnf clean all
+COPY --from=toolchain-builder /toolchain /toolchain
+ENV PATH="/toolchain/bin:${PATH}"
 COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY scripts/build-nvidia.sh /build-nvidia.sh

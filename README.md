@@ -199,9 +199,16 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           │
   │           └─→ nvidia-builder    (Fedora, build environment only)
   │                 builds the out-of-tree kmod against the reconstructed
-  │                 tree above, runs nvidia-installer --no-kernel-module,
-  │                 and packages the result via a filesystem diff
-  │                 (scripts/build-nvidia.sh)
+  │                 tree above, using GCC/binutils from toolchain-builder
+  │                 (not Fedora's own — see "Compiler/linker version
+  │                 mismatch" below), runs nvidia-installer
+  │                 --no-kernel-module, and packages the result via a
+  │                 filesystem diff (scripts/build-nvidia.sh)
+  │                 ↑
+  │                 toolchain-builder (Fedora, build environment only)
+  │                 builds GCC 16.2.0 + binutils from upstream source, at
+  │                 the exact pins freedesktop-sdk itself uses to build
+  │                 Dakota's kernel (scripts/build-toolchain.sh)
   │
   ├─→ libfprint-probe         locates libfprint-2.so's exact libdir
   │     │                     in the Dakota base image
@@ -325,6 +332,12 @@ reconstructs itself from upstream source + the image's own shipped
   non-parallel step. GitHub Actions' hosted runners (16 GB) handle it
   in well under a minute; a memory-constrained machine may need swap
   or closed applications first, or just let CI do the build.
+- **`toolchain-builder` compiles GCC + binutils from source**, adding
+  real time to every build (a from-source GCC build, even
+  single-stage/C-only, is the slowest single step in this
+  Containerfile) — the cost of matching Dakota's kernel toolchain
+  exactly instead of approximating with Fedora's own packages. See
+  "Compiler/linker version mismatch" below.
 - **`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
   `drm_ttm_helper.ko`'s exports, not literally every loadable module's.**
   If a future NVIDIA driver version (or a kernel bump) needs a symbol
@@ -357,22 +370,38 @@ reconstructs itself from upstream source + the image's own shipped
   doesn't provide and NVIDIA's C-only module doesn't need. This
   doesn't change any C struct layout, calling convention, or the
   kernel release string (vermagic).
-- **Compiler version mismatch** — Dakota's kernels are built with GCC
-  16.2.0 (per `CONFIG_CC_VERSION_TEXT` in the shipped `.config`);
-  `kernel-src-builder` and `nvidia-builder` run on Fedora 44, which
-  ships GCC 16.2.1 — the closest match available, same major.minor,
-  one micro release apart. `RANDSTRUCT` and `LTO` are both off in the
-  shipped config (the two options most likely to make a
-  cross-compiler build genuinely ABI-incompatible), which meaningfully
-  de-risks this, but isn't a byte-for-byte guarantee: a module can
-  pass compilation and the vermagic check yet still be rejected by the
-  kernel's module loader at `insmod` time (relocation ABI) if the
-  compiler major version drifts far enough from the one that actually
-  built the kernel. `build-nvidia.sh` builds with
-  `IGNORE_CC_MISMATCH=1` for the same reason — a real incompatibility
-  shows up as a module load failure, not a build failure. Test
-  `modprobe nvidia` before trusting a build, and re-check this pairing
-  whenever a base-image bump changes the kernel's own GCC version.
+- **Compiler/linker version mismatch** — `nvidia.ko` must be built with
+  the exact GCC + binutils that built Dakota's own kernel, not merely
+  something close. Even one GCC *micro* version of drift (confirmed on
+  real hardware) makes the kernel's module loader reject `nvidia.ko`
+  at `insmod` time with `Exec format error` / `Invalid relocation
+  target, existing value is nonzero` in `dmesg`, in
+  `.gnu.linkonce.this_module` — the `init_module`/`cleanup_module`
+  function-pointer struct kbuild generates for *every* out-of-tree
+  module (not NVIDIA source). `toolchain-builder` (see the
+  Containerfile) builds GCC 16.2.0 and binutils from official upstream
+  source at the exact pins freedesktop-sdk itself uses to build
+  Dakota's kernel (`elements/bootstrap/gcc.bst` → tag
+  `releases/gcc-16.2.0`; `elements/bootstrap/binutils.bst` → tag
+  `binutils-2_47`, commit `6ce87bbc521cf46eaee9a1f7ef61cee2cdfb3e32`)
+  via `scripts/build-toolchain.sh`, and `nvidia-builder` uses that
+  toolchain instead of Fedora's own. `kernel-src-builder` stays on
+  Fedora's toolchain since its output (`vmlinux`, `ttm.ko`,
+  `drm_ttm_helper.ko`) never ships to the real machine — see that
+  stage's own comment.
+
+  `build-nvidia.sh` doesn't pass `IGNORE_CC_MISMATCH=1`: kbuild's own
+  version check enforces the match, so a future drift fails the build
+  loudly instead of producing another unloadable `.ko`. `RANDSTRUCT`
+  and `LTO` are both off in the shipped config (the two options most
+  likely to make any *remaining* toolchain drift genuinely
+  ABI-incompatible on top of this). Test `modprobe nvidia` before
+  trusting a build regardless, and re-derive
+  `scripts/build-toolchain.sh`'s pins whenever a base-image bump
+  changes the kernel's own toolchain — check
+  `CONFIG_CC_VERSION_TEXT` in the shipped `.config` for the GCC
+  version, and `/proc/version` on the real machine for the binutils
+  version (not shown in the `.config`).
 - **Gaming variant: Dakota's own fixup patches to the OGC kernel are
   not applied.** `linux-ogc.bst` applies three small patches from
   `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an
