@@ -49,6 +49,19 @@ ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
 ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
+# Identity this downstream image reports as, in place of the upstream
+# Dakota base it's layered on. Rewritten into /etc/os-release's
+# IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF fields in the final
+# stage below — those are what `uwelcome` (Dakota's login banner,
+# github.com/projectbluefin/uwelcome) reads to show "You're running
+# <image>"; left untouched, it shows the upstream dakota-gaming base
+# instead of this image (confirmed on real hardware, 2026-09-22).
+# CI overrides IMAGE_NAME per matrix leg (standard vs "-gaming") —
+# see .github/workflows/build.yml.
+ARG IMAGE_NAME=dakota-nvidia-580
+ARG IMAGE_VENDOR=lbssousa
+ARG IMAGE_TAG=stable
+
 # ---------------------------------------------------------------------
 # dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
 # changes content over time). The NVIDIA module below is compiled
@@ -178,9 +191,25 @@ RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-sr
 # lbssousa/bluefin-initial-setup (playbooks/dakota/libfprint.yml,
 # dakota_libfprint_repo/_ref vars in group_vars/all/dakota.yml), which
 # installs the same fork at runtime via distrobox for Dakota hosts not
-# using this custom image. Here it's built against Fedora's
-# opencv-devel instead of the host's Homebrew — there's no host, this
-# is an image build.
+# using this custom image.
+#
+# opencv-devel is deliberately NOT installed here: the goodixtls53xd
+# driver's SIGFM matcher needs OpenCV, but this fork vendors and
+# statically links the small subset it actually uses (see the fork's
+# meson.build) whenever no system OpenCV is found — installing
+# opencv-devel would make it dynamically link against Fedora's OpenCV
+# instead, which then wouldn't exist in the final Dakota image at all
+# (confirmed on real hardware, 2026-09-22: fprintd.service crashed
+# with "libopencv_features2d.so.413: cannot open shared object file"
+# — this repo had never bundled that runtime dependency). Vendoring
+# means no such runtime dependency exists to bundle in the first
+# place. cmake/ninja-build/curl/tar here are for that vendored build
+# (fetches+compiles a minimal static OpenCV via its own native CMake
+# build), not for libfprint itself. zlib-devel is linked into the
+# result explicitly (OpenCV's persistence.cpp calls zlib's gz*
+# functions unconditionally, and a static .a never carries its own
+# transitive link deps forward). systemd-udev provides udev.pc,
+# needed for the driver's udev-rules install path.
 #
 # Installed straight into the libdir found by libfprint-probe, under
 # --prefix=/usr: this overwrites the stock libfprint shipped in the
@@ -193,9 +222,9 @@ ARG LIBFPRINT_REPO
 ARG LIBFPRINT_REF
 RUN dnf install -y meson gcc gcc-c++ ninja-build pkgconf-pkg-config \
         openssl-devel glib2-devel gobject-introspection-devel \
-        libgudev-devel libgusb-devel systemd-devel nss-devel \
+        libgudev-devel libgusb-devel systemd-devel systemd-udev nss-devel \
         pixman-devel gtk-doc python3-cairo python3-gobject cairo-devel \
-        umockdev git cmake opencv-devel && \
+        umockdev git cmake curl tar zlib-devel && \
     dnf clean all
 COPY --from=libfprint-probe /libfprint-libdir /libfprint-libdir
 RUN git clone --branch "${LIBFPRINT_REF}" --depth 1 "${LIBFPRINT_REPO}" /src
@@ -243,9 +272,11 @@ RUN pamdir="$(cat /pam-u2f-libdir)" && \
 
 # ---------------------------------------------------------------------
 # epson-builder — Fedora used only to download and unpack Epson's
-# binary epson-printer-utility RPM (printer setup/maintenance GUI +
-# ecbd network-discovery daemon), via
-# scripts/install-epson-utility.sh — adapted from lbssousa/bluefin's
+# binary epson-printer-utility RPM, keeping just the CUPS backend
+# (rastertoepson filter) and the ecbd network-discovery daemon — not
+# the Qt5 setup/maintenance GUI, which Dakota can't run (see
+# scripts/install-epson-utility.sh) — via
+# scripts/install-epson-utility.sh, adapted from lbssousa/bluefin's
 # build_files/20-epson.sh. Only rpm2cpio/cpio/curl are needed; nothing
 # here is compiled, and no dnf/rpm database ends up in the final
 # image, since Dakota (GNOME OS) has neither.
@@ -266,12 +297,42 @@ RUN chmod +x /install-epson-utility.sh && /install-epson-utility.sh /out
 # ---------------------------------------------------------------------
 FROM dakota-base
 
+ARG IMAGE_NAME
+ARG IMAGE_VENDOR
+ARG IMAGE_TAG
+
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
+
+# Kernel command-line args baked in via bootc's kargs.d mechanism
+# (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
+# writes on every deployment, e.g. after `bootc switch`/`upgrade`).
+# This is the actual fix for nouveau grabbing the GPU before nvidia.ko
+# ever gets a chance to (confirmed on real hardware, 2026-09-22): the
+# modprobe.d blacklist above only takes effect once /usr is mounted,
+# but nouveau binds the PCI device earlier, inside the initramfs
+# (dracut honors rd.driver.blacklist= from the kernel command line at
+# that stage; `rhgb quiet` triggers early KMS, which is what races
+# nvidia.ko). See files/nvidia-kargs.toml and README.md.
+COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia-blacklist-nouveau.toml
+
+# Rewrite this downstream image's identity into /etc/os-release,
+# overwriting the upstream Dakota base's own IMAGE_NAME/IMAGE_VENDOR/
+# IMAGE_TAG/IMAGE_REF. Confirmed on real hardware (2026-09-22) that
+# `uwelcome` (Dakota's login banner) reads these fields verbatim to
+# show "You're running <image>" — left as-is, it advertises the
+# upstream base image this was built FROM, not this one.
+RUN set -eux; \
+    sed -i \
+        -e "s|^IMAGE_NAME=.*|IMAGE_NAME=\"${IMAGE_NAME}\"|" \
+        -e "s|^IMAGE_VENDOR=.*|IMAGE_VENDOR=\"${IMAGE_VENDOR}\"|" \
+        -e "s|^IMAGE_TAG=.*|IMAGE_TAG=\"${IMAGE_TAG}\"|" \
+        -e "s|^IMAGE_REF=.*|IMAGE_REF=\"ostree-image-signed:docker://ghcr.io/${IMAGE_VENDOR}/${IMAGE_NAME}\"|" \
+        /etc/os-release
 
 # Signing policy — mirrors lbssousa/bluefin's build_files/00-signing.sh
 # and Dakota's own convention for verified registries (its shipped
@@ -301,28 +362,15 @@ RUN kver="$(cat /kernel-version)" && \
 # Epson epson-printer-utility post-install steps (replicated from the
 # RPM's post-install scriptlet, which cannot run in a container build;
 # see scripts/install-epson-utility.sh for the file-layout half of
-# this):
-#
-# - /opt -> /var/opt compatibility symlink: bootc's /opt is a symlink
-#   to /var/opt (mutable, not part of the image layer), but the
-#   binary's resource paths are hardcoded to /opt/epson-printer-utility/.
-#   /usr/lib is replaced wholesale on 'bootc upgrade'; this symlink
-#   persists across that and always points at the current version.
-# - systemctl enable: registers the ecbd daemon (network printer
-#   discovery) to start at boot.
-# - /etc/services entry: registers the ecbd port (cbtd 35587/tcp);
-#   /etc is mutable in bootc and 3-way merged on upgrade, safe to edit.
-# - update-desktop-database: rebuilds the desktop file cache so the
-#   utility's launcher shows up immediately; guarded since Dakota
-#   (GNOME OS) may not ship desktop-file-utils.
-RUN mkdir -p /var/opt && \
-    ln -sfn /usr/lib/epson-printer-utility /var/opt/epson-printer-utility && \
-    systemctl enable ecbd.service && \
+# this). Only the pieces printing actually needs — systemctl enable
+# registers the ecbd daemon (network printer discovery) to start at
+# boot; the /etc/services entry registers its port (cbtd 35587/tcp),
+# safe to edit since /etc is mutable in bootc and 3-way merged on
+# upgrade. (The GUI setup/maintenance utility itself is not shipped —
+# see scripts/install-epson-utility.sh for why.)
+RUN systemctl enable ecbd.service && \
     if ! grep -q 'cbtd' /etc/services 2>/dev/null; then \
         printf '\ncbtd\t35587/tcp\t# Epson printer backend\n' >> /etc/services; \
-    fi && \
-    if command -v update-desktop-database >/dev/null 2>&1; then \
-        update-desktop-database /usr/share/applications; \
     fi
 
 # Device nodes (e.g. /dev/ecblp0) created by the epson-printer-utility

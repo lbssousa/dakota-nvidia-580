@@ -1,28 +1,36 @@
 #!/usr/bin/env bash
-# Downloads and unpacks Epson's binary "epson-printer-utility" RPM
-# (printer setup/maintenance GUI + ecbd network-discovery daemon) into
-# an output tree the Containerfile can COPY straight into the final
-# Dakota image — mirroring how build-nvidia.sh packages the NVIDIA
-# driver via a filesystem diff instead of running an installer
-# directly against the final image.
+# Downloads and unpacks Epson's binary "epson-printer-utility" RPM,
+# keeping only the CUPS backend (rastertoepson filter) and the ecbd
+# network-discovery daemon — the pieces printing actually needs — and
+# discarding the Qt5 setup/maintenance GUI. Output tree the
+# Containerfile COPYs straight into the final Dakota image, mirroring
+# how build-nvidia.sh packages the NVIDIA driver via a filesystem diff
+# instead of running an installer directly against the final image.
 #
 # Adapted from lbssousa/bluefin's build_files/20-epson.sh (the
 # "Install epson-printer-utility" section only — this repo doesn't
 # install the epson-inkjet-printer-escpr driver, which needs building
 # from source against cups-devel/autotools not present on Dakota).
 #
+# The GUI (/opt/epson-printer-utility/bin/epson-printer-utility) is
+# dropped on purpose: it's a Qt5 binary (libQt5Core/Gui/Widgets.so.5),
+# and Dakota (GNOME OS) ships no Qt5 runtime at all — confirmed on
+# real hardware (2026-09-22) that launching it fails with
+# "libQt5Core.so.5: cannot open shared object file". Bundling a full
+# Qt5 stack just for an optional setup/maintenance utility isn't worth
+# the image-size cost; printing itself doesn't need it — the CUPS
+# filter and ecbd both link only against libraries Dakota already
+# ships (confirmed via `ldd` against the running system), and ecbd
+# starts cleanly as a systemd service. Printer setup/maintenance is
+# available via GNOME Settings › Printers or the CUPS web UI instead.
+#
 # We don't use 'rpm -i' (Dakota's builder stage is Fedora, but the
 # RPM's cpio payload has duplicate directory entries that make rpm/cpio
-# fail with "mkdir failed - File exists" once /opt exists) and we
-# relocate /opt/epson-printer-utility to /usr/lib/epson-printer-utility
-# because in bootc /opt is a symlink to /var/opt (mutable, NOT part of
-# the image layer that survives 'bootc upgrade'). The final stage
-# creates a compatibility symlink back to /opt so the binary's
-# hardcoded /opt/epson-printer-utility/ resource paths still resolve.
+# fail with "mkdir failed - File exists" once /opt exists).
 #
 # Usage: install-epson-utility.sh <output-dir>
 #   <output-dir>  directory to populate with the final tree
-#                  (usr/bin/..., usr/lib/epson-printer-utility/, ...)
+#                  (usr/bin/..., usr/lib/epson-backend/, ...)
 set -euo pipefail
 
 out_dir="$1"
@@ -73,47 +81,17 @@ mkdir -p "${extract_dir}"
 echo "==> Assembling output tree in ${out_dir}..."
 
 # /usr content (CUPS backend, ecbd daemon + its service file, docs)
-# goes straight to /usr.
+# goes straight to /usr. Nothing under /opt/epson-printer-utility (the
+# Qt5 GUI and its resources) is copied — see the header comment above.
 mkdir -p "${out_dir}/usr"
 cp -a "${extract_dir}/usr/." "${out_dir}/usr/"
 
-# Relocate /opt/epson-printer-utility -> /usr/lib/epson-printer-utility
-# (immutable layer; see the header comment above).
-cp -a "${extract_dir}/opt/epson-printer-utility" "${out_dir}/usr/lib/epson-printer-utility"
-
-# Binary into PATH.
-mkdir -p "${out_dir}/usr/bin"
-ln -sfn /usr/lib/epson-printer-utility/bin/epson-printer-utility \
-        "${out_dir}/usr/bin/epson-printer-utility"
-
 # Udev rules: ship in the immutable system path instead of
 # /etc/udev/rules.d/ (the RPM scriptlet's target, not replicated here).
+# USB permission handling for Epson devices, unrelated to the GUI.
 install -Dm0644 \
     "${extract_dir}/opt/epson-printer-utility/rules/79-udev-epson.rules" \
     "${out_dir}/usr/lib/udev/rules.d/79-udev-epson.rules"
-
-# Desktop entry + icon. The RPM's own .desktop file hardcodes
-# /opt/epson-printer-utility/ paths (which GNOME Shell's icon loader
-# may not follow through the /opt->/var/opt->/usr/lib symlink chain)
-# and uses the deprecated Categories=Application; write a clean one
-# referencing /usr/bin and /usr/share instead.
-install -Dm0644 \
-    "${extract_dir}/opt/epson-printer-utility/resource/Images/AppIcon.png" \
-    "${out_dir}/usr/share/pixmaps/epson-printer-utility.png"
-
-mkdir -p "${out_dir}/usr/share/applications"
-cat > "${out_dir}/usr/share/applications/epson-printer-utility.desktop" << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=Epson Printer Utility
-GenericName=Epson Printer Utility
-Comment=Configure and maintain Epson printers
-Exec=/usr/bin/epson-printer-utility
-Icon=epson-printer-utility
-Terminal=false
-Categories=Utility;Printing;
-Name[ja_JP]=Epson Printer Utility
-EOF
 
 # Move service file from /usr/lib/epson-backend/ to the standard
 # systemd unit path so the final stage's 'systemctl enable' can find

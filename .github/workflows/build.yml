@@ -52,9 +52,14 @@ jobs:
 
       - name: Build image (${{ matrix.variant }})
         run: |
+          # IMAGE_NAME (the Containerfile ARG, not this job's env var of
+          # the same name) is what gets baked into /etc/os-release so
+          # `uwelcome` shows this image instead of the upstream Dakota
+          # base — must match the repo name half of the tag above.
           podman build \
             --file Containerfile \
             --build-arg "BASE_IMAGE=${{ steps.base.outputs.base_image }}" \
+            --build-arg "IMAGE_NAME=dakota-nvidia-580${{ matrix.tag_suffix }}" \
             --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:stable" \
             .
 

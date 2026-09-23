@@ -19,7 +19,12 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   is compiled during the image build and installed **directly into
   `/usr`, overwriting the stock libfprint** shipped in the Dakota base
   image at its original path — see ["How the libfprint overwrite
-  works"](#how-the-libfprint-overwrite-works) below.
+  works"](#how-the-libfprint-overwrite-works) below. The
+  goodixtls53xd driver's SIGFM matcher (OpenCV-based) is built from a
+  small, **statically vendored** OpenCV subset in the fork itself — no
+  `opencv-devel` is installed in `libfprint-builder`, and no OpenCV
+  runtime library needs bundling into the final image (see the
+  `libfprint-builder` stage comment in the `Containerfile`).
 - **[Yubico/pam-u2f](https://github.com/Yubico/pam-u2f)** (upstream,
   not a fork) — `pam_u2f.so` (the PAM module) and `pamu2fcfg` (the CLI
   used to enroll a YubiKey and generate `~/.config/Yubico/u2f_keys`),
@@ -41,15 +46,19 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   turns out to be a plain, directly-editable file (confirmed by
   inspecting the published image), not `authselect`-templated, so that
   gap may be easier to close than documented there.
-- **Epson's [`epson-printer-utility`](https://support.epson.net/linux/Printer/LSB_distribution_pages/en/utility.php)**
-  (printer setup/maintenance GUI + `ecbd` network-discovery daemon),
-  obtained and installed the same way as in
+- **Epson printer support** (CUPS `rastertoepson` filter + `ecbd`
+  network-discovery daemon), extracted from Epson's binary
+  `epson-printer-utility` RPM the same way as in
   [ublue-os/bluefin](https://github.com/ublue-os/bluefin)
-  (`build_files/20-epson.sh`) — downloaded as a binary RPM and unpacked
-  rather than installed via `rpm`/`dnf`, since Dakota has neither. This
-  repo installs only the utility, not bluefin's
-  `epson-inkjet-printer-escpr` driver package (which needs building
-  from source against `cups-devel`/autotools, not present on Dakota).
+  (`build_files/20-epson.sh`) — downloaded and unpacked rather than
+  installed via `rpm`/`dnf`, since Dakota has neither. This repo does
+  **not** ship the RPM's Qt5 setup/maintenance GUI (Dakota/GNOME OS has
+  no Qt5 runtime, and bundling one just for an optional utility isn't
+  worth the image-size cost — confirmed on real hardware, see
+  ["Known limitations"](#known-limitations)); printing itself doesn't
+  need it. Nor does it install bluefin's `epson-inkjet-printer-escpr`
+  driver package, which needs building from source against
+  `cups-devel`/autotools, not present on Dakota.
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, both published:
@@ -69,9 +78,34 @@ The container image builds, all four NVIDIA kernel modules
 compile and link, and both images are signed with a valid SBOM
 attestation (see ["Verification"](#verification)) — confirmed with
 `cosign verify`/`cosign verify-attestation` against the published
-images. **Nothing here has been booted on real Dakota hardware yet**
-— see ["Known limitations"](#known-limitations)
-below.
+images.
+
+**First real-hardware boot (2026-09-22, `dakota-nvidia-580-gaming`)**
+surfaced four issues, all now fixed in this repo:
+
+- NVIDIA kernel modules never bound the GPU — nouveau claimed it
+  first, during the initramfs stage, before the modprobe.d blacklist
+  ever got consulted. Fixed with kernel command-line args baked in via
+  `/usr/lib/bootc/kargs.d/` (`rd.driver.blacklist=nouveau`); needs a
+  fresh `bootc switch`/`upgrade` from this image to take effect (kargs
+  are applied when bootc writes the boot entry, not retroactively).
+- `fprintd-list` failed (D-Bus activation timeout) because
+  `fprintd.service` crashed on missing `libopencv_features2d.so.413` —
+  the libfprint fork's OpenCV dependency was never bundled into the
+  final image. Fixed upstream in the fork itself (statically vendored,
+  no runtime OpenCV/BLAS library needed at all) — see the libfprint
+  bullet above and ["Known limitations"](#known-limitations).
+- Dakota's login banner (`uwelcome`) showed the upstream
+  `ghcr.io/projectbluefin/dakota-gaming:latest` base instead of this
+  image — it reads `/etc/os-release`'s `IMAGE_NAME`/`IMAGE_VENDOR`/
+  `IMAGE_TAG` verbatim, which this repo never rewrote. Fixed: the
+  final stage now overwrites those fields (and `IMAGE_REF`) with this
+  image's own identity.
+- `epson-printer-utility` (the Qt5 GUI) failed to launch —
+  `libQt5Core.so.5: cannot open shared object file`, since Dakota ships
+  no Qt5 runtime. Fixed by dropping the GUI from the image entirely;
+  printing itself (CUPS filter + `ecbd`) doesn't need it and was
+  already working. See the Epson bullet above.
 
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
@@ -360,10 +394,17 @@ reconstructs itself from upstream source + the image's own shipped
   Boot enabled. If `modprobe nvidia` fails silently on first boot,
   start here (disable Secure Boot, or set up MOK enrollment + module
   signing in the build). Not tested in this repo yet.
-- **nouveau blacklist may not be enough** — if Dakota bakes nouveau
-  statically into the UKI instead of as an on-demand module,
-  `files/nvidia-blacklist-nouveau.conf` alone won't fix it. See the
-  comment in that file.
+- **nouveau blacklist alone is not enough** — confirmed on real
+  hardware (2026-09-22): `files/nvidia-blacklist-nouveau.conf` doesn't
+  stop nouveau from claiming the GPU, since it binds the PCI device
+  during the initramfs/plymouth stage, before `/usr/lib/modprobe.d` is
+  even consulted. Fixed via kernel command-line args
+  (`rd.driver.blacklist=nouveau`, honored inside the initramfs) baked
+  in through `files/nvidia-kargs.toml` → `/usr/lib/bootc/kargs.d/`. A
+  machine already running an older build of this image needs a fresh
+  `bootc switch`/`upgrade` for the new kargs to take effect — they're
+  applied when bootc writes the boot entry, not retroactively to an
+  existing deployment.
 - **`nvidia-installer` flags** — checked against `--help`/
   `--advanced-options` of recent versions, but they change between
   branches. Re-validate before changing `NVIDIA_VERSION`.
@@ -379,17 +420,23 @@ reconstructs itself from upstream source + the image's own shipped
 - **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
   scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
   in the image; see the pam-u2f bullet near the top of this README.
-- **`epson-printer-utility` post-install steps run against Dakota
-  itself, not just verified via Fedora tooling** — `systemctl enable`,
-  the `/etc/services` edit, and the (guarded) `update-desktop-database`
-  call all run in the `final` stage, straight against the Dakota base
-  image. The file layout the RPM unpacks into was verified against a
-  real download in a Fedora build stage, but whether the daemon starts
-  cleanly, the launcher shows up in GNOME Shell, and printing actually
-  works has not been checked on real Dakota hardware.
-- **Nothing here has been validated on real Dakota hardware.** Treat
-  it as a tested starting point, not a guarantee — the same caveat
-  `bluefin-initial-setup` makes about Dakota in general (still alpha).
+- **Epson printing confirmed working on real hardware (2026-09-22)**:
+  `ecbd.service` starts cleanly and the CUPS `rastertoepson` filter's
+  dependencies all resolve. The GUI utility is no longer shipped at
+  all (see the Epson bullet near the top of this README) — actual
+  print jobs through CUPS haven't been exercised end-to-end yet
+  (network-discovered printer + real print job), only the daemon/filter
+  wiring.
+- **First real-hardware boot validated most of this repo** (2026-09-22,
+  `dakota-nvidia-580-gaming`) — see the "Status" section above for the
+  four issues that surfaced and their fixes. Signing/SBOM verification,
+  the kernel module build itself, and libfprint/pam-u2f/Epson file
+  layout were all already confirmed; what hadn't been exercised before
+  that boot (nouveau actually losing the GPU race, fprintd staying up,
+  `uwelcome`'s banner, the Epson GUI) now has either a real-hardware
+  pass or a documented, self-contained fix. Not yet re-validated on
+  hardware *after* these fixes land in a published image — do that
+  before considering this "done."
 
 ## Local build
 
