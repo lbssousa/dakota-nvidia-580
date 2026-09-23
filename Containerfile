@@ -126,8 +126,15 @@ RUN set -eux; \
 # headers, scripts, objtool) from upstream kernel source + the exact
 # .config extracted above, via scripts/build-kernel-src.sh. See that
 # script and README.md for the full rationale.
+#
+# Fedora 44: Dakota's own kernel is built with GCC 16.2.0 (per
+# CONFIG_CC_VERSION_TEXT in the shipped .config), and Fedora 44 ships
+# GCC 16.2.1 — the closest match available. A module built with a
+# mismatched GCC major version can pass compilation and the vermagic
+# check yet still be rejected at load time (kernel module relocation
+# ABI). See README.md, "Compiler version mismatch".
 # ---------------------------------------------------------------------
-FROM fedora:42 AS kernel-src-builder
+FROM fedora:44 AS kernel-src-builder
 # openssl (the CLI, not just openssl-devel's headers/libs) is needed by
 # certs/Makefile's gen_key rule: the gaming variant's shipped .config
 # has CONFIG_MODULE_SIG_ALL=y (unset on standard), which makes `make
@@ -184,9 +191,11 @@ RUN set -eux; \
 # ---------------------------------------------------------------------
 # nvidia-builder — Fedora used only as a build environment (dnf/gcc/
 # make); nothing here ends up in the final image except what
-# build-nvidia.sh explicitly packages into /out.
+# build-nvidia.sh explicitly packages into /out. Fedora 44 — see the
+# kernel-src-builder stage comment above for why (GCC version match
+# with Dakota's own kernel).
 # ---------------------------------------------------------------------
-FROM fedora:42 AS nvidia-builder
+FROM fedora:44 AS nvidia-builder
 ARG NVIDIA_VERSION
 RUN dnf install -y gcc make kmod elfutils-libelf-devel perl-interpreter \
         tar xz curl which && \

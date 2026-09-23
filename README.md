@@ -359,14 +359,20 @@ reconstructs itself from upstream source + the image's own shipped
   kernel release string (vermagic).
 - **Compiler version mismatch** — Dakota's kernels are built with GCC
   16.2.0 (per `CONFIG_CC_VERSION_TEXT` in the shipped `.config`);
-  `kernel-src-builder` uses whatever GCC Fedora 42 ships. `RANDSTRUCT`
-  and `LTO` are both off in the shipped config (the two options most
-  likely to make a cross-compiler build genuinely ABI-incompatible),
-  which meaningfully de-risks this, but isn't a byte-for-byte
-  guarantee. `build-nvidia.sh` builds with `IGNORE_CC_MISMATCH=1` for
-  the same reason — a real incompatibility would show up as a module
-  load failure, not a build failure. Test `modprobe nvidia` before
-  trusting a build.
+  `kernel-src-builder` and `nvidia-builder` run on Fedora 44, which
+  ships GCC 16.2.1 — the closest match available, same major.minor,
+  one micro release apart. `RANDSTRUCT` and `LTO` are both off in the
+  shipped config (the two options most likely to make a
+  cross-compiler build genuinely ABI-incompatible), which meaningfully
+  de-risks this, but isn't a byte-for-byte guarantee: a module can
+  pass compilation and the vermagic check yet still be rejected by the
+  kernel's module loader at `insmod` time (relocation ABI) if the
+  compiler major version drifts far enough from the one that actually
+  built the kernel. `build-nvidia.sh` builds with
+  `IGNORE_CC_MISMATCH=1` for the same reason — a real incompatibility
+  shows up as a module load failure, not a build failure. Test
+  `modprobe nvidia` before trusting a build, and re-check this pairing
+  whenever a base-image bump changes the kernel's own GCC version.
 - **Gaming variant: Dakota's own fixup patches to the OGC kernel are
   not applied.** `linux-ogc.bst` applies three small patches from
   `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an

@@ -46,12 +46,13 @@ echo "==> Extracting installer..."
 cd "NVIDIA-Linux-x86_64-${version}"
 
 echo "==> Building the kmod against ${build_dir}..."
-# IGNORE_CC_MISMATCH: this stage's Fedora compiler is almost certainly
-# not bit-for-bit the one used to build Dakota's kernel
-# (freedesktop-sdk). That's tolerable for an out-of-tree module; real
-# ABI incompatibilities would show up as a link/load failure, not a
-# compile failure — test `modprobe nvidia` on the final image before
-# considering this validated.
+# IGNORE_CC_MISMATCH: this stage's compiler (GCC 16.2.1) is still not
+# bit-for-bit the one used to build Dakota's kernel (GCC 16.2.0,
+# freedesktop-sdk) — only a micro version apart, which kbuild's own
+# mismatch check would otherwise still flag. That's tolerable for an
+# out-of-tree module; a real ABI incompatibility would show up as a
+# link/load failure, not a compile failure — test `modprobe nvidia` on
+# the final image before considering a build validated.
 #
 # IGNORE_MISSING_MODULE_SYMVERS: belt-and-suspenders only. The tree
 # scripts/build-kernel-src.sh reconstructs ships a real Module.symvers
@@ -65,7 +66,7 @@ echo "==> Building the kmod against ${build_dir}..."
 # empty/missing file silently steers it toward APIs long removed from
 # modern kernels instead of just skipping a CRC check.
 #
-# KCFLAGS: GCC 14+ (this Fedora 42 stage) made a small group of
+# KCFLAGS: GCC 14+ (this stage's compiler) made a small group of
 # diagnostics errors unconditionally, not just via -Werror. These three
 # all trace back to the same root cause in NVIDIA's source: several
 # files call strncpy() without including <string.h>/<linux/string.h>,
