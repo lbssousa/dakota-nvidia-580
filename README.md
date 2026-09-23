@@ -1,7 +1,7 @@
 # dakota-nvidia-580
 
 A customized [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
-image with three components baked in via downstream OCI image layering
+image with four components baked in via downstream OCI image layering
 (not by forking the upstream BuildStream build — see ["Why downstream
 instead of forking
 BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
@@ -20,6 +20,27 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `/usr`, overwriting the stock libfprint** shipped in the Dakota base
   image at its original path — see ["How the libfprint overwrite
   works"](#how-the-libfprint-overwrite-works) below.
+- **[Yubico/pam-u2f](https://github.com/Yubico/pam-u2f)** (upstream,
+  not a fork) — `pam_u2f.so` (the PAM module) and `pamu2fcfg` (the CLI
+  used to enroll a YubiKey and generate `~/.config/Yubico/u2f_keys`),
+  needed to authenticate with a YubiKey over FIDO2/U2F. Neither can
+  come from Homebrew: PAM modules must live in the system's PAM module
+  directory (found by `pam-u2f-probe`, same trick as `libfprint-probe`
+  below) to be loadable by `gdm`/`sudo`/`su` at all. Its own runtime
+  dependency, `libfido2`, is deliberately **not** baked in here — it's
+  left to `brew install libfido2`, matching what
+  [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
+  (`playbooks/yubikey.yml`) already documents for Fedora Dakota hosts.
+  Actually wiring `pam_u2f.so` into `/etc/pam.d` (enabling YubiKey PAM
+  auth) is **out of scope for this image** — this repo only ensures
+  the library and executable exist; see
+  [`playbooks/dakota/yubikey.yml`](https://github.com/lbssousa/bluefin-initial-setup/blob/main/playbooks/dakota/yubikey.yml)
+  in bluefin-initial-setup for the current state of that (as of this
+  writing, deliberately left out there too, since Dakota has no
+  `authselect`) — though `/etc/pam.d/system-auth` on this image's base
+  turns out to be a plain, directly-editable file (confirmed by
+  inspecting the published image), not `authselect`-templated, so that
+  gap may be easier to close than documented there.
 - **Epson's [`epson-printer-utility`](https://support.epson.net/linux/Printer/LSB_distribution_pages/en/utility.php)**
   (printer setup/maintenance GUI + `ecbd` network-discovery daemon),
   obtained and installed the same way as in
@@ -129,9 +150,9 @@ The same `Containerfile` builds both variants — `dakota-base` resolves
 to whichever image `BASE_IMAGE` points at (standard Dakota by
 default; the gaming base when CI overrides it for the `-gaming` leg —
 see ["CI and automatic updates"](#ci-and-automatic-updates) below).
-Everything downstream (kernel headers, kmod build, libfprint, Epson
-utility) is derived from that image at build time, so it needs no
-per-variant changes.
+Everything downstream (kernel headers, kmod build, libfprint, pam-u2f,
+Epson utility) is derived from that image at build time, so it needs
+no per-variant changes.
 
 ```
 dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha256:...
@@ -162,26 +183,37 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           builds the fork against Fedora's opencv-devel, with
   │           --prefix=/usr --libdir=<probed dir>, DESTDIR=/out
   │
+  ├─→ pam-u2f-probe           locates the PAM module directory
+  │     │                     (e.g. /usr/lib/x86_64-linux-gnu/security)
+  │     │                     in the Dakota base image
+  │     │
+  │     └─→ pam-u2f-builder   (Fedora, build environment only)
+  │           builds Yubico's upstream pam-u2f (CMake) against Fedora's
+  │           libfido2-devel (build-time only), installing pam_u2f.so
+  │           to -DPAM_DIR=<probed dir> and pamu2fcfg to /usr/bin,
+  │           DESTDIR=/out
+  │
   ├─→ epson-builder           (Fedora, build environment only)
   │         downloads Epson's binary epson-printer-utility RPM and
   │         unpacks it (no rpm/dnf install) into /out
   │         (scripts/install-epson-utility.sh)
   │
   └─→ final (FROM dakota-base again)
-        COPY of all three /out trees (libfprint's overwrites the
-        stock library in place), nouveau blacklist, depmod +
-        ldconfig -r, Epson post-install steps (symlink, systemd
-        enable, /etc/services entry), signing policy
-        (scripts/configure-signing-policy.sh — see "Verification"),
-        bootc container lint
+        COPY of all four /out trees (libfprint's overwrites the
+        stock library in place; pam-u2f's adds new files alongside
+        it), nouveau blacklist, depmod + ldconfig -r, Epson
+        post-install steps (symlink, systemd enable, /etc/services
+        entry), signing policy (scripts/configure-signing-policy.sh —
+        see "Verification"), bootc container lint
 ```
 
-The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder` and
-`epson-builder` stages use Fedora **only as a build environment** (it
-has `dnf`, `gcc`, `meson`, `rpm2cpio`...) — nothing from them ends up
-in the final image except what the scripts explicitly package into
-`/out`. The final image is still plain Dakota (GNOME OS, no RPMs) with
-these payloads layered on top.
+The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`,
+`pam-u2f-builder` and `epson-builder` stages use Fedora **only as a
+build environment** (it has `dnf`, `gcc`, `meson`, `cmake`,
+`rpm2cpio`...) — nothing from them ends up in the final image except
+what the scripts/build commands explicitly package into `/out`. The
+final image is still plain Dakota (GNOME OS, no RPMs) with these
+payloads layered on top.
 
 ## How the libfprint overwrite works
 
@@ -211,6 +243,35 @@ This assumes the fork stays ABI-compatible with the stock libfprint
 not a fork that changes the library's public API, so this should
 hold, but hasn't been verified against Dakota's exact stock version.
 
+## How pam-u2f is installed
+
+Same `lib`-vs-`lib64`-style ambiguity as libfprint above, except for
+the PAM module directory: on this image's base it turned out to be
+`/usr/lib/x86_64-linux-gnu/security` (Debian-style multiarch, not
+Fedora's `/usr/lib64/security`), confirmed by inspecting the published
+image directly rather than assuming. A `/usr/lib/security` directory
+also exists but only holds an unrelated `pam_apparmor.so` — installing
+`pam_u2f.so` there instead would make it silently invisible to PAM.
+`pam-u2f-probe` finds the right one by locating `pam_unix.so` (always
+present, since it's what local password auth uses) and reading off its
+containing directory; `pam-u2f-builder` passes that as CMake's
+`-DPAM_DIR`.
+
+Unlike libfprint, this doesn't overwrite anything already shipped —
+`pam_u2f.so` and `pamu2fcfg` are new files, added alongside Dakota's
+existing PAM modules.
+
+`pam_u2f.so`/`pamu2fcfg` are built directly against Fedora's
+`libfido2-devel` (build-time only — nothing from that dnf install
+lands in `/out`/the final image). At runtime, their only dependency
+not already present in the Dakota base image (confirmed: `libpam.so.0`
+and `libcrypto.so.3` both are) is `libfido2.so.1` itself, which this
+repo deliberately does **not** bake in — see the `PAM_U2F_REPO`/`REF`
+comment in the `Containerfile` and ["Known
+limitations"](#known-limitations) below for why that's left to
+`brew install libfido2`, and why that hasn't been independently
+verified to actually resolve at runtime for a module living in `/usr`.
+
 ## Why downstream instead of forking BuildStream
 
 Dakota has no `dnf`/`rpm`/`akmods` — you can't `rpm-ostree install
@@ -225,11 +286,11 @@ security/GNOME updates.
 
 This repo takes the cheaper path to maintain for a single-user setup:
 a `Containerfile` that starts `FROM` the already-published image and
-only compiles what actually needs compiling (the out-of-tree kmod +
-the libfprint fork) against a kernel tree it reconstructs itself from
-upstream source + the image's own shipped `.config` (see above) — plus
-unpacking Epson's binary `epson-printer-utility` RPM, which needs no
-compilation at all.
+only compiles what actually needs compiling (the out-of-tree kmod, the
+libfprint fork, and Yubico's pam-u2f) against a kernel tree it
+reconstructs itself from upstream source + the image's own shipped
+`.config` (see above) — plus unpacking Epson's binary
+`epson-printer-utility` RPM, which needs no compilation at all.
 
 ## Known limitations
 
@@ -307,6 +368,17 @@ compilation at all.
   `--advanced-options` of recent versions, but they change between
   branches. Re-validate before changing `NVIDIA_VERSION`.
 - **libfprint overwrite ABI assumption** — see the section above.
+- **pam-u2f's runtime dependency on a Homebrew-provided `libfido2` is
+  unverified** — see ["How pam-u2f is
+  installed"](#how-pam-u2f-is-installed). This image's base ships no
+  `linuxbrew` entry in `/etc/ld.so.conf.d` out of the box (checked
+  directly), so whether `pam_u2f.so`/`pamu2fcfg` can actually resolve
+  `libfido2.so.1` at runtime depends entirely on how Homebrew itself
+  gets installed/registered on the running host. Re-verify with `ldd`
+  against the real host before relying on this for login/`sudo`.
+- **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
+  scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
+  in the image; see the pam-u2f bullet near the top of this README.
 - **`epson-printer-utility` post-install steps run against Dakota
   itself, not just verified via Fedora tooling** — `systemctl enable`,
   the `/etc/services` edit, and the (guarded) `update-desktop-database`

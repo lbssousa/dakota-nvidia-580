@@ -4,11 +4,12 @@
 # branch (for a GPU generation no longer supported by the official
 # dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
 # branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
-# (Goodix 538d) + Epson's epson-printer-utility, baked in via
-# downstream OCI image layering — not via forking the upstream
-# BuildStream build. See README.md for the full reasoning (why
-# downstream instead of a BuildStream fork, and the risks that haven't
-# been validated on real hardware yet).
+# (Goodix 538d) + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
+# pamu2fcfg) + Epson's epson-printer-utility, baked in via downstream
+# OCI image layering — not via forking the upstream BuildStream build.
+# See README.md for the full reasoning (why downstream instead of a
+# BuildStream fork, and the risks that haven't been validated on real
+# hardware yet).
 #
 # The published Dakota images do NOT expose a usable kernel build tree
 # at /usr/lib/modules/<kver>/build — the symlink is there, but its
@@ -31,6 +32,22 @@
 ARG NVIDIA_VERSION=580.173.02
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
+# pam-u2f (upstream Yubico, not a fork): provides pam_u2f.so + pamu2fcfg,
+# the PAM module and enrollment CLI needed to use a YubiKey for FIDO2/U2F
+# PAM authentication — neither can come from Homebrew, since PAM modules
+# must live in the system's PAM module directory to be loadable by
+# gdm/sudo/su at all (a module under /home/linuxbrew is not on that
+# path). Its own runtime dependency, libfido2, IS left to `brew install
+# libfido2`, matching what lbssousa/bluefin-initial-setup
+# (playbooks/yubikey.yml) already documents/assumes for Fedora Dakota
+# hosts — not independently verified here that ldconfig actually
+# resolves the Homebrew-provided libfido2.so for a module living in
+# /usr on THIS image; this repo's base image ships no linuxbrew
+# ld.so.conf.d entry out of the box (checked directly), so that must
+# come from whatever installs Homebrew on the running host. Re-verify
+# before relying on this at login/sudo time.
+ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
+ARG PAM_U2F_REF=pam_u2f-1.4.0
 
 # ---------------------------------------------------------------------
 # dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
@@ -121,6 +138,27 @@ RUN set -eux; \
     echo "Found libfprint at: $so (libdir: $(cat /libfprint-libdir))" >&2
 
 # ---------------------------------------------------------------------
+# pam-u2f-probe — same idea as libfprint-probe above, but for the PAM
+# module directory: locates it by finding pam_unix.so (always present —
+# it's what local password auth uses), rather than assuming a
+# distro-conventional path. Confirmed on this base image to NOT be a
+# plain lib64/security path: it's /usr/lib/x86_64-linux-gnu/security
+# (Debian-style multiarch), while /usr/lib/security exists too but only
+# holds an unrelated pam_apparmor.so — installing pam_u2f.so into the
+# wrong one of the two would make it silently unloadable by PAM.
+# ---------------------------------------------------------------------
+FROM dakota-base AS pam-u2f-probe
+RUN set -eux; \
+    so="$(find /usr/lib* -name 'pam_unix.so' 2>/dev/null | head -n1)"; \
+    if [ -z "$so" ]; then \
+        echo "ERROR: pam_unix.so not found in this Dakota base image." >&2; \
+        echo "Can't determine where PAM security modules live." >&2; \
+        exit 1; \
+    fi; \
+    dirname "$so" > /pam-u2f-libdir; \
+    echo "Found PAM modules at: $so (dir: $(cat /pam-u2f-libdir))" >&2
+
+# ---------------------------------------------------------------------
 # nvidia-builder — Fedora used only as a build environment (dnf/gcc/
 # make); nothing here ends up in the final image except what
 # build-nvidia.sh explicitly packages into /out.
@@ -167,6 +205,43 @@ RUN libdir="$(cat /libfprint-libdir)" && \
     DESTDIR=/out ninja -C /src/builddir install
 
 # ---------------------------------------------------------------------
+# pam-u2f-builder — builds Yubico's own pam-u2f (upstream, not a fork)
+# from source: pam_u2f.so (the PAM module) + pamu2fcfg (the CLI used to
+# enroll a YubiKey and generate ~/.config/Yubico/u2f_keys — see
+# lbssousa/bluefin-initial-setup playbooks/yubikey.yml for the intended
+# usage). Man pages are skipped (-DBUILD_MANPAGES=OFF) since building
+# them needs asciidoc/a2x, an extra dependency for something outside
+# this task's scope (libraries + executables only).
+#
+# libfido2-devel is a BUILD-time only dependency here (needed to link
+# pam_u2f.so/pamu2fcfg against libfido2's headers/.so) — the runtime
+# libfido2.so itself is deliberately not copied into the final image;
+# see the PAM_U2F_REPO/REF comment near the top of this file for why.
+#
+# pam_u2f.so is installed into the exact directory pam-u2f-probe found
+# (-DPAM_DIR), same reasoning as libfprint-builder's --libdir above.
+# pamu2fcfg has no such ambiguity — CMake's default GNUInstallDirs
+# always resolves its bin dir to /usr/bin here.
+# ---------------------------------------------------------------------
+FROM fedora:44 AS pam-u2f-builder
+ARG PAM_U2F_REPO
+ARG PAM_U2F_REF
+RUN dnf install -y cmake gcc make pkgconf-pkg-config pam-devel \
+        openssl-devel libfido2-devel git && \
+    dnf clean all
+COPY --from=pam-u2f-probe /pam-u2f-libdir /pam-u2f-libdir
+RUN git clone --branch "${PAM_U2F_REF}" --depth 1 "${PAM_U2F_REPO}" /src
+RUN pamdir="$(cat /pam-u2f-libdir)" && \
+    cmake -S /src -B /src/build \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DPAM_DIR="${pamdir}" \
+        -DBUILD_MANPAGES=OFF \
+        -DBUILD_TESTING=OFF \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build /src/build --parallel && \
+    DESTDIR=/out cmake --install /src/build
+
+# ---------------------------------------------------------------------
 # epson-builder — Fedora used only to download and unpack Epson's
 # binary epson-printer-utility RPM (printer setup/maintenance GUI +
 # ecbd network-discovery daemon), via
@@ -194,6 +269,7 @@ FROM dakota-base
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
+COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
