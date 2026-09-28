@@ -11,8 +11,8 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   the official `dakota-nvidia`/`dakota-nvidia-gaming` variants, which
   track the newer branch (~610.x/615.x as of 2026).
 - **[lbssousa/libfprint](https://github.com/lbssousa/libfprint) fork**
-  (`goodix-538d-sigfm-gtls` branch), adding support for the Goodix
-  538d fingerprint reader — the same fork used in
+  (pinned to tag `v1.94.10-goodix538d.2`), adding support for the
+  Goodix 538d fingerprint reader — the same fork used in
   [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
   (`playbooks/dakota/libfprint.yml`), which installs it at **runtime**
   via distrobox for Dakota hosts not using this custom image. Here it
@@ -20,11 +20,10 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `/usr`, overwriting the stock libfprint** shipped in the Dakota base
   image at its original path — see ["How the libfprint overwrite
   works"](#how-the-libfprint-overwrite-works) below. The
-  goodixtls53xd driver's SIGFM matcher (OpenCV-based) is built from a
-  small, **statically vendored** OpenCV subset in the fork itself — no
-  `opencv-devel` is installed in `libfprint-builder`, and no OpenCV
-  runtime library needs bundling into the final image (see the
-  `libfprint-builder` stage comment in the `Containerfile`).
+  goodixtls53xd driver's SIGFM matcher is a self-contained
+  implementation with no OpenCV dependency, so `libfprint-builder`
+  needs no `opencv-devel` and nothing OpenCV-related ends up in the
+  final image.
 - **[Yubico/pam-u2f](https://github.com/Yubico/pam-u2f)** (upstream,
   not a fork) — `pam_u2f.so` (the PAM module) and `pamu2fcfg` (the CLI
   used to enroll a YubiKey and generate `~/.config/Yubico/u2f_keys`),
@@ -214,7 +213,7 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │     │                     in the Dakota base image
   │     │
   │     └─→ libfprint-builder (Fedora, build environment only)
-  │           builds the fork against Fedora's opencv-devel, with
+  │           builds the fork with meson, with
   │           --prefix=/usr --libdir=<probed dir>, DESTDIR=/out
   │
   ├─→ pam-u2f-probe           locates the PAM module directory

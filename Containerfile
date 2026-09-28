@@ -30,7 +30,11 @@
 
 ARG NVIDIA_VERSION=580.173.02
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
-ARG LIBFPRINT_REF=goodix-538d-sigfm-gtls
+# Pinned to a tag, not a branch: a tag is an immutable, reviewed
+# release point, so bumping this value is a deliberate, visible change.
+# Check https://github.com/lbssousa/libfprint/tags for newer releases
+# before bumping.
+ARG LIBFPRINT_REF=v1.94.10-goodix538d.2
 # pam-u2f (upstream Yubico, not a fork): provides pam_u2f.so + pamu2fcfg,
 # the PAM module and enrollment CLI needed to use a YubiKey for FIDO2/U2F
 # PAM authentication — neither can come from Homebrew, since PAM modules
@@ -236,22 +240,10 @@ RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-sr
 # installs the same fork at runtime via distrobox for Dakota hosts not
 # using this custom image.
 #
-# opencv-devel is deliberately NOT installed here: the goodixtls53xd
-# driver's SIGFM matcher needs OpenCV, but this fork vendors and
-# statically links the small subset it actually uses (see the fork's
-# meson.build) whenever no system OpenCV is found — installing
-# opencv-devel would make it dynamically link against Fedora's OpenCV
-# instead, which then wouldn't exist in the final Dakota image at all
-# (fprintd.service would crash on startup with
-# "libopencv_features2d.so.413: cannot open shared object file").
-# Vendoring means no such runtime dependency exists to bundle in the
-# first place. cmake/ninja-build/curl/tar here are for that vendored build
-# (fetches+compiles a minimal static OpenCV via its own native CMake
-# build), not for libfprint itself. zlib-devel is linked into the
-# result explicitly (OpenCV's persistence.cpp calls zlib's gz*
-# functions unconditionally, and a static .a never carries its own
-# transitive link deps forward). systemd-udev provides udev.pc,
-# needed for the driver's udev-rules install path.
+# The goodixtls53xd driver's SIGFM matcher is a self-contained
+# implementation with no OpenCV dependency at all — no opencv-devel,
+# and nothing to vendor or statically link. systemd-udev provides
+# udev.pc, needed for the driver's udev-rules install path.
 #
 # Installed straight into the libdir found by libfprint-probe, under
 # --prefix=/usr: this overwrites the stock libfprint shipped in the
@@ -266,7 +258,7 @@ RUN dnf install -y meson gcc gcc-c++ ninja-build pkgconf-pkg-config \
         openssl-devel glib2-devel gobject-introspection-devel \
         libgudev-devel libgusb-devel systemd-devel systemd-udev nss-devel \
         pixman-devel gtk-doc python3-cairo python3-gobject cairo-devel \
-        umockdev git cmake curl tar zlib-devel && \
+        umockdev git && \
     dnf clean all
 COPY --from=libfprint-probe /libfprint-libdir /libfprint-libdir
 RUN git clone --branch "${LIBFPRINT_REF}" --depth 1 "${LIBFPRINT_REPO}" /src
