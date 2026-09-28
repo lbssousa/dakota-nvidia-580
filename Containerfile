@@ -52,6 +52,29 @@ ARG LIBFPRINT_REF=v1.94.10-goodix538d.2
 ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
+# On by default: revert three of Bluefin's default GNOME customizations
+# back to stock GNOME behavior (set to "false" to keep Bluefin's own
+# desktop defaults instead). Bluefin bakes its desktop defaults into
+# /usr/share/glib-2.0/schemas/zz0-bluefin-modifications.gschema.override
+# (a GSettings *default-value* override, compiled into
+# gschemas.compiled — a per-user dconf still wins over it, this only
+# changes what a fresh account starts with). When set to "true", the
+# final stage below adds a same-mechanism override file that sorts
+# after Bluefin's own (zz0 and zz3) so it wins on any key both define,
+# and re-runs glib-compile-schemas:
+#   - window titlebar buttons: Bluefin's button-layout is
+#     ":minimize,maximize,close"; this reverts to ":close".
+#   - hot corners: Bluefin sets enable-hot-corners=false; this reverts
+#     to true.
+#   - Blur my Shell (blur-my-shell@aunetx) and Dash to Dock
+#     (dash-to-dock@micxgx.gmail.com) are force-disabled via the
+#     `disabled-extensions` gsettings key, which
+#     org.gnome.shell.gschema.xml documents as taking precedence over
+#     `enabled-extensions` — more robust than trying to strip them out
+#     of Bluefin's own enabled-extensions list, which is set in two
+#     separate override files.
+ARG DISABLE_BLUEFIN_GNOME_TWEAKS=true
+
 # Identity this downstream image reports as, in place of the upstream
 # Dakota base it's layered on. Rewritten in the final stage below into
 # both /etc/os-release's IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF
@@ -334,6 +357,7 @@ FROM dakota-base
 ARG IMAGE_NAME
 ARG IMAGE_VENDOR
 ARG IMAGE_TAG
+ARG DISABLE_BLUEFIN_GNOME_TWEAKS
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
@@ -383,6 +407,28 @@ RUN set -eux; \
     printf '{\n  "image-name": "%s",\n  "image-flavor": "%s",\n  "image-vendor": "%s",\n  "image-ref": "ostree-image-signed:docker://ghcr.io/%s/%s",\n  "image-tag": "%s"\n}\n' \
         "${IMAGE_NAME}" "${image_flavor}" "${IMAGE_VENDOR}" "${IMAGE_VENDOR}" "${IMAGE_NAME}" "${IMAGE_TAG}" \
         > /usr/share/ublue-os/image-info.json
+
+# Reverts the three Bluefin GNOME defaults described at the
+# DISABLE_BLUEFIN_GNOME_TWEAKS ARG comment near the top of this file.
+# "zz9" sorts after both of Bluefin's own override files (zz0 and zz3
+# at the time of writing), which is what makes it win on button-layout
+# and enable-hot-corners; disabled-extensions doesn't need that,
+# since Bluefin's files never set that key. glib-compile-schemas is
+# already shipped in the Dakota base image, so no extra tooling stage
+# is needed to rerun it.
+RUN if [ "${DISABLE_BLUEFIN_GNOME_TWEAKS}" = "true" ]; then \
+        printf '%s\n' \
+            '[org.gnome.desktop.wm.preferences]' \
+            "button-layout=':close'" \
+            '' \
+            '[org.gnome.desktop.interface]' \
+            'enable-hot-corners=true' \
+            '' \
+            '[org.gnome.shell]' \
+            "disabled-extensions=['blur-my-shell@aunetx', 'dash-to-dock@micxgx.gmail.com']" \
+            > /usr/share/glib-2.0/schemas/zz9-dakota-nvidia-580-gnome-tweaks.gschema.override; \
+        glib-compile-schemas /usr/share/glib-2.0/schemas; \
+    fi
 
 # Signing policy — mirrors lbssousa/bluefin's build_files/00-signing.sh
 # and Dakota's own convention for verified registries (its shipped
