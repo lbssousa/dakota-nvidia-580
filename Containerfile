@@ -36,7 +36,7 @@
 # the "580" in the repo and image names wrong, and the kernel-7.x
 # workarounds in scripts/build-nvidia.sh would need re-deriving. The
 # watcher therefore reports a newer branch without ever proposing it.
-ARG NVIDIA_VERSION=580.173.02
+ARG NVIDIA_VERSION=580.178.04
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 # Pinned to a tag, not a branch: a tag is an immutable, reviewed
 # release point, so bumping this value is a deliberate, visible change.
