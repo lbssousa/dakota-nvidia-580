@@ -64,10 +64,9 @@ upstream Dakota's own rolling-vs-promoted tag split (`:testing`
 promoted to `:stable` on a fixed cadence), simplified to a single
 rolling tag since this repo has no `:next`/`:testing` split of its own:
 
-- `:latest` — rebuilt on every push to `main`, on the daily schedule
-  that catches a merged Renovate base-image bump, and on manual
-  dispatch. This is the rolling tag; see ["CI and automatic
-  updates"](#ci-and-automatic-updates).
+- `:latest` — rebuilt on every push to `main`, on a weekly safety-net
+  schedule (Mondays), and on manual dispatch. This is the rolling tag;
+  see ["CI and automatic updates"](#ci-and-automatic-updates).
 - `:stable` — a straight registry retag of whatever `:latest` digest
   is current at promotion time (no rebuild), promoted weekly. This is
   the tag a real machine should track.
@@ -978,8 +977,8 @@ down to this repo's single rolling tag:
   (`standard`, `gaming`) from the same `Containerfile`, building and
   publishing both `ghcr.io/lbssousa/dakota-nvidia-580:latest` and
   `ghcr.io/lbssousa/dakota-nvidia-580-gaming:latest` on push to `main`,
-  on a daily schedule (covers the case where a Renovate PR was already
-  merged without a manual rebuild), and via `workflow_dispatch`. Each
+  on a weekly schedule (Mondays 04:17 UTC), and via
+  `workflow_dispatch`. Each
   matrix leg resolves its base image by reading the
   `BASE_IMAGE`/`BASE_IMAGE_GAMING` `ARG` default straight out of the
   `Containerfile` and passing it as `--build-arg BASE_IMAGE=...` — the
@@ -991,6 +990,28 @@ down to this repo's single rolling tag:
   `image-info.json` — see ["Known limitations"](#known-limitations)),
   so the image's own self-reported identity stays correct even after
   it's later promoted to `:stable` below.
+
+  **Why weekly and not daily.** The schedule used to be daily, to cover a
+  Renovate base-digest bump that got merged without anyone triggering a
+  rebuild. It never needed to: `renovate.json5` sets no automerge, so
+  those PRs are merged by hand, and merging one *is* a push to `main`,
+  which triggers this workflow — and the PR itself is built beforehand via
+  `pull_request`, so a new kernel is validated before it lands. The daily
+  run was therefore rebuilding everything from scratch, including a
+  from-source GCC, to produce an equivalent image six days out of seven.
+
+  What the periodic run is actually worth keeping for is drift in what
+  this repo does *not* pin: the builder stages' `dnf install` lines take
+  whatever Fedora currently ships, and `LIBFPRINT_REF`/`PAM_U2F_REF` are
+  git tags that Renovate isn't configured to track (no `# renovate:`
+  datasource annotations, and its rules here cover only the two base
+  images). A weekly build surfaces breakage from those on its own
+  schedule rather than in the middle of an unrelated change. It runs
+  **Mondays** so that `promote-stable.yml`'s premise survives: that
+  workflow promotes whatever `:latest` is every Sunday at 06:00 UTC, and
+  its whole point is letting a build soak on `:latest` first — a Sunday
+  build would be promoted about 100 minutes later, a Monday one gets
+  nearly a week.
 - **`:stable` — `.github/workflows/promote-stable.yml`.** Runs weekly
   (Sundays) and via `workflow_dispatch`. For each variant, resolves the
   current `:latest` digest, `cosign verify`s it against `cosign.pub`,

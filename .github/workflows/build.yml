@@ -5,11 +5,33 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Covers the case where Renovate already bumped a dakota base
-    # digest (see renovate.json5) — without this, the NVIDIA kmod
-    # would stay compiled against a stale kernel until someone opens a
-    # manual push.
-    - cron: "17 4 * * *"
+    # Weekly, not daily. The stated reason for a daily rebuild was to
+    # cover a Renovate base-digest bump that never got a manual rebuild —
+    # but renovate.json5 sets no automerge, so those PRs are merged by
+    # hand, and merging one is itself a push to main that triggers this
+    # workflow. (The PR is built too, via `pull_request` above, so the
+    # new kernel is validated before it is merged at all.) A daily run
+    # therefore rebuilt everything from scratch — including a from-source
+    # GCC — to produce a byte-for-byte equivalent image six days out of
+    # seven.
+    #
+    # What the periodic run is genuinely for is drift in what this repo
+    # does NOT pin: the builder stages' `dnf install` lines take whatever
+    # Fedora currently ships, and LIBFPRINT_REF / PAM_U2F_REF are git
+    # tags that renovate.json5's dockerfile-manager rules don't track. A
+    # weekly build surfaces breakage from those on its own schedule
+    # instead of during an unrelated change.
+    #
+    # Mondays specifically, to keep promote-stable.yml's premise intact:
+    # it promotes whatever :latest is every Sunday at 06:00 UTC, and its
+    # whole rationale is giving a build some soak time on :latest first.
+    # Building Sunday morning would hand it a fresh, unsoaked image
+    # roughly 100 minutes later; building Monday leaves nearly a week.
+    #
+    # Note that .github/workflows/nvidia-driver-update.yml stays daily:
+    # polling an index costs one HTTP request, and it opens a PR rather
+    # than publishing anything.
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
   workflow_dispatch: {}
 
 env:
