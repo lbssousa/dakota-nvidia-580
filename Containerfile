@@ -194,8 +194,8 @@ RUN set -eux; \
 # .config extracted above, via scripts/build-kernel-src.sh. See that
 # script and README.md for the full rationale.
 #
-# Uses Fedora 44's own gcc/binutils, as nvidia-builder below now does
-# too (see that stage's EXPERIMENT note): this stage compiles
+# Uses Fedora 44's own gcc/binutils, as nvidia-builder below does too
+# (see that stage's comment on why): this stage compiles
 # no kernel code at all any more. `modules_prepare` generates headers and
 # builds host tools (scripts/, objtool) that never ship and never run on
 # the target, so which compiler produced them doesn't matter.
@@ -296,9 +296,8 @@ RUN set -eux; \
 # make/kmod/...); nothing here ends up in the final image except what
 # build-nvidia.sh explicitly packages into /out.
 #
-# EXPERIMENT (branch experiment/drop-toolchain-builder): this used to
-# take its compiler and linker from a toolchain-builder stage that built
-# GCC 16.2.0 + binutils 2.47 from upstream source, at the pins
+# The compiler and linker used to come from a toolchain-builder stage that
+# built GCC 16.2.0 + binutils 2.47 from upstream source, at the pins
 # freedesktop-sdk uses for Dakota's own kernel, because Fedora's own
 # gcc/binutils were believed not to be good enough — the claim being that
 # a micro-version of GCC drift made nvidia.ko fail at insmod with
@@ -307,11 +306,11 @@ RUN set -eux; \
 #
 # That diagnosis was wrong. The real cause was a `struct module` layout
 # mismatch from a silently dropped .config option (see README.md,
-# "`struct module` layout must match the running kernel"), and it is now
-# both fixed and guarded structurally by scripts/module-abi.py. So the
-# from-source toolchain — the single most expensive stage in this file,
-# and the slowest step in every CI run — is worth re-testing rather than
-# keeping on the strength of a superseded explanation.
+# "`struct module` layout must match the running kernel"), now fixed and
+# guarded structurally by scripts/module-abi.py. The from-source toolchain
+# was the slowest step in every CI run and rested on that superseded
+# explanation, so it was removed; `git log -- scripts/build-toolchain.sh`
+# has it if it is ever needed back.
 #
 # What is verifiably true about the compiler check either way: nothing in
 # this build distinguishes the two compilers.
@@ -328,8 +327,11 @@ RUN set -eux; \
 #     self-consistent for the first time.
 #
 # What no check can settle is whether a module built by 16.2.1 against a
-# kernel built by 16.2.0 loads and behaves. Only real hardware answers
-# that, which is why this lives on a branch.
+# kernel built by 16.2.0 loads and behaves. A local build compared the
+# five resulting modules against the from-source-toolchain reference and
+# found identical section sets, identical undefined-symbol sets and no
+# unresolved externals — but codegen stays unobserved, and only real
+# hardware answers it. See README.md, "Known limitations".
 # ---------------------------------------------------------------------
 FROM fedora:44 AS nvidia-builder
 ARG NVIDIA_VERSION

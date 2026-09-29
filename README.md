@@ -97,6 +97,20 @@ kernel"](#struct-module-layout-must-match-the-running-kernel). **An
 image built before that fix needs rebuilding**; loading has not yet
 been re-confirmed on hardware with a post-fix image.
 
+Two changes since then are also awaiting that same confirmation, and
+they are the first thing to suspect if a fresh image misbehaves:
+
+- The modules are now built with **Fedora's GCC/binutils** rather than a
+  from-source toolchain matched to Dakota's kernel. Every check the build
+  can make says the two are indistinguishable, but codegen is unobserved
+  — see ["Compiler/linker version
+  mismatch"](#known-limitations).
+- `Module.symvers` is now **derived from the image's own binaries**
+  instead of produced by compiling the kernel. Validated against
+  `System.map` and `depmod`'s `modules.symbols`, with every difference
+  accounted for — see ["Deriving `Module.symvers` instead of compiling
+  the kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel).
+
 Open items on real hardware, tracked in detail in ["Known
 limitations"](#known-limitations) below:
 
@@ -424,8 +438,8 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           │
   │           └─→ nvidia-builder    (Fedora, build environment only)
   │                 builds the out-of-tree kmod against the reconstructed
-  │                 tree above with Fedora's own GCC/binutils (EXPERIMENT:
-  │                 a from-source toolchain-builder stage used to supply
+  │                 tree above with Fedora's own GCC/binutils (a
+  │                 from-source toolchain-builder stage used to supply
   │                 them — see "Compiler/linker version mismatch" below),
   │                 VERIFIES every built .ko against the kernel's own
   │                 struct module layout before packaging
@@ -640,7 +654,7 @@ reconstructs itself from upstream source + the image's own shipped
 
 ## Known limitations
 
-- **No stage compiles anything large any more (on this branch).**
+- **No stage compiles anything large any more.**
   `kernel-src-builder` no longer compiles the kernel (see ["Deriving
   `Module.symvers` instead of compiling the
   kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel)), so
@@ -702,7 +716,7 @@ reconstructs itself from upstream source + the image's own shipped
   (`scripts/rust_is_available.sh`) and this stage installs no `rustc` —
   the explicit `scripts/config --disable RUST` just makes the intent
   visible.
-- **Compiler/linker version mismatch — being re-tested on this branch.**
+- **Compiler/linker version mismatch — not what it was thought to be.**
   `nvidia.ko` is built here with Fedora's own GCC/binutils. A
   `toolchain-builder` stage used to build GCC 16.2.0 and binutils 2.47
   from upstream source, at the pins freedesktop-sdk uses for Dakota's own
@@ -717,8 +731,7 @@ reconstructs itself from upstream source + the image's own shipped
   kernel"](#struct-module-layout-must-match-the-running-kernel) — now
   fixed, and guarded structurally by `scripts/module-abi.py`. Since the
   from-source toolchain was the slowest step in every CI run and rested
-  on a superseded explanation, this branch removes it to find out whether
-  it is needed.
+  on a superseded explanation, it was removed.
 
   What is verifiably true either way is that **nothing in the build
   distinguishes the two compilers**:
@@ -740,7 +753,7 @@ reconstructs itself from upstream source + the image's own shipped
   "enforces the match" was never true. It is still omitted, since it
   costs nothing and would catch a major/minor jump.
 
-  **What this branch cannot prove.** `scripts/module-abi.py` gates
+  **What is still unverified.** `scripts/module-abi.py` gates
   `struct module`'s *layout*, which is decided by the `.config` and
   headers — not by the compiler. It will pass either way, so it is not
   evidence about compiler compatibility. `RANDSTRUCT` and `LTO` are both
@@ -748,8 +761,9 @@ reconstructs itself from upstream source + the image's own shipped
   make toolchain drift genuinely ABI-incompatible, and a module built by
   16.2.1 against a kernel built by 16.2.0 is very likely fine — but "very
   likely" is not proof. **Only `modprobe nvidia` on real hardware, plus
-  some use under load, settles it.** That is the one test that has to
-  happen before this is merged.
+  some use under load, settles it — and that has not happened yet.** This
+  was merged as a deliberate decision to take that risk, not because the
+  question was answered.
 
   **What the local test did show.** The whole `nvidia-builder` stage was
   run locally with Fedora's toolchain (GCC 16.2.1, GNU ld 2.46.1) against
@@ -782,13 +796,15 @@ reconstructs itself from upstream source + the image's own shipped
   plausible half of any residual risk here — a point in favour of
   actually testing rather than reasoning about it.
 
-  If it turns out to be needed, `scripts/build-toolchain.sh` is still in
-  the tree on `main`, with pins `elements/bootstrap/gcc.bst` → tag
-  `releases/gcc-16.2.0` and `elements/bootstrap/binutils.bst` → tag
-  `binutils-2_47`, commit `6ce87bbc521cf46eaee9a1f7ef61cee2cdfb3e32`.
-  Those need re-deriving whenever a base-image bump changes the kernel's
-  own toolchain: `CONFIG_CC_VERSION_TEXT` in the shipped `.config` for
-  the GCC version, `/proc/version` on the real machine for binutils.
+  **If it turns out to be needed**, `scripts/build-toolchain.sh` is
+  recoverable with `git log -- scripts/build-toolchain.sh` (removed in the
+  commit that dropped the stage). Its pins were
+  `elements/bootstrap/gcc.bst` → tag `releases/gcc-16.2.0` and
+  `elements/bootstrap/binutils.bst` → tag `binutils-2_47`, commit
+  `6ce87bbc521cf46eaee9a1f7ef61cee2cdfb3e32`, and they need re-deriving
+  whenever a base-image bump changes the kernel's own toolchain:
+  `CONFIG_CC_VERSION_TEXT` in the shipped `.config` for the GCC version,
+  `/proc/version` on the real machine for binutils.
 - **Gaming variant: Dakota's own fixup patches to the OGC kernel are
   not applied.** `linux-ogc.bst` applies three small patches from
   `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an
