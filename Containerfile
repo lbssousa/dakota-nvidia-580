@@ -127,13 +127,31 @@ ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:e0670ab
 FROM ${BASE_IMAGE} AS dakota-base
 
 # ---------------------------------------------------------------------
-# kernel-headers — extracts this specific image's kernel version and
-# its shipped .config (the ground truth kernel-src-builder reconstructs
-# a build tree from). Fails loudly and early if the image doesn't even
-# ship the .config — that would mean Dakota's kernel packaging changed
-# more deeply than the missing-build-tree issue this repo works around.
+# kernel-headers — extracts the three pieces of ground truth every
+# stage below works from, straight out of this specific image:
+#
+#   /kernel-version        this image's kernel release string.
+#   /kernel-config         the exact .config it was built with — what
+#                          kernel-src-builder reconstructs a build tree
+#                          from.
+#   /kernel-module-abi.json  the authoritative layout of `struct module`,
+#                          read out of the image's own
+#                          /usr/lib/modules/<kver>/vmlinux .BTF section.
+#                          nvidia-builder checks the modules it built
+#                          against this, so a build tree that diverged
+#                          from this kernel fails the build instead of
+#                          the boot. See scripts/module-abi.py.
+#
+# Fails loudly and early if the image doesn't even ship the .config —
+# that would mean Dakota's kernel packaging changed more deeply than the
+# missing-build-tree issue this repo works around.
+#
+# Everything here runs with the base image's own tooling (python3 only —
+# module-abi.py deliberately carries its own ELF/BTF readers rather than
+# depending on bpftool or pahole being present in a runtime image).
 # ---------------------------------------------------------------------
 FROM dakota-base AS kernel-headers
+COPY scripts/module-abi.py /module-abi.py
 RUN set -eux; \
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"; \
     echo "$kver" > /kernel-version; \
@@ -145,7 +163,9 @@ RUN set -eux; \
         echo "is missing'." >&2; \
         exit 1; \
     fi; \
-    cp "/usr/lib/modules/$kver/config" /kernel-config
+    cp "/usr/lib/modules/$kver/config" /kernel-config; \
+    python3 /module-abi.py extract "$kver" \
+        "/usr/lib/modules/$kver/vmlinux" /kernel-module-abi.json
 
 # ---------------------------------------------------------------------
 # kernel-src-builder — Fedora used only as a build environment;
@@ -155,19 +175,46 @@ RUN set -eux; \
 # script and README.md for the full rationale.
 #
 # Stays on Fedora 44's own gcc/binutils (unlike nvidia-builder below,
-# which needs the toolchain-builder stage instead): this stage's own
-# vmlinux/ttm.ko/drm_ttm_helper.ko are never copied into the final
-# image — they only give nvidia-builder a real Module.symvers/API
-# surface to link against, which isn't relocation-ABI sensitive the
-# way an actually-loaded .ko is.
+# which needs the toolchain-builder stage instead): the binaries this
+# stage produces — vmlinux, ttm.ko, drm_ttm_helper.ko — are never
+# copied into the final image and never loaded. They exist only to give
+# nvidia-builder a real Module.symvers to compile against, so which
+# compiler built them doesn't matter.
+#
+# The .config this stage reconciles is a different matter entirely: it
+# decides the layout of `struct module`, which every module compiled
+# against the resulting tree bakes into its own
+# .gnu.linkonce.this_module relocations. Get it wrong and the modules
+# compile, link, and pass vermagic, then fail to load. That's why
+# build-kernel-src.sh aborts on any option `make olddefconfig` silently
+# changes, and why the package list below is ABI-relevant rather than
+# merely sufficient to compile.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS kernel-src-builder
 # openssl (the CLI, not just openssl-devel's headers/libs) is needed by
 # certs/Makefile's gen_key rule: the gaming variant's shipped .config
 # has CONFIG_MODULE_SIG_ALL=y (unset on standard), which makes `make
 # vmlinux` generate a self-signed certs/signing_key.pem via `openssl req`.
+#
+# dwarves (i.e. pahole) is not a nicety here — leaving it out silently
+# changes the module ABI. CONFIG_DEBUG_INFO_BTF `depends on
+# PAHOLE_VERSION >= 122`, and scripts/pahole-version.sh reports 0 when
+# pahole isn't on PATH, so `make olddefconfig` quietly drops Dakota's
+# shipped CONFIG_DEBUG_INFO_BTF=y along with CONFIG_DEBUG_INFO_BTF_MODULES=y.
+# The latter contributes 24 bytes to `struct module` (btf_data_size,
+# btf_base_data_size, btf_data, btf_base_data) between its `init` and
+# `exit` members, so without pahole every NVIDIA module builds cleanly
+# and then refuses to load at boot with "x86/modules: Invalid relocation
+# target, existing value is nonzero" / -ENOEXEC — its `exit` relocation
+# pointing 24 bytes early, at source_list.prev. See README.md, "struct
+# module layout must match the running kernel".
+#
+# zlib-devel/libzstd-devel/pkgconf-pkg-config are in turn what keeping
+# CONFIG_DEBUG_INFO_BTF=y needs: `make vmlinux` then also builds
+# tools/bpf/resolve_btfids, which links libbpf (libelf + zlib + zstd).
 RUN dnf install -y gcc make bison flex bc elfutils-libelf-devel \
         openssl openssl-devel perl findutils diffutils ncurses-devel \
+        dwarves zlib-devel libzstd-devel pkgconf-pkg-config \
         git curl tar xz which hostname && \
     dnf clean all
 COPY --from=kernel-headers /kernel-version /kernel-version
@@ -246,13 +293,17 @@ RUN chmod +x /build-toolchain.sh && /build-toolchain.sh /toolchain
 # ---------------------------------------------------------------------
 FROM fedora:44 AS nvidia-builder
 ARG NVIDIA_VERSION
+# python3 runs scripts/module-abi.py, which build-nvidia.sh invokes on
+# the freshly built .ko files before packaging them.
 RUN dnf install -y make kmod elfutils-libelf-devel perl-interpreter \
-        tar xz curl which && \
+        python3 tar xz curl which && \
     dnf clean all
 COPY --from=toolchain-builder /toolchain /toolchain
 ENV PATH="/toolchain/bin:${PATH}"
 COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
+COPY --from=kernel-headers /kernel-module-abi.json /kernel-module-abi.json
+COPY scripts/module-abi.py /module-abi.py
 COPY scripts/build-nvidia.sh /build-nvidia.sh
 RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out
 

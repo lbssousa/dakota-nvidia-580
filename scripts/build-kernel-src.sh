@@ -77,6 +77,145 @@ scripts/config --disable RUST 2>/dev/null || true
 echo "==> Reconciling shipped .config against this exact source tree (olddefconfig)..."
 make -j1 olddefconfig
 
+# ---------------------------------------------------------------------
+# Guard: olddefconfig must not have silently changed anything else.
+#
+# `olddefconfig`'s entire job is to resolve, without asking and without
+# saying so, every shipped option whose dependencies this tree can't
+# satisfy. Crucially, some Kconfig dependencies are on a build *tool*
+# being installed rather than on another option:
+#
+#   config DEBUG_INFO_BTF
+#           ...
+#           depends on PAHOLE_VERSION >= 122
+#
+# and scripts/pahole-version.sh reports 0 when pahole isn't on PATH. A
+# missing package in the Containerfile's kernel-src-builder stage
+# therefore flips a shipped "=y" to unset with no diagnostic at all.
+#
+# That is not cosmetic when the option is one of the `#ifdef CONFIG_*`
+# blocks inside `struct module` (include/linux/module.h):
+# CONFIG_DEBUG_INFO_BTF_MODULES contributes 24 bytes of btf_data_size/
+# btf_base_data_size/btf_data/btf_base_data, sitting between `init` and
+# `exit`. Lose it and every module built against this tree puts its
+# `exit` pointer 24 bytes early — at 0x498 instead of 0x4b0, i.e. on
+# top of source_list.prev. vermagic encodes none of this, so such a
+# module compiles clean, passes the version check, and then fails to
+# load: load_module() populates source_list (module_unload_init()'s
+# INIT_LIST_HEAD) *before* apply_relocations(), and x86's
+# __write_relocate_add() rejects any relocation whose target isn't
+# still zero — "Invalid relocation target, existing value is nonzero",
+# -ENOEXEC. This repo shipped exactly that once.
+#
+# So: treat any silent divergence as a build failure, and run the check
+# here rather than after the expensive modules_prepare/vmlinux builds
+# below. scripts/module-abi.py is the second, structural half of the
+# same defence — it checks the resulting .ko against the running
+# kernel's own BTF, catching a layout mismatch whatever its cause.
+# ---------------------------------------------------------------------
+normalize_config() {
+    # "CONFIG_X=v" -> "CONFIG_X v", "# CONFIG_X is not set" -> "CONFIG_X n".
+    # Comparing normalized name/value pairs rather than raw lines is what
+    # makes a shipped "=y" turning into "is not set" register as a changed
+    # option instead of an unrelated deleted line and added comment.
+    sed -nE -e 's/^(CONFIG_[A-Za-z0-9_]+)=(.*)$/\1 \2/p' \
+            -e 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1 n/p' "$1" \
+        | LC_ALL=C sort
+}
+
+normalize_config "${config_file}" > ../config.shipped.norm
+normalize_config .config          > ../config.reconciled.norm
+
+# Symbol names allowed to differ, as anchored extended regexes. Add to
+# this list only alongside a comment explaining why that divergence
+# can't affect the module ABI.
+#
+# The sole entry covers the deliberate `scripts/config --disable RUST`
+# above — and, equally, the fact that Kconfig would have dropped RUST by
+# itself here regardless (CONFIG_RUST depends on RUST_IS_AVAILABLE,
+# another tool probe: scripts/rust_is_available.sh, and this stage
+# installs no rustc). Every option Dakota's shipped .config enables that
+# depends on Rust carries RUST in its own symbol name — CONFIG_RUST,
+# CONFIG_HAVE_RUST, CONFIG_RUST_IS_AVAILABLE, the CONFIG_RUSTC_* probe
+# results, CONFIG_RUST_OVERFLOW_CHECKS, CONFIG_ANDROID_BINDER_IPC_RUST —
+# and the Rust-only drivers that don't (CONFIG_DRM_NOVA,
+# CONFIG_NOVA_CORE) are already unset there. None of them appears in an
+# `#ifdef` inside struct module.
+allowed_deltas=(
+    'CONFIG_[A-Z0-9_]*RUST[A-Z0-9_]*'
+)
+
+delta_value() {
+    # $1: normalized file, $2: symbol. Prints the whole value, which may
+    # itself contain spaces (CONFIG_RUSTC_VERSION_TEXT, CONFIG_CC_VERSION_TEXT).
+    LC_ALL=C awk -v k="$2" '$1 == k { sub(/^[^ ]+ /, ""); print; found = 1 }
+                            END { if (!found) print "(absent)" }' "$1"
+}
+
+describe_delta() {
+    printf '      %-48s %s -> %s\n' "$1" \
+        "$(delta_value ../config.shipped.norm "$1")" \
+        "$(delta_value ../config.reconciled.norm "$1")"
+}
+
+changed="$(LC_ALL=C comm -3 ../config.shipped.norm ../config.reconciled.norm \
+    | awk '{ print $1 }' | LC_ALL=C sort -u)"
+
+expected_changes=()
+unexpected_changes=()
+while IFS= read -r opt; do
+    [ -n "${opt}" ] || continue
+    allowed=false
+    for pat in "${allowed_deltas[@]}"; do
+        if [[ "${opt}" =~ ^${pat}$ ]]; then
+            allowed=true
+            break
+        fi
+    done
+    if [ "${allowed}" = true ]; then
+        expected_changes+=("${opt}")
+    else
+        unexpected_changes+=("${opt}")
+    fi
+done <<< "${changed}"
+
+if [ "${#expected_changes[@]}" -gt 0 ]; then
+    echo "==> olddefconfig resolved ${#expected_changes[@]} expected option(s) (the Rust disable above):"
+    for opt in "${expected_changes[@]}"; do
+        describe_delta "${opt}"
+    done
+fi
+
+if [ "${#unexpected_changes[@]}" -gt 0 ]; then
+    {
+        echo "ERROR: 'make olddefconfig' silently changed ${#unexpected_changes[@]} option(s) this"
+        echo "script did not ask it to:"
+        echo
+        for opt in "${unexpected_changes[@]}"; do
+            describe_delta "${opt}"
+        done
+        echo
+        echo "A build tree whose .config differs from the running kernel's is not the"
+        echo "tree this repo needs: differences in struct module's #ifdef CONFIG_*"
+        echo "blocks silently produce modules that compile, pass vermagic, and then"
+        echo "fail to load with '-ENOEXEC / Invalid relocation target'."
+        echo
+        echo "Almost always this means a build tool some Kconfig symbol probes for is"
+        echo "not installed in the Containerfile's kernel-src-builder stage, so"
+        echo "Kconfig concluded the option is unavailable. Check the affected symbols'"
+        echo "'depends on' lines for a *_VERSION or \$(success,...) probe — pahole"
+        echo "(package: dwarves) for CONFIG_DEBUG_INFO_BTF is the known example — and"
+        echo "install the missing package rather than accepting the changed option."
+        echo
+        echo "If a divergence really is harmless, add its symbol to allowed_deltas"
+        echo "above WITH a comment saying why it can't affect the module ABI."
+    } >&2
+    exit 1
+fi
+
+echo "==> Guard OK: the reconciled .config matches Dakota's shipped one on every"
+echo "    option except the expected Rust ones."
+
 release="$(make -s kernelrelease)"
 if [ "${release}" != "${kver}" ]; then
     echo "ERROR: rebuilt kernelrelease ('${release}') does not match the" >&2

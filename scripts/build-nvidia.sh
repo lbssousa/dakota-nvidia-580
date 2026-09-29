@@ -145,8 +145,26 @@ done
 KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types" \
 make -C kernel SYSSRC="${build_dir}" IGNORE_MISSING_MODULE_SYMVERS=1 modules
 
+# A clean compile proves nothing about loadability. The modules just
+# built carry a `struct module` whose field offsets came from
+# ${build_dir}'s reconstructed .config, and nothing checked yet that
+# those offsets match the kernel they'll actually be inserted into —
+# vermagic doesn't cover struct module's layout, and CONFIG_MODVERSIONS
+# is unset on Dakota. A mismatch here is not a subtle degradation: the
+# load fails outright with x86's "Invalid relocation target, existing
+# value is nonzero" / -ENOEXEC. So compare against the layout read from
+# the Dakota base image's own vmlinux .BTF before packaging anything.
+# See scripts/module-abi.py for the full mechanism.
+mapfile -t built_kos < <(find kernel -maxdepth 1 -name '*.ko' | sort)
+if [ "${#built_kos[@]}" -eq 0 ]; then
+    echo "ERROR: 'make modules' produced no .ko files." >&2
+    exit 1
+fi
+echo "==> Verifying the ${#built_kos[@]} built module(s) against the kernel's own struct module layout..."
+python3 /module-abi.py verify /kernel-module-abi.json "${built_kos[@]}"
+
 mkdir -p "${out_dir}/usr/lib/modules/${kver}/extra"
-find kernel -maxdepth 1 -name '*.ko' -exec cp {} "${out_dir}/usr/lib/modules/${kver}/extra/" \;
+cp "${built_kos[@]}" "${out_dir}/usr/lib/modules/${kver}/extra/"
 
 echo "==> Installing userspace components (--no-kernel-module, the kmod was already handled above)..."
 # WARNING: the flag names below were checked against
