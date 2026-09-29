@@ -593,6 +593,67 @@ limitations"](#known-limitations) below for why that's left to
 `brew install libfido2`, and why that hasn't been independently
 verified to actually resolve at runtime for a module living in `/usr`.
 
+## How the NVIDIA userspace libraries are installed
+
+Same `lib`-vs-`lib64` ambiguity as libfprint/pam-u2f above, but it went
+unnoticed for longer because the symptom is quieter: the kernel module
+still loads and the GPU still works for anything that talks to it
+directly through the device nodes, and only broke visibly once
+`nvidia-smi`/`nvidia-settings` were actually run (`NVIDIA-SMI couldn't
+find libnvidia-ml.so library in your system`, `libnvidia-cfg.so.1`
+missing for `nvidia-settings`) — every real `.so.580.178.04` file
+built fine and passed `nvidia-installer`, they just landed somewhere
+Dakota's own `ldconfig` never looks.
+
+`nvidia-installer` runs inside the plain `fedora:44` `nvidia-builder`
+stage, so its directory auto-detection sees Fedora's own conventions
+(64-bit libraries under `/usr/lib64`; 32-bit compatibility libraries —
+auto-installed because Fedora's multilib packages are present in that
+*builder* — under `/usr/lib`). Dakota's actual runtime, confirmed by
+inspecting a running image directly:
+
+```
+$ ldconfig -v            # default scan, no args
+/usr/lib/x86_64-linux-gnu/GL/default/lib: (from /etc/ld.so.conf.d/00_mesa.conf)
+/usr/lib/x86_64-linux-gnu: (builtin)
+```
+
+`/usr/lib` and `/usr/lib64` are never scanned. `/` is also a read-only
+composefs mount at runtime, so this can't be patched over live with
+`ldconfig` after the fact — it has to be right in the image.
+
+`nvidia-libdir-probe` (same pattern as `libfprint-probe`/
+`pam-u2f-probe`) finds the real directory by locating `libGL.so.1`
+(Mesa's, always present) in `dakota-base` and reading off its
+containing directory — `/usr/lib/x86_64-linux-gnu`, Debian-style
+multiarch, matching pam-u2f's own finding above. `build-nvidia.sh`
+takes that as its 4th argument and passes it straight through to
+`nvidia-installer` via `--opengl-libdir`/`--utility-libdir` (which
+place `libnvidia-ml.so`/`libnvidia-cfg.so`/`libcuda.so`/etc.) and
+`--x-library-path`/`--x-module-path`/`--gbm-backend-dir` (which
+otherwise default to a *guessed* `/usr/lib64`, since there's no real X
+server in the builder stage for the installer to query). It also
+passes `--no-install-compat32-libs`, since Dakota ships no 32-bit
+multiarch directory at all (`/usr/lib/i386-linux-gnu` doesn't exist) —
+the 32-bit libraries Fedora's builder would otherwise produce could
+never be loaded by anything on this image, so they'd just be dead
+weight. See ["Known limitations"](#known-limitations) for the
+gaming-variant caveat this implies.
+
+Separately, `build-nvidia.sh`'s file-diff (still filesystem-diff
+based, not a hardcoded manifest — see the script's own header comment)
+used to run `find / -xdev -type f`, which matches only regular files —
+silently dropping every symlink `nvidia-installer` itself creates,
+including the SONAME links (`libnvidia-ml.so.1` →
+`libnvidia-ml.so.580.178.04`, etc.) that `dlopen()` actually resolves
+against. It's now `find / -xdev \( -type f -o -type l \)`, so those
+symlinks ship too, instead of relying on the final stage's `ldconfig
+-r /` (Containerfile, near the end) to regenerate the SONAME subset of
+them after the fact — which only works at all once the real files are
+somewhere that command actually scans, and doesn't cover
+non-SONAME symlinks the installer creates (e.g. its own
+`/usr/lib/libGL.so.1` compatibility shim) either way.
+
 ## Optional: reverting Bluefin's GNOME desktop tweaks
 
 Bluefin (which Dakota is built on) bakes a set of desktop defaults into
@@ -693,8 +754,13 @@ reconstructs itself from upstream source + the image's own shipped
   What is still hardcoded, and therefore still worth a look when
   `NVIDIA_VERSION` changes, is the `nvidia-installer` flag list
   (`--advanced-options` output is not a stable interface across
-  branches). All thirteen flags this repo passes were re-confirmed
-  against `580.178.04`.
+  branches). All nineteen flags this repo passes were re-confirmed
+  against `580.178.04` — the six directory-placement ones
+  (`--opengl-libdir`, `--utility-libdir`, `--no-install-compat32-libs`,
+  `--x-library-path`, `--x-module-path`, `--gbm-backend-dir`) exist
+  specifically to counter the builder stage's Fedora-vs-Dakota libdir
+  mismatch — see ["How the NVIDIA userspace libraries are
+  installed"](#how-the-nvidia-userspace-libraries-are-installed).
 - **`CONFIG_RUST` is force-disabled** in the reconstructed tree
   (`scripts/config --disable RUST` before `olddefconfig`). Both
   variants ship `CONFIG_RUST=y` for unrelated in-tree Rust drivers;
@@ -870,8 +936,18 @@ reconstructs itself from upstream source + the image's own shipped
   reboot.
 - **`nvidia-installer` flags** — they change between branches, so
   they are re-validated against `--help`/`--advanced-options` on every
-  `NVIDIA_VERSION` change. All thirteen currently passed were confirmed
+  `NVIDIA_VERSION` change. All nineteen currently passed were confirmed
   present in `580.178.04`.
+- **No 32-bit NVIDIA libraries at all (`--no-install-compat32-libs`)**
+  — correct for the standard variant (Dakota/GNOME OS has no 32-bit
+  multiarch directory to put them in), but worth revisiting for
+  **`-gaming`** specifically if a Wine/Proton title turns out to need
+  32-bit OpenGL (some older, non-Vulkan titles still do): that would
+  first need Dakota's `-gaming` base to grow a real
+  `/usr/lib/i386-linux-gnu`-style 32-bit runtime before this repo could
+  usefully ship 32-bit NVIDIA libraries into it. See ["How the NVIDIA
+  userspace libraries are
+  installed"](#how-the-nvidia-userspace-libraries-are-installed).
 - **libfprint overwrite ABI assumption** — see the section above.
 - **pam-u2f's runtime dependency on a Homebrew-provided `libfido2` is
   unverified** — see ["How pam-u2f is

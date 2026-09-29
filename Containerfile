@@ -292,6 +292,37 @@ RUN set -eux; \
     echo "Found PAM modules at: $so (dir: $(cat /pam-u2f-libdir))" >&2
 
 # ---------------------------------------------------------------------
+# nvidia-libdir-probe — same idea as libfprint-probe/pam-u2f-probe
+# above, applied to NVIDIA's userspace libraries: locates the real
+# 64-bit library directory already used in the Dakota base image by
+# finding libGL.so.1 (Mesa's, present in every variant), rather than
+# assuming a distro-conventional path. `nvidia-installer` runs inside
+# the plain fedora:44 nvidia-builder stage below, where the RHEL/Fedora
+# convention (64-bit libs under /usr/lib64) holds — but Dakota/GNOME OS
+# uses a Debian-style multiarch layout instead
+# (/usr/lib/x86_64-linux-gnu, confirmed here the same way
+# pam-u2f-probe confirmed /usr/lib/x86_64-linux-gnu/security below).
+# Left uncorrected, the installer's own directory auto-detection (and
+# its 32-bit-compat auto-detection, which sees Fedora's own multilib
+# packages, not Dakota's — Dakota has no 32-bit multiarch directory at
+# all) puts every NVIDIA .so under /usr/lib64 and /usr/lib, neither of
+# which Dakota's ldconfig ever scans by default: the kernel module
+# still loads fine, but nvidia-smi/nvidia-settings/anything else that
+# dlopens libnvidia-ml.so.1 or libnvidia-cfg.so.1 fails outright. See
+# README.md, "How the NVIDIA userspace libraries are installed".
+# ---------------------------------------------------------------------
+FROM dakota-base AS nvidia-libdir-probe
+RUN set -eux; \
+    so="$(find /usr/lib* -name 'libGL.so.1*' 2>/dev/null | head -n1)"; \
+    if [ -z "$so" ]; then \
+        echo "ERROR: libGL.so.1 not found in this Dakota base image." >&2; \
+        echo "Can't determine the libdir NVIDIA's userspace libraries need to install into." >&2; \
+        exit 1; \
+    fi; \
+    dirname "$so" > /nvidia-libdir; \
+    echo "Found the runtime library dir at: $so (libdir: $(cat /nvidia-libdir))" >&2
+
+# ---------------------------------------------------------------------
 # nvidia-builder — Fedora used only as a build environment (dnf/gcc/
 # make/kmod/...); nothing here ends up in the final image except what
 # build-nvidia.sh explicitly packages into /out.
@@ -344,10 +375,11 @@ RUN dnf install -y gcc binutils make kmod elfutils-libelf-devel \
 COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=kernel-headers /kernel-module-abi.json /kernel-module-abi.json
+COPY --from=nvidia-libdir-probe /nvidia-libdir /nvidia-libdir
 COPY scripts/kernel_elf.py /kernel_elf.py
 COPY scripts/module-abi.py /module-abi.py
 COPY scripts/build-nvidia.sh /build-nvidia.sh
-RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out
+RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out "$(cat /nvidia-libdir)"
 
 # ---------------------------------------------------------------------
 # libfprint-builder — same fork/ref used in

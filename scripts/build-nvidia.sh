@@ -7,7 +7,7 @@
 # between driver versions and isn't documented stably enough to
 # hardcode here; capturing the real diff is more reliable.
 #
-# Usage: build-nvidia.sh <version> <kernel-src-root> <output>
+# Usage: build-nvidia.sh <version> <kernel-src-root> <output> <libdir>
 #   <version>          e.g. 580.178.04 (legacy branch — confirm at
 #                      https://www.nvidia.com/en-us/drivers/unix/
 #                      that it's the right version for your GPU before
@@ -17,12 +17,30 @@
 #                      around and doesn't build against it at all)
 #   <kernel-src-root>  root containing lib/modules/<kver>/build
 #   <output>           directory to populate with the final tree
-#                      (usr/lib/modules/..., usr/lib64/..., etc.)
+#                      (usr/lib/modules/..., usr/lib/x86_64-linux-gnu/...,
+#                      etc.)
+#   <libdir>           absolute path of the real 64-bit library
+#                      directory in the target runtime image (e.g.
+#                      /usr/lib/x86_64-linux-gnu on Dakota — see
+#                      nvidia-libdir-probe in the Containerfile). This
+#                      builder stage is plain fedora:44, where
+#                      nvidia-installer would otherwise auto-detect
+#                      Fedora's own /usr/lib64 convention — wrong for
+#                      Dakota's Debian-style multiarch layout, and
+#                      invisible to Dakota's ldconfig (see README.md,
+#                      "How the NVIDIA userspace libraries are
+#                      installed").
 set -euo pipefail
 
 version="$1"
 kernel_src_root="$2"
 out_dir="$3"
+libdir="$4"
+# nvidia-installer's --opengl-libdir/--utility-libdir/--gbm-backend-dir
+# are relative to their own install prefix (--opengl-prefix,
+# --utility-prefix — both default to /usr, per --advanced-options), so
+# strip that leading /usr/ back off the absolute path the probe found.
+relative_libdir="${libdir#/usr/}"
 
 kver="$(cat /kernel-version)"
 build_dir="${kernel_src_root}/lib/modules/${kver}/build"
@@ -191,7 +209,25 @@ echo "==> Installing userspace components (--no-kernel-module, the kmod was alre
 # changes flags between branches — run `./nvidia-installer --help` and
 # `--advanced-options` the first time you switch versions and adjust
 # this list before trusting the build.
-find / -xdev -type f 2>/dev/null | sort > /tmp/before.list
+#
+# The --opengl-libdir/--utility-libdir/--x-library-path/--x-module-path/
+# --gbm-backend-dir overrides below all steer the installer at
+# "${libdir}" (found by nvidia-libdir-probe) instead of letting it
+# auto-detect a libdir — without them it guesses Fedora's own
+# convention (/usr/lib64), since that's what's actually true of this
+# fedora:44 builder stage, not of the Dakota image these files end up
+# in. See README.md, "How the NVIDIA userspace libraries are
+# installed".
+#
+# --no-install-compat32-libs: this builder stage has Fedora's own
+# 32-bit multilib packages available, which makes nvidia-installer
+# auto-install a full parallel set of 32-bit compatibility libraries —
+# but Dakota ships no 32-bit multiarch directory at all
+# (/usr/lib/i386-linux-gnu doesn't exist), so those libraries are dead
+# weight nothing on the target image could ever load. See README.md,
+# "Known limitations" for the gaming-variant caveat (32-bit Wine/Proton
+# titles needing 32-bit OpenGL would need this revisited).
+find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/before.list
 
 ./nvidia-installer \
     --silent \
@@ -206,9 +242,15 @@ find / -xdev -type f 2>/dev/null | sort > /tmp/before.list
     --no-check-for-alternate-installs \
     --skip-depmod \
     --skip-module-load \
-    --install-libglvnd
+    --install-libglvnd \
+    --no-install-compat32-libs \
+    --opengl-libdir="${relative_libdir}" \
+    --utility-libdir="${relative_libdir}" \
+    --x-library-path="${libdir}" \
+    --x-module-path="${libdir}/xorg/modules" \
+    --gbm-backend-dir="${relative_libdir}/gbm"
 
-find / -xdev -type f 2>/dev/null | sort > /tmp/after.list
+find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/after.list
 comm -13 /tmp/before.list /tmp/after.list > /tmp/new-files.list
 
 n="$(wc -l < /tmp/new-files.list)"
