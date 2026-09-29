@@ -424,18 +424,14 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           │
   │           └─→ nvidia-builder    (Fedora, build environment only)
   │                 builds the out-of-tree kmod against the reconstructed
-  │                 tree above, using GCC/binutils from toolchain-builder
-  │                 (not Fedora's own — see "Compiler/linker version
-  │                 mismatch" below), VERIFIES every built .ko against
-  │                 the kernel's own struct module layout before
-  │                 packaging (scripts/module-abi.py verify), runs
-  │                 nvidia-installer --no-kernel-module, and packages the
-  │                 result via a filesystem diff (scripts/build-nvidia.sh)
-  │                 ↑
-  │                 toolchain-builder (Fedora, build environment only)
-  │                 builds GCC 16.2.0 + binutils from upstream source, at
-  │                 the exact pins freedesktop-sdk itself uses to build
-  │                 Dakota's kernel (scripts/build-toolchain.sh)
+  │                 tree above with Fedora's own GCC/binutils (EXPERIMENT:
+  │                 a from-source toolchain-builder stage used to supply
+  │                 them — see "Compiler/linker version mismatch" below),
+  │                 VERIFIES every built .ko against the kernel's own
+  │                 struct module layout before packaging
+  │                 (scripts/module-abi.py verify), runs nvidia-installer
+  │                 --no-kernel-module, and packages the result via a
+  │                 filesystem diff (scripts/build-nvidia.sh)
   │
   ├─→ libfprint-probe         locates libfprint-2.so's exact libdir
   │     │                     in the Dakota base image
@@ -644,7 +640,7 @@ reconstructs itself from upstream source + the image's own shipped
 
 ## Known limitations
 
-- **`toolchain-builder` is now the only genuinely heavy stage.**
+- **No stage compiles anything large any more (on this branch).**
   `kernel-src-builder` no longer compiles the kernel (see ["Deriving
   `Module.symvers` instead of compiling the
   kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel)), so
@@ -654,12 +650,6 @@ reconstructs itself from upstream source + the image's own shipped
   keeping the option no longer means paying for BTF generation, since
   nothing here links a `vmlinux` to generate it from. `pahole` is still
   installed for exactly one reason: so Kconfig doesn't drop the option.
-- **`toolchain-builder` compiles GCC + binutils from source**, adding
-  real time to every build (a from-source GCC build, even
-  single-stage/C-only, is the slowest single step in this
-  Containerfile) — the cost of matching Dakota's kernel toolchain
-  exactly instead of approximating with Fedora's own packages. See
-  "Compiler/linker version mismatch" below.
 - ~~**`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
   `drm_ttm_helper.ko`'s exports, not every loadable module's.**~~ No
   longer a limitation: `Module.symvers` is now derived from the image's
@@ -712,48 +702,93 @@ reconstructs itself from upstream source + the image's own shipped
   (`scripts/rust_is_available.sh`) and this stage installs no `rustc` —
   the explicit `scripts/config --disable RUST` just makes the intent
   visible.
-- **Compiler/linker version mismatch** — `nvidia.ko` is built with the
-  exact GCC + binutils that built Dakota's own kernel rather than
-  something close, on the general principle that an out-of-tree module
-  should be compiled by the toolchain its kernel was.
+- **Compiler/linker version mismatch — being re-tested on this branch.**
+  `nvidia.ko` is built here with Fedora's own GCC/binutils. A
+  `toolchain-builder` stage used to build GCC 16.2.0 and binutils 2.47
+  from upstream source, at the pins freedesktop-sdk uses for Dakota's own
+  kernel, on the belief that Fedora's compiler was not good enough — the
+  evidence being an `Invalid relocation target, existing value is
+  nonzero` failure in `.gnu.linkonce.this_module` at `insmod` time,
+  attributed to a micro-version of GCC drift.
 
-  Be aware of what this does *not* explain, though: the
-  `Invalid relocation target, existing value is nonzero` failure in
-  `.gnu.linkonce.this_module` that motivated `toolchain-builder` in the
-  first place was **not** caused by GCC drift. It was a `struct module`
-  layout mismatch from a silently dropped `.config` option, diagnosed
-  and fixed separately — see ["`struct module` layout must match the
-  running kernel"](#struct-module-layout-must-match-the-running-kernel)
-  above. So treat that symptom as a layout problem first (run
-  `scripts/module-abi.py`, which pinpoints it in a tenth of a second)
-  and a toolchain problem second. Nothing here has since demonstrated
-  that a micro-version of GCC drift alone breaks module loading; if you
-  ever need to cut build time, dropping `toolchain-builder` for Fedora's
-  own compiler is therefore a reasonable thing to *test*, with the ABI
-  check as the gate. `toolchain-builder` (see the
-  Containerfile) builds GCC 16.2.0 and binutils from official upstream
-  source at the exact pins freedesktop-sdk itself uses to build
-  Dakota's kernel (`elements/bootstrap/gcc.bst` → tag
-  `releases/gcc-16.2.0`; `elements/bootstrap/binutils.bst` → tag
-  `binutils-2_47`, commit `6ce87bbc521cf46eaee9a1f7ef61cee2cdfb3e32`)
-  via `scripts/build-toolchain.sh`, and `nvidia-builder` uses that
-  toolchain instead of Fedora's own. `kernel-src-builder` stays on
-  Fedora's toolchain since its output (`vmlinux`, `ttm.ko`,
-  `drm_ttm_helper.ko`) never ships to the real machine — see that
-  stage's own comment.
+  That attribution was wrong. The cause was a `struct module` layout
+  mismatch from a silently dropped `.config` option — see ["`struct
+  module` layout must match the running
+  kernel"](#struct-module-layout-must-match-the-running-kernel) — now
+  fixed, and guarded structurally by `scripts/module-abi.py`. Since the
+  from-source toolchain was the slowest step in every CI run and rested
+  on a superseded explanation, this branch removes it to find out whether
+  it is needed.
 
-  `build-nvidia.sh` doesn't pass `IGNORE_CC_MISMATCH=1`: kbuild's own
-  version check enforces the match, so a future drift fails the build
-  loudly instead of producing another unloadable `.ko`. `RANDSTRUCT`
-  and `LTO` are both off in the shipped config (the two options most
-  likely to make any *remaining* toolchain drift genuinely
-  ABI-incompatible on top of this). Test `modprobe nvidia` before
-  trusting a build regardless, and re-derive
-  `scripts/build-toolchain.sh`'s pins whenever a base-image bump
-  changes the kernel's own toolchain — check
-  `CONFIG_CC_VERSION_TEXT` in the shipped `.config` for the GCC
-  version, and `/proc/version` on the real machine for the binutils
-  version (not shown in the `.config`).
+  What is verifiably true either way is that **nothing in the build
+  distinguishes the two compilers**:
+
+  - NVIDIA's own `cc_sanity_check` (`kernel/conftest.sh`) parses only
+    *major.minor* out of `include/generated/compile.h`'s
+    `LINUX_COMPILER` and compares it to `__GNUC__`/`__GNUC_MINOR__`.
+    Dakota's kernel GCC is 16.2.0 and Fedora 44's is 16.2.1 — both
+    `16.2` — so it passes with or without the stage, and is blind to
+    precisely the micro-version drift it was credited with catching.
+  - The reconstructed tree's `CONFIG_CC_VERSION_TEXT` is *Fedora's*, not
+    Dakota's (`"gcc (GCC) 16.2.1 20260819 (Red Hat 16.2.1-2)"`), because
+    `make olddefconfig` recomputes it from the compiler present in
+    `kernel-src-builder`. Building with Fedora's gcc therefore makes the
+    module and the tree it compiles against self-consistent for the
+    first time; with `toolchain-builder` they never were.
+
+  So the old claim that `build-nvidia.sh` omitting `IGNORE_CC_MISMATCH=1`
+  "enforces the match" was never true. It is still omitted, since it
+  costs nothing and would catch a major/minor jump.
+
+  **What this branch cannot prove.** `scripts/module-abi.py` gates
+  `struct module`'s *layout*, which is decided by the `.config` and
+  headers — not by the compiler. It will pass either way, so it is not
+  evidence about compiler compatibility. `RANDSTRUCT` and `LTO` are both
+  off in the shipped config, which removes the two options most likely to
+  make toolchain drift genuinely ABI-incompatible, and a module built by
+  16.2.1 against a kernel built by 16.2.0 is very likely fine — but "very
+  likely" is not proof. **Only `modprobe nvidia` on real hardware, plus
+  some use under load, settles it.** That is the one test that has to
+  happen before this is merged.
+
+  **What the local test did show.** The whole `nvidia-builder` stage was
+  run locally with Fedora's toolchain (GCC 16.2.1, GNU ld 2.46.1) against
+  the reconstructed tree, and the five resulting modules were compared
+  against the reference build made with the from-source toolchain
+  (GCC 16.2.0, binutils 2.47):
+
+  - All five compile and link, and pass `scripts/module-abi.py`.
+  - **Section-name sets are identical** in all five.
+  - **Undefined-symbol sets are identical** in all five, with one
+    difference that is not the compiler's: the reference build's
+    `nvidia-modeset.ko` and `nvidia-uvm.ko` also need `sized_strscpy`,
+    because they were built when the `strncpy()` shim still had callers
+    to patch. `580.178.04` has none, so the shim is skipped — exactly as
+    intended.
+  - **Zero unresolved external symbols** across all five, checked against
+    the derived `Module.symvers` (the kernel's own exports plus every
+    module the image ships) together with the NVIDIA set's own. So no
+    `Unknown symbol in module` at `insmod` time either.
+
+  In other words, at every level the build itself can observe, the module
+  built with Fedora's toolchain is indistinguishable from the one built
+  with the from-source toolchain. What remains unobserved is codegen, and
+  no static comparison settles that.
+
+  Note also that the **linker** drifts further than the compiler does:
+  Fedora 44 ships GNU ld 2.46.1 where Dakota's kernel was built with a
+  2.47 snapshot. Since the module's final link (`ld -r`) is what emits
+  `.gnu.linkonce.this_module` and its relocations, that is the more
+  plausible half of any residual risk here — a point in favour of
+  actually testing rather than reasoning about it.
+
+  If it turns out to be needed, `scripts/build-toolchain.sh` is still in
+  the tree on `main`, with pins `elements/bootstrap/gcc.bst` → tag
+  `releases/gcc-16.2.0` and `elements/bootstrap/binutils.bst` → tag
+  `binutils-2_47`, commit `6ce87bbc521cf46eaee9a1f7ef61cee2cdfb3e32`.
+  Those need re-deriving whenever a base-image bump changes the kernel's
+  own toolchain: `CONFIG_CC_VERSION_TEXT` in the shipped `.config` for
+  the GCC version, `/proc/version` on the real machine for binutils.
 - **Gaming variant: Dakota's own fixup patches to the OGC kernel are
   not applied.** `linux-ogc.bst` applies three small patches from
   `patches/linux-ogc/` in the Dakota repo (an `ayn-ec` HID fix, an

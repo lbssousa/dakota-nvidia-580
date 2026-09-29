@@ -194,8 +194,8 @@ RUN set -eux; \
 # .config extracted above, via scripts/build-kernel-src.sh. See that
 # script and README.md for the full rationale.
 #
-# Stays on Fedora 44's own gcc/binutils (unlike nvidia-builder below,
-# which needs the toolchain-builder stage instead): this stage compiles
+# Uses Fedora 44's own gcc/binutils, as nvidia-builder below now does
+# too (see that stage's EXPERIMENT note): this stage compiles
 # no kernel code at all any more. `modules_prepare` generates headers and
 # builds host tools (scripts/, objtool) that never ship and never run on
 # the target, so which compiler produced them doesn't matter.
@@ -292,43 +292,53 @@ RUN set -eux; \
     echo "Found PAM modules at: $so (dir: $(cat /pam-u2f-libdir))" >&2
 
 # ---------------------------------------------------------------------
-# toolchain-builder — builds the exact GCC + binutils that built
-# Dakota's own kernel, from official upstream source, at the same
-# pins freedesktop-sdk itself uses
-# (elements/bootstrap/gcc.bst / elements/bootstrap/binutils.bst in the
-# dakota/freedesktop-sdk repo) — not whatever Fedora happens to
-# package. Fedora's own gcc/binutils, even a version very close to the
-# kernel's own, is not good enough: `nvidia.ko` needs a real relocation
-# resolved at `insmod` time (in .gnu.linkonce.this_module, boilerplate
-# every out-of-tree module carries), and that fails with a toolchain
-# mismatch. See scripts/build-toolchain.sh and README.md,
-# "Compiler/linker version mismatch".
-# ---------------------------------------------------------------------
-FROM fedora:44 AS toolchain-builder
-RUN dnf install -y gcc gcc-c++ make bison flex texinfo git curl tar xz \
-        bzip2 gettext-devel zlib-ng-compat-devel diffutils findutils \
-        which && \
-    dnf clean all
-COPY scripts/build-toolchain.sh /build-toolchain.sh
-RUN chmod +x /build-toolchain.sh && /build-toolchain.sh /toolchain
-
-# ---------------------------------------------------------------------
-# nvidia-builder — Fedora used only as a build environment (dnf/make/
-# kmod/...); nothing here ends up in the final image except what
-# build-nvidia.sh explicitly packages into /out. The actual compiler
-# and linker come from toolchain-builder above, put first on PATH —
-# see that stage's comment for why Fedora's own gcc/binutils (even
-# Fedora 44's) aren't good enough here.
+# nvidia-builder — Fedora used only as a build environment (dnf/gcc/
+# make/kmod/...); nothing here ends up in the final image except what
+# build-nvidia.sh explicitly packages into /out.
+#
+# EXPERIMENT (branch experiment/drop-toolchain-builder): this used to
+# take its compiler and linker from a toolchain-builder stage that built
+# GCC 16.2.0 + binutils 2.47 from upstream source, at the pins
+# freedesktop-sdk uses for Dakota's own kernel, because Fedora's own
+# gcc/binutils were believed not to be good enough — the claim being that
+# a micro-version of GCC drift made nvidia.ko fail at insmod with
+# "Invalid relocation target, existing value is nonzero" in
+# .gnu.linkonce.this_module.
+#
+# That diagnosis was wrong. The real cause was a `struct module` layout
+# mismatch from a silently dropped .config option (see README.md,
+# "`struct module` layout must match the running kernel"), and it is now
+# both fixed and guarded structurally by scripts/module-abi.py. So the
+# from-source toolchain — the single most expensive stage in this file,
+# and the slowest step in every CI run — is worth re-testing rather than
+# keeping on the strength of a superseded explanation.
+#
+# What is verifiably true about the compiler check either way: nothing in
+# this build distinguishes the two compilers.
+#   - NVIDIA's own cc_sanity_check (kernel/conftest.sh) parses only
+#     major.minor out of include/generated/compile.h's LINUX_COMPILER and
+#     compares it to __GNUC__/__GNUC_MINOR__. Dakota's kernel GCC is
+#     16.2.0 and Fedora 44's is 16.2.1: both are "16.2", so the check
+#     passes with or without this stage, and cannot see a micro-version
+#     drift at all.
+#   - The tree's own CONFIG_CC_VERSION_TEXT is Fedora's, not Dakota's,
+#     because `make olddefconfig` in kernel-src-builder recomputes it
+#     from the compiler actually present there. Using Fedora's gcc here
+#     therefore makes the module and the tree it is built against
+#     self-consistent for the first time.
+#
+# What no check can settle is whether a module built by 16.2.1 against a
+# kernel built by 16.2.0 loads and behaves. Only real hardware answers
+# that, which is why this lives on a branch.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS nvidia-builder
 ARG NVIDIA_VERSION
-# python3 runs scripts/module-abi.py, which build-nvidia.sh invokes on
-# the freshly built .ko files before packaging them.
-RUN dnf install -y make kmod elfutils-libelf-devel perl-interpreter \
-        python3 tar xz curl which && \
+# gcc/binutils now come from Fedora (the experiment above). python3 runs
+# scripts/module-abi.py, which build-nvidia.sh invokes on the freshly
+# built .ko files before packaging them.
+RUN dnf install -y gcc binutils make kmod elfutils-libelf-devel \
+        perl-interpreter python3 tar xz curl which && \
     dnf clean all
-COPY --from=toolchain-builder /toolchain /toolchain
-ENV PATH="/toolchain/bin:${PATH}"
 COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=kernel-headers /kernel-module-abi.json /kernel-module-abi.json

@@ -46,18 +46,26 @@ echo "==> Extracting installer..."
 cd "NVIDIA-Linux-x86_64-${version}"
 
 echo "==> Building the kmod against ${build_dir}..."
-# No IGNORE_CC_MISMATCH: PATH is set up (see the nvidia-builder
-# Containerfile stage) so $(CC) resolves to the toolchain-builder
-# stage's from-source GCC, matching Dakota's own kernel exactly
-# (CONFIG_CC_VERSION_TEXT) — kbuild's own mismatch check should just
-# pass. Leaving it enforced means a future toolchain drift (see
-# README.md, "Compiler/linker version mismatch") fails the build
-# loudly instead of silently producing another unloadable .ko.
+# No IGNORE_CC_MISMATCH, but do not read much into that passing. It was
+# described here as enforcing a match with the compiler that built
+# Dakota's kernel; it does not, and never did. NVIDIA's cc_sanity_check
+# (kernel/conftest.sh) parses only major.minor out of
+# include/generated/compile.h's LINUX_COMPILER and compares it to
+# __GNUC__/__GNUC_MINOR__ of $(CC). Dakota's kernel GCC is 16.2.0 and
+# Fedora 44's is 16.2.1 — both "16.2" — so the check passes either way
+# and is blind to exactly the micro-version drift it was credited with
+# catching. It is left unset because it costs nothing and would still
+# catch a major/minor jump.
+#
+# $(CC) itself: NVIDIA's kernel/Makefile takes the first word of the
+# tree's CONFIG_CC_VERSION_TEXT when CC is unset, which is plain "gcc",
+# resolved from PATH.
 #
 # IGNORE_MISSING_MODULE_SYMVERS: belt-and-suspenders only. The tree
-# scripts/build-kernel-src.sh reconstructs ships a real Module.symvers
-# (from `make vmlinux` — see that script), so this sanity check should
-# pass on its own; this flag just avoids a hard Containerfile failure
+# scripts/build-kernel-src.sh assembles ships a real Module.symvers
+# (derived from the image's own binaries — see that script), so this
+# sanity check should pass on its own; this flag just avoids a hard
+# Containerfile failure
 # in the edge case where a future Dakota .config somehow produces an
 # empty one instead. NVIDIA's own conftest.sh actually *depends* on
 # Module.symvers content, beyond what this flag's name suggests — it
