@@ -1101,12 +1101,12 @@ down to this repo's single rolling tag:
     compiled against both Dakota kernels, including
     `scripts/module-abi.py`'s loadability gate, before anything merges.
     For that to happen automatically the PR must be created by a real
-    token: GitHub deliberately does not trigger workflows from PRs made
-    with the default `GITHUB_TOKEN`. Add a `NVIDIA_WATCH_PR_TOKEN`
-    repository secret (a fine-grained PAT with `contents: write` and
-    `pull-requests: write` on this repo) and the workflow uses it; with
-    no such secret the PR still opens and says in its body to
-    close/reopen it to start CI.
+    token: GitHub deliberately does not trigger workflows from anything
+    done with the default `GITHUB_TOKEN`. That restriction has no
+    workaround — a `push` trigger on the bump branch and
+    `repository_dispatch` are both equally inert — so the options are a
+    PAT, a GitHub App, or one manual step. See ["Making the watcher's PRs
+    trigger CI"](#making-the-watchers-prs-trigger-ci).
 - `renovate.json5` tracks both base-image digests — `BASE_IMAGE`
   (`ghcr.io/projectbluefin/dakota:stable`) and `BASE_IMAGE_GAMING`
   (`ghcr.io/projectbluefin/dakota-gaming:stable`) — pinned in the
@@ -1118,3 +1118,78 @@ down to this repo's single rolling tag:
   independently of, and sometimes lags, the standard one. Renovate
   handles the base images only; the NVIDIA driver has no Renovate
   datasource, which is what the watcher above is for.
+
+### Making the watcher's PRs trigger CI
+
+Without a token the watcher still works: it opens the PR, and the PR body
+says to close and reopen it to start CI. For a branch that sees roughly
+one release a month that is two clicks, and it needs no credential to
+rotate — a legitimate choice.
+
+To have it happen automatically, add a **fine-grained personal access
+token** as the repository secret `NVIDIA_WATCH_PR_TOKEN`:
+
+1. <https://github.com/settings/personal-access-tokens/new>
+2. **Resource owner**: your own account. **Repository access**: *Only
+   select repositories* → `dakota-nvidia-580`. Not "All repositories" —
+   this token can push branches and open PRs, so keep its reach to the
+   one repo that needs it.
+3. **Repository permissions** — exactly two, everything else *No access*:
+   - **Contents**: Read and write — the workflow pushes the bump branch.
+   - **Pull requests**: Read and write — it lists and creates PRs.
+
+   (*Metadata: Read-only* is added automatically and is required.)
+4. **Expiration**: a year is a reasonable trade. "No expiration" removes
+   the rotation chore at the cost of a credential that never lapses. Note
+   what happens if it does lapse: the run fails loudly at checkout rather
+   than degrading quietly, so you will notice.
+5. Add it at
+   *Settings → Secrets and variables → Actions → New repository secret*,
+   named `NVIDIA_WATCH_PR_TOKEN`. Paste it in the browser, or run
+   `gh secret set NVIDIA_WATCH_PR_TOKEN` locally, which reads the value
+   from a hidden prompt rather than your shell history.
+
+A GitHub App (via `actions/create-github-app-token`) is the other
+no-expiry option and is what a shared repo should use, but it needs an App
+created and installed plus two secrets — more moving parts than this repo
+warrants.
+
+#### Verifying it actually works
+
+The watcher only opens a PR when a newer release exists, and the pin is
+already the newest, so there is nothing for it to do — running it now
+proves the index parse works and nothing else. To exercise the real path,
+point a throwaway branch's pin *backwards* and run the watcher against
+that branch:
+
+```bash
+# 1. A throwaway branch whose pin is one release behind.
+git switch -c test/watcher-token main
+sed -i 's|^ARG NVIDIA_VERSION=.*$|ARG NVIDIA_VERSION=580.173.02|' Containerfile
+git commit -am "temp: pin back to exercise the watcher"
+git push -u origin test/watcher-token
+
+# 2. Run the watcher from that branch (workflow_dispatch can target any
+#    ref that contains the workflow file).
+gh workflow run nvidia-driver-update.yml --ref test/watcher-token
+gh run watch
+
+# 3. It should open a PR from nvidia-driver/580.178.04. The thing to look
+#    at is whether "Build and publish latest" appears as a check on it.
+#    If it does, the token works. If the PR body carries the
+#    "build.yml has not run on this PR" warning instead, the secret
+#    isn't being seen.
+
+# 4. Clean up.
+gh pr close <number> --delete-branch
+git push origin --delete test/watcher-token
+git switch main && git branch -D test/watcher-token
+```
+
+Two things to expect. The PR's file diff against `main` will look *empty*,
+because the bump branch ends up with the same pin `main` already has —
+that is the test being artificial, not a fault. And because the watcher
+never re-proposes a version it has already opened a PR for, testing with
+`580.178.04` permanently marks that version as seen; harmless here since
+it is the current pin, but do not run this test with a version you
+actually expect the watcher to propose later.
