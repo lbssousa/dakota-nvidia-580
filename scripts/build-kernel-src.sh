@@ -143,6 +143,57 @@ normalize_config .config          > ../config.reconciled.norm
 # `#ifdef` inside struct module.
 allowed_deltas=(
     'CONFIG_[A-Z0-9_]*RUST[A-Z0-9_]*'
+
+    # --- Toolchain and build-environment probes ---
+    #
+    # Kconfig recomputes every symbol that has no prompt: its `default`
+    # is evaluated fresh and the value in the .config is ignored. A large
+    # family of those defaults probe the *installed* toolchain rather
+    # than describing the kernel:
+    #
+    #   config CC_VERSION_TEXT  string  default "$(CC_VERSION_TEXT)"
+    #   config GCC_VERSION      int     default $(cc-version) if CC_IS_GCC
+    #   config PAHOLE_VERSION   int     default "$(PAHOLE_VERSION)"
+    #
+    # This stage runs on Fedora's gcc/binutils/pahole, not the ones
+    # freedesktop-sdk built Dakota's kernel with, so all 62 of these in
+    # Dakota's shipped .config are guaranteed to differ — e.g.
+    # CC_VERSION_TEXT="gcc (GCC) 16.2.0" and PAHOLE_VERSION=131 there vs
+    # Fedora 44's own. Failing on them would mean the guard could never
+    # pass, so they are allowed.
+    #
+    # What makes that safe is that a probe only ever *describes* the
+    # toolchain; anything it actually gates shows up in a separate,
+    # non-probe symbol that this guard still checks. If Fedora's compiler
+    # lacked something Dakota's had and a real feature got dropped as a
+    # result, the failure would surface as that feature's own symbol —
+    # CONFIG_STACKPROTECTOR, say — which is not in this list.
+    #
+    # Hence enumerated patterns rather than a family wildcard: a blanket
+    # 'CONFIG_CC_.*' would also swallow CC_OPTIMIZE_FOR_PERFORMANCE (a
+    # real codegen choice), and 'CONFIG_GCC_.*' would swallow the
+    # GCC_PLUGIN_* family, which is where GCC_PLUGIN_RANDSTRUCT lives —
+    # an option that genuinely reorders structs. Both stay checked.
+    'CONFIG_(CC|AS|LD|GCC|CLANG|LLD|PAHOLE)_VERSION(_TEXT)?'
+    'CONFIG_(CC|AS|LD)_IS_[A-Z0-9_]+'
+    'CONFIG_(CC|AS|LD|PAHOLE)_HAS_[A-Z0-9_]+'
+    'CONFIG_(CC|LD)_CAN_[A-Z0-9_]+'
+    'CONFIG_TOOLS_SUPPORT_[A-Z0-9_]+'
+    'CONFIG_AS_WRUSS'
+    # Warning-flag strings and suppressions selected by compiler version.
+    'CONFIG_CC_(IMPLICIT_FALLTHROUGH|MS_EXTENSIONS|NO_ARRAY_BOUNDS|NO_STRINGOP_OVERFLOW)'
+    'CONFIG_GCC_NO_STRINGOP_OVERFLOW'
+    'CONFIG_LD_ORPHAN_WARN(_LEVEL)?'
+    # The bare plugin-infrastructure flag, gated on gcc-plugin-devel's
+    # plugin-version.h being installed. Dakota ships CONFIG_GCC_PLUGINS=y
+    # but selects no plugin at all (GCC_PLUGIN_LATENT_ENTROPY unset,
+    # GCC_PLUGIN_RANDSTRUCT not even present), so on this .config it
+    # enables nothing and gates nothing in the headers a module compiles
+    # against. Every individual CONFIG_GCC_PLUGIN_* stays checked, so if
+    # Dakota ever turns one on, this guard catches it. Installing
+    # gcc-plugin-devel in the Containerfile would let this entry be
+    # dropped, at the cost of another package in the stage.
+    'CONFIG_GCC_PLUGINS'
 )
 
 delta_value() {
@@ -180,7 +231,8 @@ while IFS= read -r opt; do
 done <<< "${changed}"
 
 if [ "${#expected_changes[@]}" -gt 0 ]; then
-    echo "==> olddefconfig resolved ${#expected_changes[@]} expected option(s) (the Rust disable above):"
+    echo "==> olddefconfig resolved ${#expected_changes[@]} expected option(s) (the Rust"
+    echo "    disable above, plus this stage's own toolchain-probe results):"
     for opt in "${expected_changes[@]}"; do
         describe_delta "${opt}"
     done
@@ -214,7 +266,8 @@ if [ "${#unexpected_changes[@]}" -gt 0 ]; then
 fi
 
 echo "==> Guard OK: the reconciled .config matches Dakota's shipped one on every"
-echo "    option except the expected Rust ones."
+echo "    option that describes the kernel. Only Rust and toolchain-probe symbols"
+echo "    differ, which is expected and explained in allowed_deltas above."
 
 release="$(make -s kernelrelease)"
 if [ "${release}" != "${kver}" ]; then
