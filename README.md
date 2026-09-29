@@ -160,17 +160,15 @@ does ship:
   (`ogc-localversion: '-ogc1'`, not autodetected).
 
 `scripts/build-kernel-src.sh` fetches that source, drops in the
-shipped `.config`, runs `make olddefconfig` + `make modules_prepare`,
-builds `vmlinux` (needed for a real `Module.symvers` — NVIDIA's own
-`conftest.sh` greps it to pick which kernel-version-specific code path
-to compile, so an empty one silently steers it toward APIs long
-removed from modern kernels) plus `drivers/gpu/drm/ttm/ttm.ko` and
-`drivers/gpu/drm/drm_ttm_helper.ko` (the DRM subsystem pieces that are
-loadable modules rather than built into `vmlinux` on Dakota's shipped
-`.config`, and that `nvidia-drm.ko` needs symbols from), and assembles
-`/usr/src/linux-<kver>/` with the same file list
-`linux.bst`/`linux-ogc.bst` themselves copy — reproducing their exact
-artifact shape.
+shipped `.config`, runs `make olddefconfig` + `make modules_prepare`
+and `tools/objtool/objtool`, and assembles `/usr/src/linux-<kver>/`
+with the same file list `linux.bst`/`linux-ogc.bst` themselves copy —
+reproducing their exact artifact shape.
+
+It does **not** compile the kernel. `Module.symvers` is derived instead,
+straight out of the binaries the image already ships — see
+["Deriving `Module.symvers` instead of compiling the
+kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel).
 
 Run this to confirm a given image still ships the `.config` this
 approach depends on (a much weaker requirement than the old
@@ -180,6 +178,80 @@ approach depends on (a much weaker requirement than the old
 ./scripts/check-kernel-headers.sh stable dakota
 ./scripts/check-kernel-headers.sh stable dakota-gaming
 ```
+
+## Deriving `Module.symvers` instead of compiling the kernel
+
+An out-of-tree module build needs `Module.symvers` for two things:
+`modpost` resolves the module's undefined symbols against it (and
+derives the `.ko`'s `depends=` from it), and NVIDIA's own `conftest.sh`
+greps it for the *exact* export line of each symbol it feature-tests —
+silently concluding "not present", and falling back to APIs long removed
+from modern kernels, whenever the file is missing or incomplete.
+`modules_prepare` alone never produces one.
+
+Dakota's published image ships no `Module.symvers`, so this repo used to
+obtain one the obvious way: `make vmlinux`, i.e. compile the whole
+kernel, plus two scoped module builds (`ttm.ko`, `drm_ttm_helper.ko`)
+for DRM exports that `make vmlinux` leaves out. That was the most
+expensive step here after building GCC — a full kernel compile, a final
+link needing several GB of RAM in one non-parallel step, and, since
+`CONFIG_DEBUG_INFO_BTF` has to stay on for ABI reasons, a `pahole -J`
+pass over a fully DWARF-annotated `vmlinux`.
+
+None of it was necessary. The image already contains every export, fully
+resolved:
+
+| what | where | how it is stored |
+| --- | --- | --- |
+| built-in exports | `/usr/lib/modules/<kver>/vmlinux` | `__ksymtab` (a `struct kernel_symbol` per export: three PREL32 refs — value, name, namespace), `__kflagstab` (one byte per export), `__ksymtab_strings` |
+| module exports | `/usr/lib/modules/<kver>/kernel/**/*.ko` | the same sections, plus the per-export `__ksymtab_<name>` / `__flags_<name>` / `__kstrtabns_<name>` labels in each module's symbol table |
+
+`scripts/gen-module-symvers.py` reads both and writes `Module.symvers` in
+`modpost`'s own `write_dump()` format, in about two seconds. The two file
+kinds need different readers: in `vmlinux` the PREL32 refs are resolved,
+so the targets are address arithmetic, while a `.ko` is relocatable and
+those words are zero with relocations against them — hence the label
+route for modules, which needs no relocation processing at all. The
+GPL-only flag comes from the `__kflagstab` byte, which `modpost`'s
+`get_symbol_flags()` sets to `KSYM_FLAG_GPL_ONLY` or `0` and nothing
+else.
+
+The result is *more* complete than what was compiled before: every
+module in the image contributes, so a future NVIDIA release needing a
+symbol from some other module no longer requires anyone to hunt down and
+add its build target. On kernel 7.2.6 that is 16364 built-in exports plus
+8568 from 2335 shipped modules.
+
+Validated against two independent sources on a real installation:
+
+- **Built-in exports** — the 16364 names match the `__ksymtab_*` labels
+  in the image's own `System.map` exactly: no extras, none missing.
+- **Module exports** — compared against `modules.symbols`, which `depmod`
+  generates independently. Every difference is accounted for: 99 are
+  symbol *namespaces*, which `kmod` lists as though they were symbols,
+  and 102 belong to `nvidia`/`nvidia-modeset` in `extra/`, which the
+  generator deliberately skips (feeding a previous build's own output
+  back into the next build's symbol list would be both circular and
+  stale). Nothing appears in the derived file that `depmod` doesn't know
+  about.
+
+Two guard rails, because a silently *incomplete* `Module.symvers` is the
+failure mode that makes `conftest.sh` pick the wrong API:
+
+- A `__kcrctab` section anywhere means `CONFIG_MODVERSIONS=y`, where real
+  CRCs matter and cannot be derived. The generator refuses rather than
+  emit zeros that would make every module unloadable.
+- Compressed modules (`.ko.xz`/`.ko.zst`) are a hard error too, rather
+  than being skipped.
+
+One consequence to know: the assembled tree has no `vmlinux`, so kbuild
+skips BTF generation for modules built against it —
+`scripts/Makefile.modfinal`'s `cmd_btf_ko` tests for `$(objtree)/vmlinux`
+and prints `Skipping BTF generation ... due to unavailability of
+vmlinux` instead of failing. That was already true before this change
+(the copied file list never included `vmlinux`), it means no `pahole` is
+needed in `nvidia-builder`, and module BTF is introspection metadata for
+BPF tooling — unrelated to whether the module loads.
 
 ## `struct module` layout must match the running kernel
 
@@ -263,13 +335,32 @@ Both halves are deliberate: one catches the cause, the other the
 effect, so a future divergence from any other cause is still caught.
 
 1. **`scripts/build-kernel-src.sh` fails on any silent `.config`
-   change.** It diffs the reconciled `.config` against the shipped one
-   immediately after `make olddefconfig` — before the expensive
-   `modules_prepare`/`vmlinux` builds — and aborts unless every changed
-   symbol matches its `allowed_deltas` list. That list holds exactly one
-   entry today, the deliberate Rust disable (see ["Known
-   limitations"](#known-limitations)). Adding to it requires a comment
-   explaining why the divergence can't affect the module ABI.
+   change.** It compares the reconciled `.config` against the shipped one
+   immediately after `make olddefconfig` — before `modules_prepare` spends
+   any time on a tree that is already wrong — and aborts unless every
+   changed symbol matches its `allowed_deltas` list. Adding to that list
+   requires a comment explaining why the divergence can't affect the
+   module ABI; the entries there today are the deliberate Rust disable and
+   its one non-obvious knock-on (`CONFIG_ANDROID_BINDER_DEVICES`), plus
+   the toolchain probes described below.
+
+   Two things make the comparison mean what it should. A symbol *absent*
+   from a `.config` counts as `n`, because Kconfig writes no line at all
+   for a symbol whose dependencies are unmet — treating that as a change
+   produced six pure non-events on this `.config` and nothing useful. And
+   Kconfig recomputes every symbol that has no prompt, evaluating its
+   `default` fresh, which for a large family means probing the *installed*
+   toolchain: `CONFIG_CC_VERSION_TEXT`, `CONFIG_GCC_VERSION`,
+   `CONFIG_PAHOLE_VERSION`, the `CONFIG_CC_HAS_*` results and 60-odd
+   others are guaranteed to differ, since this stage runs on Fedora's
+   compiler rather than the one freedesktop-sdk built Dakota's kernel
+   with. Those are allowed, because a probe only *describes* the
+   toolchain: anything it actually gates surfaces in a separate,
+   non-probe symbol that the guard still checks. The patterns are
+   enumerated rather than family wildcards so that
+   `CC_OPTIMIZE_FOR_PERFORMANCE` and the `GCC_PLUGIN_*` family — where
+   `GCC_PLUGIN_RANDSTRUCT` lives, which genuinely reorders structs —
+   stay policed.
 2. **`scripts/module-abi.py` verifies the built modules structurally.**
    The Dakota base image ships `/usr/lib/modules/<kver>/vmlinux` with a
    `.BTF` section, i.e. the running kernel's own `struct module` layout
@@ -313,10 +404,13 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
              or ghcr.io/projectbluefin/dakota-gaming:stable@sha256:... for the gaming variant)
   │
   ├─→ kernel-headers            extracts kernel version, its shipped .config,
-  │     │                       and the authoritative struct module layout from
-  │     │                       the image's own vmlinux .BTF section
+  │     │                       the authoritative struct module layout from the
+  │     │                       image's own vmlinux .BTF section, and a real
+  │     │                       Module.symvers derived from that vmlinux plus
+  │     │                       every shipped module
   │     │                       (NOT /usr/lib/modules/<kver>/build — see above)
-  │     │                       (scripts/module-abi.py extract)
+  │     │                       (scripts/module-abi.py extract,
+  │     │                        scripts/gen-module-symvers.py)
   │     │
   │     └─→ kernel-src-builder  (Fedora, build environment only)
   │           fetches matching upstream kernel source (kernel.org or
@@ -324,10 +418,10 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   │           kernel version string), configures it with the shipped
   │           .config, ABORTS if olddefconfig silently changed any
   │           option (see "struct module layout must match the running
-  │           kernel" above), builds vmlinux + the DRM modules
-  │           nvidia-drm.ko needs, assembles a real /src/linux-<kver>/ +
-  │           /lib/modules/<kver>/build
-  │           (scripts/build-kernel-src.sh)
+  │           kernel" above), runs modules_prepare + objtool, assembles a
+  │           real /src/linux-<kver>/ + /lib/modules/<kver>/build around
+  │           the Module.symvers passed in from kernel-headers. Does NOT
+  │           compile the kernel (scripts/build-kernel-src.sh)
   │           │
   │           └─→ nvidia-builder    (Fedora, build environment only)
   │                 builds the out-of-tree kmod against the reconstructed
@@ -410,6 +504,56 @@ This assumes the fork stays ABI-compatible with the stock libfprint
 (same soname/version scheme) — it's a fork for a new device driver,
 not a fork that changes the library's public API, so this should
 hold, but hasn't been verified against Dakota's exact stock version.
+
+## Lock screen occasionally shows no password/fingerprint prompt
+
+Confirmed on real hardware (2026-09-29, via `journalctl` across several
+boots) as a two-part chain, only the first part of which this repo can
+actually fix:
+
+1. **GNOME Shell's own fingerprint-verify timeout races a cold
+   `fprintd`.** `fprintd.service` is D-Bus-activated and, by default,
+   exits after being idle for ~30-45s. GNOME Shell periodically
+   re-arms fingerprint auth while the screen is locked (observed at an
+   almost exact 15-minute cadence, all night, independent of whether
+   anyone was actually present) — and since `fprintd` had reliably
+   idle-exited between re-arms, every one of these is a *cold* start:
+   the Goodix 538d sensor has to be reopened and re-handshake with its
+   MCU before `fprintd` can answer. That consistently took longer than
+   GNOME Shell's own client-side timeout, logging dozens of times per
+   day:
+   ```
+   gnome-shell: Failed to start gdm-fingerprint verification for user:
+   Gio.IOErrorEnum: O tempo limite foi alcançado
+     async*begin@resource:///org/gnome/shell/gdm/authPrompt.js:1044:28
+     _onReset@resource:///org/gnome/shell/ui/unlockDialog.js:965:26
+   ```
+2. **Each such D-Bus activation timeout appears to leak a system-bus
+   connection slot for UID 0 (root).** Independently confirmed the
+   same day: `uupd.service` (Universal Blue's own updater, unrelated
+   to fingerprint hardware) crash-looped 84 times in one boot with the
+   identical `"The maximum number of active connections for UID 0 has
+   been reached (max_connections_per_user=256)"`, and `gdm-password`
+   (the process that actually builds the lock screen's password entry)
+   failed with the same `LimitsExceeded` error at the same timestamp as
+   one of the fingerprint timeouts above. Once UID 0's 256-connection
+   cap on the system bus is exhausted, *any* fresh root-owned process
+   needing a new system-bus connection fails outright — which is what
+   makes the screen occasionally come up with no password/fingerprint
+   field at all, impossible to unlock without a hard reboot.
+
+Part 2 is very likely a `dbus-broker`/systemd bug in the Dakota (GNOME
+OS) base image itself — not this repo's code, and not fixed here.
+Part 1, though, is one of that leak's most frequent and mechanically
+regular triggers on this hardware (a clockwork timeout every 15
+minutes, all day, regardless of activity), and *is* in scope: the
+final stage now ships `files/fprintd-no-timeout.conf` as a
+`fprintd.service.d` drop-in forcing `--no-timeout`, so the sensor
+handshake stays warm and verification starts fast enough not to time
+out in the first place. This should substantially reduce how often
+the underlying leak gets fed, likely enough to avoid hitting the cap
+in a normal day's uptime — but doesn't address the leak itself. See
+["Known limitations"](#known-limitations) for the residual risk.
 
 ## How pam-u2f is installed
 
@@ -501,32 +645,27 @@ reconstructs itself from upstream source + the image's own shipped
 
 ## Known limitations
 
-- **`make vmlinux`'s final link needs several GB of RAM** in a single
-  non-parallel step. GitHub Actions' hosted runners (16 GB) handle it
-  in well under a minute; a memory-constrained machine may need swap
-  or closed applications first, or just let CI do the build.
-- **BTF generation adds to that.** Dakota ships
-  `CONFIG_DEBUG_INFO_BTF=y`, and the reconstructed tree has to keep it
-  (see ["`struct module` layout must match the running
-  kernel"](#struct-module-layout-must-match-the-running-kernel)), so
-  `make vmlinux` also runs `pahole -J` over a fully DWARF-annotated
-  `vmlinux` and builds `tools/bpf/resolve_btfids`. Turning it off is
-  not an option: it changes `struct module`'s layout, and
-  `scripts/module-abi.py` will fail the build if you try.
+- **`toolchain-builder` is now the only genuinely heavy stage.**
+  `kernel-src-builder` no longer compiles the kernel (see ["Deriving
+  `Module.symvers` instead of compiling the
+  kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel)), so
+  the several-GB-RAM `vmlinux` link and the `pahole -J` pass over it are
+  both gone. `CONFIG_DEBUG_INFO_BTF=y` still has to be preserved in the
+  reconstructed `.config` — it changes `struct module`'s layout — but
+  keeping the option no longer means paying for BTF generation, since
+  nothing here links a `vmlinux` to generate it from. `pahole` is still
+  installed for exactly one reason: so Kconfig doesn't drop the option.
 - **`toolchain-builder` compiles GCC + binutils from source**, adding
   real time to every build (a from-source GCC build, even
   single-stage/C-only, is the slowest single step in this
   Containerfile) — the cost of matching Dakota's kernel toolchain
   exactly instead of approximating with Fedora's own packages. See
   "Compiler/linker version mismatch" below.
-- **`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
-  `drm_ttm_helper.ko`'s exports, not literally every loadable module's.**
-  If a future NVIDIA driver version (or a kernel bump) needs a symbol
-  from some *other* loadable module, find the owning module from the
-  undefined-symbol name and the kernel's own subsystem `Makefile`, then
-  add a scoped `make path/to/that.ko` target — not a blanket `make
-  modules`, which is prohibitively slow and memory-hungry against this
-  `.config`.
+- ~~**`kernel-src-builder` covers `vmlinux` + `ttm.ko` +
+  `drm_ttm_helper.ko`'s exports, not every loadable module's.**~~ No
+  longer a limitation: `Module.symvers` is now derived from the image's
+  own `vmlinux` *and* every module it ships, so a future NVIDIA version
+  needing a symbol from some other module needs no build target added.
 - **NVIDIA's legacy 580.xxx driver may need patches for kernel 7.x.**
   The pin is `580.178.04`, the newest release in the 580 branch;
   `580.65.06` (the original pin) doesn't compile against kernel 7.x at
@@ -561,10 +700,13 @@ reconstructs itself from upstream source + the image's own shipped
   doesn't provide and NVIDIA's C-only module doesn't need. This
   doesn't change any C struct layout, calling convention, or the
   kernel release string (vermagic), and none of the affected symbols
-  appears in an `#ifdef` inside `struct module`. It is the sole entry in
-  `build-kernel-src.sh`'s `allowed_deltas` — every other `.config`
-  divergence fails the build (see ["`struct module` layout must match
-  the running
+  appears in an `#ifdef` inside `struct module`. The cascade is allowed in
+  `build-kernel-src.sh`'s `allowed_deltas`, and reaches exactly one symbol
+  whose name gives no hint of Rust: Dakota builds the *Rust* binder rather
+  than the C one, so `CONFIG_ANDROID_BINDER_DEVICES` (which
+  `depends on ANDROID_BINDER_IPC || ANDROID_BINDER_IPC_RUST`) loses its
+  last satisfied dependency. Every other `.config` divergence still fails
+  the build (see ["`struct module` layout must match the running
   kernel"](#struct-module-layout-must-match-the-running-kernel)). Note
   that Kconfig would drop `CONFIG_RUST` here by itself regardless, since
   `CONFIG_RUST_IS_AVAILABLE` is another tool probe
@@ -663,6 +805,19 @@ reconstructs itself from upstream source + the image's own shipped
   itself (the `goodixtls53xd` SIGFM matcher) — this image-build repo
   only bundles that fork's build output, so it can't fix this on its
   own; track/fix it in that repo instead.
+- **System-bus D-Bus connection leak on activation timeout (not this
+  repo's bug, not fixed here)** — see ["Lock screen occasionally shows
+  no password/fingerprint prompt"](#lock-screen-occasionally-shows-no-passwordfingerprint-prompt).
+  `files/fprintd-no-timeout.conf` removes fingerprint re-arm as one
+  trigger, but any other D-Bus service-activation timeout (observed
+  independently from `NetworkManager`'s dispatcher and
+  `org.freedesktop.Flatpak.SystemHelper`) can still feed the same leak
+  given enough uptime. If the lock screen (or anything else needing a
+  fresh root D-Bus connection, e.g. `uupd.service`) still fails this
+  way, `busctl list --system | wc -l` climbing well past normal and
+  `journalctl` showing `"maximum number of active connections for
+  UID 0"` confirms it — the only known full recovery once hit is a
+  reboot.
 - **`nvidia-installer` flags** — they change between branches, so
   they are re-validated against `--help`/`--advanced-options` on every
   `NVIDIA_VERSION` change. All thirteen currently passed were confirmed

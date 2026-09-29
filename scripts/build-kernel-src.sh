@@ -33,12 +33,27 @@
 #         Collective kernel fork at the matching tag, from
 #         elements/core/linux-ogc.bst's own source pin.
 #
-# Usage: build-kernel-src.sh <kver> <config-file> <output-dir>
+# Usage: build-kernel-src.sh <kver> <config-file> <output-dir> <module-symvers>
+#   <module-symvers>  a Module.symvers derived from the target image's own
+#                     vmlinux and shipped modules by
+#                     scripts/gen-module-symvers.py. This script used to
+#                     produce one by running `make vmlinux` here; see the
+#                     comment above where it's installed for why it no
+#                     longer does.
 set -euo pipefail
 
 kver="$1"
 config_file="$2"
 out_dir="$3"
+module_symvers="$4"
+
+if [ ! -s "${module_symvers}" ]; then
+    echo "ERROR: ${module_symvers} is missing or empty. It should have been" >&2
+    echo "produced by scripts/gen-module-symvers.py in the kernel-headers" >&2
+    echo "stage, from the Dakota image's own /usr/lib/modules/<kver>/vmlinux" >&2
+    echo "and kernel/**/*.ko." >&2
+    exit 1
+fi
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
@@ -108,18 +123,20 @@ make -j1 olddefconfig
 # -ENOEXEC. This repo shipped exactly that once.
 #
 # So: treat any silent divergence as a build failure, and run the check
-# here rather than after the expensive modules_prepare/vmlinux builds
-# below. scripts/module-abi.py is the second, structural half of the
+# here, before modules_prepare below spends any time on a tree that is
+# already wrong. scripts/module-abi.py is the second, structural half of the
 # same defence — it checks the resulting .ko against the running
 # kernel's own BTF, catching a layout mismatch whatever its cause.
 # ---------------------------------------------------------------------
 normalize_config() {
-    # "CONFIG_X=v" -> "CONFIG_X v", "# CONFIG_X is not set" -> "CONFIG_X n".
-    # Comparing normalized name/value pairs rather than raw lines is what
-    # makes a shipped "=y" turning into "is not set" register as a changed
-    # option instead of an unrelated deleted line and added comment.
-    sed -nE -e 's/^(CONFIG_[A-Za-z0-9_]+)=(.*)$/\1 \2/p' \
-            -e 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1 n/p' "$1" \
+    # "CONFIG_X=v" -> "CONFIG_X<TAB>v", "# CONFIG_X is not set" ->
+    # "CONFIG_X<TAB>n". Comparing name/value pairs rather than raw lines is
+    # what makes a shipped "=y" turning into "is not set" register as a
+    # changed option instead of an unrelated deleted line and added comment.
+    # The separator is a tab because values contain spaces
+    # (CONFIG_CC_VERSION_TEXT, CONFIG_ANDROID_BINDER_DEVICES).
+    sed -nE -e 's/^(CONFIG_[A-Za-z0-9_]+)=(.*)$/\1\t\2/p' \
+            -e 's/^# (CONFIG_[A-Za-z0-9_]+) is not set$/\1\tn/p' "$1" \
         | LC_ALL=C sort
 }
 
@@ -130,19 +147,26 @@ normalize_config .config          > ../config.reconciled.norm
 # this list only alongside a comment explaining why that divergence
 # can't affect the module ABI.
 #
-# The sole entry covers the deliberate `scripts/config --disable RUST`
-# above — and, equally, the fact that Kconfig would have dropped RUST by
-# itself here regardless (CONFIG_RUST depends on RUST_IS_AVAILABLE,
-# another tool probe: scripts/rust_is_available.sh, and this stage
-# installs no rustc). Every option Dakota's shipped .config enables that
-# depends on Rust carries RUST in its own symbol name — CONFIG_RUST,
-# CONFIG_HAVE_RUST, CONFIG_RUST_IS_AVAILABLE, the CONFIG_RUSTC_* probe
-# results, CONFIG_RUST_OVERFLOW_CHECKS, CONFIG_ANDROID_BINDER_IPC_RUST —
-# and the Rust-only drivers that don't (CONFIG_DRM_NOVA,
-# CONFIG_NOVA_CORE) are already unset there. None of them appears in an
-# `#ifdef` inside struct module.
+# The Rust entries cover the deliberate `scripts/config --disable RUST`
+# above — and, equally, the fact that Kconfig would drop RUST here by itself
+# regardless (CONFIG_RUST depends on RUST_IS_AVAILABLE, another tool probe:
+# scripts/rust_is_available.sh, and this stage installs no rustc).
+# CONFIG_BINDGEN_VERSION_TEXT belongs to that same probe result set despite
+# not carrying RUST in its name.
 allowed_deltas=(
     'CONFIG_[A-Z0-9_]*RUST[A-Z0-9_]*'
+    'CONFIG_BINDGEN_VERSION(_TEXT)?'
+
+    # The one place the Rust cascade reaches a symbol whose name gives no
+    # hint of it. Dakota builds the Rust binder rather than the C one
+    # (CONFIG_ANDROID_BINDER_IPC unset, CONFIG_ANDROID_BINDER_IPC_RUST=y),
+    # and drivers/android/Kconfig declares the device-name string
+    # `depends on ANDROID_BINDER_IPC || ANDROID_BINDER_IPC_RUST` — so
+    # dropping Rust leaves it with no satisfied dependency and Kconfig stops
+    # writing it at all. It is a string naming Android binder device nodes,
+    # for a driver this tree does not build and that no header a module
+    # compiles against ever reads.
+    'CONFIG_ANDROID_BINDER_DEVICES'
 
     # --- Toolchain and build-environment probes ---
     #
@@ -197,10 +221,12 @@ allowed_deltas=(
 )
 
 delta_value() {
-    # $1: normalized file, $2: symbol. Prints the whole value, which may
-    # itself contain spaces (CONFIG_RUSTC_VERSION_TEXT, CONFIG_CC_VERSION_TEXT).
-    LC_ALL=C awk -v k="$2" '$1 == k { sub(/^[^ ]+ /, ""); print; found = 1 }
-                            END { if (!found) print "(absent)" }' "$1"
+    # $1: normalized file, $2: symbol. A symbol with no line at all reports as
+    # "n", because that is what it means: Kconfig writes nothing for a symbol
+    # whose dependencies are unmet, and such a symbol is no more enabled than
+    # one spelled out as "is not set".
+    LC_ALL=C awk -F'\t' -v k="$2" '$1 == k { print $2; found = 1 }
+                                   END { if (!found) print "n" }' "$1"
 }
 
 describe_delta() {
@@ -209,8 +235,29 @@ describe_delta() {
         "$(delta_value ../config.reconciled.norm "$1")"
 }
 
-changed="$(LC_ALL=C comm -3 ../config.shipped.norm ../config.reconciled.norm \
-    | awk '{ print $1 }' | LC_ALL=C sort -u)"
+# Compare over the union of both symbol sets, treating a symbol absent from
+# a file as "n". Kconfig writes no line at all for a symbol whose
+# dependencies are unmet, so "# CONFIG_X is not set" becoming "not mentioned
+# anywhere" is not a change in the kernel's configuration -- it is the same
+# disabled option, described differently. A line-wise diff reports six such
+# non-events on this .config (DRM_NOVA, NOVA_CORE, KSTACK_ERASE,
+# RANDSTRUCT_FULL, RANDSTRUCT_PERFORMANCE, GCC_PLUGIN_LATENT_ENTROPY), which
+# would have made this guard unusable while telling us nothing.
+changed="$(LC_ALL=C awk -F'\t' '
+    NR == FNR { shipped[$1] = $2; next }
+    { rebuilt[$1] = $2 }
+    END {
+        for (k in shipped) {
+            if (k in rebuilt) {
+                if (shipped[k] != rebuilt[k]) print k
+            } else if (shipped[k] != "n") {
+                print k
+            }
+        }
+        for (k in rebuilt) {
+            if (!(k in shipped) && rebuilt[k] != "n") print k
+        }
+    }' ../config.shipped.norm ../config.reconciled.norm | LC_ALL=C sort -u)"
 
 expected_changes=()
 unexpected_changes=()
@@ -289,70 +336,46 @@ if [ "$(scripts/config -s OBJTOOL 2>/dev/null || true)" = "y" ]; then
     have_objtool=true
 fi
 
-# NVIDIA's own conftest.sh (nv-timer.h's del_timer_sync/timer_delete_sync
-# switch, and many other feature checks) doesn't gate on kernel version
-# macros alone -- it greps Module.symvers for the *exact* export line of
-# each symbol it cares about, and silently assumes "not present" (falling
-# back to APIs long removed from modern kernels) whenever that file is
-# missing or incomplete. modules_prepare alone never produces a real one.
-# `make vmlinux` builds the kernel image and runs modpost over it,
-# populating Module.symvers with every symbol exported directly from the
-# kernel (built-in, not from a loadable module) -- covers this class of
-# core-subsystem symbol NVIDIA's conftest checks for, without paying for
-# a full `make modules` across every driver in this everything-enabled
-# .config. See README.md for what this still doesn't cover.
-echo "==> Building vmlinux to populate a real Module.symvers..."
-make -j"$(nproc)" vmlinux
-
-# drivers/gpu/drm/ is built as a set of loadable modules in Dakota's
-# shipped .config (not built into vmlinux), so `make vmlinux` alone
-# leaves DRM's own exports out of Module.symvers. nvidia-drm.ko (the
-# DRM/KMS integration module, needed for accelerated Wayland/GNOME
-# Shell output) needs drm_fbdev_ttm_driver_fbdev_probe
-# (drivers/gpu/drm/drm_fbdev_ttm.c), which belongs to
-# drivers/gpu/drm/drm_ttm_helper.ko -- CONFIG_DRM=y and
-# CONFIG_DRM_KMS_HELPER=y are both built into vmlinux already on this
-# .config, but CONFIG_DRM_TTM_HELPER=m is a real loadable module (per
-# `drm_ttm_helper-$(CONFIG_DRM_FBDEV_EMULATION) += drm_fbdev_ttm.o` in
-# drivers/gpu/drm/Makefile). drm_ttm_helper.ko itself then needs
-# drivers/gpu/drm/ttm/ttm.ko (CONFIG_DRM_TTM=m too, providing
-# ttm_bo_vunmap/ttm_bo_mmap_obj/ttm_bo_vmap).
+# Module.symvers is NOT produced here any more, and that is the single
+# biggest simplification in this repo.
 #
-# `make drivers/gpu/drm/` (the whole directory) is NOT the right scope
-# for this: it builds every vendor GPU driver enabled in this
-# everything-enabled .config too (amdgpu alone is one of the largest
-# drivers in the kernel tree), which is prohibitively slow and
-# memory-hungry. Building the two specific .ko targets instead keeps
-# this to just what nvidia-drm.ko actually needs; if a future NVIDIA
-# version or kernel bump needs a symbol from some other loadable
-# module, find its owning module the same way (grep the kernel's own
-# subsystem Makefile for the file that exports it) and add one more
-# scoped target here.
-echo "==> Building ttm.ko + drm_ttm_helper.ko so nvidia-drm.ko's DRM-core dependencies land in Module.symvers..."
-make -j"$(nproc)" drivers/gpu/drm/ttm/ttm.ko drivers/gpu/drm/drm_ttm_helper.ko
-
-# Modern kbuild names `make vmlinux`'s modpost output vmlinux.symvers,
-# not Module.symvers -- the latter is only materialized by the full
-# `modules` target (merging vmlinux.symvers with every built module's
-# own exports). Since we built the two DRM modules above via scoped
-# per-target invocations (not the full `modules` target), check for
-# Module.symvers first -- kbuild's per-target module build does
-# produce/update it -- and only fall back to vmlinux.symvers if that
-# somehow didn't happen. External-module tooling (nvidia-installer's
-# Kbuild, conftest.sh) only ever looks for the file named
-# Module.symvers, so install it under that name -- its content is
-# genuinely real (vmlinux + the two DRM modules') exports, just missing
-# anything exported solely by some *other* loadable module we didn't
-# also build here.
-if [ -f Module.symvers ]; then
-    symvers_src="Module.symvers"
-elif [ -f vmlinux.symvers ]; then
-    symvers_src="vmlinux.symvers"
-else
-    echo "ERROR: neither Module.symvers nor vmlinux.symvers exists after" >&2
-    echo "'make vmlinux' -- kbuild's output naming may have changed again." >&2
-    exit 1
-fi
+# An external module build needs it for two things: modpost resolves the
+# module's undefined symbols against it (and derives the .ko's `depends=`
+# from it), and NVIDIA's own conftest.sh greps it for the *exact* export
+# line of each symbol it feature-tests -- silently assuming "not present",
+# and falling back to APIs long removed from modern kernels, whenever the
+# file is missing or incomplete. `modules_prepare` alone never produces
+# one.
+#
+# This script used to get one by running `make vmlinux` (a full kernel
+# compile, a final link needing several GB of RAM in one non-parallel
+# step, and -- since CONFIG_DEBUG_INFO_BTF has to stay on for ABI reasons,
+# see the guard above -- a `pahole -J` pass over a fully DWARF-annotated
+# vmlinux), followed by two scoped module builds for the DRM exports
+# `make vmlinux` leaves out.
+#
+# All of that reconstructed information the target image already contains,
+# fully resolved: /usr/lib/modules/<kver>/vmlinux carries every built-in
+# export in its __ksymtab/__kflagstab/__ksymtab_strings sections, and
+# every loadable module under /usr/lib/modules/<kver>/kernel/ carries its
+# own -- including ttm.ko and drm_ttm_helper.ko, the two this script used
+# to compile by hand. scripts/gen-module-symvers.py reads them directly,
+# in about two seconds, and the kernel-headers stage runs it. The result
+# is also strictly more complete than what was built here before: every
+# module in the image contributes, so a future NVIDIA release needing a
+# symbol from some other module no longer requires anyone to find and add
+# its build target.
+#
+# One consequence worth knowing: with no vmlinux in the assembled tree,
+# kbuild skips BTF generation for the modules built against it --
+# scripts/Makefile.modfinal's cmd_btf_ko tests for $(objtree)/vmlinux and
+# prints "Skipping BTF generation ... due to unavailability of vmlinux"
+# rather than failing. That was already the case before this change (the
+# to_copy list below never included vmlinux either), it needs no pahole in
+# the nvidia-builder stage, and module BTF is introspection metadata for
+# BPF tooling -- nothing to do with whether the module loads.
+echo "==> Using the Module.symvers derived from the image's own binaries:"
+echo "      ${module_symvers} ($(wc -l < "${module_symvers}") exports)"
 
 echo "==> Assembling the linux.bst-shaped output tree in ${out_dir}..."
 
@@ -361,10 +384,10 @@ mkdir -p "${targetdir}"
 
 # Mirrors freedesktop-sdk's own linux.bst / linux-ogc.bst install-commands
 # 'to_copy' list exactly — this is the artifact shape nvidia-drivers.bst
-# itself compiles against upstream. Module.symvers here comes from `make
-# vmlinux` + ttm.ko + drm_ttm_helper.ko above (vmlinux's built-in
-# exports plus those two modules' — not every loadable module — see
-# README.md for what that still doesn't cover).
+# itself compiles against upstream. Module.symvers is added separately
+# below, from the file derived out of the image's own binaries (see the
+# comment above), and vmlinux is deliberately not among these: kbuild
+# then skips module BTF generation instead of needing pahole here.
 to_copy=(
     Makefile
     .config
@@ -381,7 +404,7 @@ for f in "${to_copy[@]}"; do
     mkdir -p "$(dirname "${dest}")"
     cp -aT "${f}" "${dest}"
 done
-cp -aT "${symvers_src}" "${targetdir}/Module.symvers"
+cp -aT "${module_symvers}" "${targetdir}/Module.symvers"
 
 mkdir -p "${out_dir}/lib/modules/${release}"
 ln -sr "${targetdir}" "${out_dir}/lib/modules/${release}/build"

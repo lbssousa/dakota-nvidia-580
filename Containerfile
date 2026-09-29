@@ -149,17 +149,28 @@ FROM ${BASE_IMAGE} AS dakota-base
 #                          against this, so a build tree that diverged
 #                          from this kernel fails the build instead of
 #                          the boot. See scripts/module-abi.py.
+#   /kernel-module-symvers   a real Module.symvers, read out of that same
+#                          vmlinux's __ksymtab/__kflagstab sections plus
+#                          every module under /usr/lib/modules/<kver>/
+#                          kernel/. This replaces the `make vmlinux` that
+#                          kernel-src-builder used to run purely to
+#                          produce one — a full kernel compile, for
+#                          information the image already contains. See
+#                          scripts/gen-module-symvers.py.
 #
 # Fails loudly and early if the image doesn't even ship the .config —
 # that would mean Dakota's kernel packaging changed more deeply than the
 # missing-build-tree issue this repo works around.
 #
 # Everything here runs with the base image's own tooling (python3 only —
-# module-abi.py deliberately carries its own ELF/BTF readers rather than
-# depending on bpftool or pahole being present in a runtime image).
+# both scripts deliberately share a small ELF reader of their own,
+# kernel_elf.py, rather than depending on bpftool, pahole or binutils
+# being present in a runtime image).
 # ---------------------------------------------------------------------
 FROM dakota-base AS kernel-headers
+COPY scripts/kernel_elf.py /kernel_elf.py
 COPY scripts/module-abi.py /module-abi.py
+COPY scripts/gen-module-symvers.py /gen-module-symvers.py
 RUN set -eux; \
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"; \
     echo "$kver" > /kernel-version; \
@@ -173,7 +184,8 @@ RUN set -eux; \
     fi; \
     cp "/usr/lib/modules/$kver/config" /kernel-config; \
     python3 /module-abi.py extract "$kver" \
-        "/usr/lib/modules/$kver/vmlinux" /kernel-module-abi.json
+        "/usr/lib/modules/$kver/vmlinux" /kernel-module-abi.json; \
+    python3 /gen-module-symvers.py "/usr/lib/modules/$kver" /kernel-module-symvers
 
 # ---------------------------------------------------------------------
 # kernel-src-builder — Fedora used only as a build environment;
@@ -183,11 +195,10 @@ RUN set -eux; \
 # script and README.md for the full rationale.
 #
 # Stays on Fedora 44's own gcc/binutils (unlike nvidia-builder below,
-# which needs the toolchain-builder stage instead): the binaries this
-# stage produces — vmlinux, ttm.ko, drm_ttm_helper.ko — are never
-# copied into the final image and never loaded. They exist only to give
-# nvidia-builder a real Module.symvers to compile against, so which
-# compiler built them doesn't matter.
+# which needs the toolchain-builder stage instead): this stage compiles
+# no kernel code at all any more. `modules_prepare` generates headers and
+# builds host tools (scripts/, objtool) that never ship and never run on
+# the target, so which compiler produced them doesn't matter.
 #
 # The .config this stage reconciles is a different matter entirely: it
 # decides the layout of `struct module`, which every module compiled
@@ -199,11 +210,6 @@ RUN set -eux; \
 # merely sufficient to compile.
 # ---------------------------------------------------------------------
 FROM fedora:44 AS kernel-src-builder
-# openssl (the CLI, not just openssl-devel's headers/libs) is needed by
-# certs/Makefile's gen_key rule: the gaming variant's shipped .config
-# has CONFIG_MODULE_SIG_ALL=y (unset on standard), which makes `make
-# vmlinux` generate a self-signed certs/signing_key.pem via `openssl req`.
-#
 # dwarves (i.e. pahole) is not a nicety here — leaving it out silently
 # changes the module ABI. CONFIG_DEBUG_INFO_BTF `depends on
 # PAHOLE_VERSION >= 122`, and scripts/pahole-version.sh reports 0 when
@@ -217,19 +223,34 @@ FROM fedora:44 AS kernel-src-builder
 # pointing 24 bytes early, at source_list.prev. See README.md, "struct
 # module layout must match the running kernel".
 #
-# zlib-devel/libzstd-devel/pkgconf-pkg-config are in turn what keeping
-# CONFIG_DEBUG_INFO_BTF=y needs: `make vmlinux` then also builds
-# tools/bpf/resolve_btfids, which links libbpf (libelf + zlib + zstd).
+# Note that pahole is needed only so Kconfig keeps the option: nothing
+# here runs `pahole -J`. This stage no longer builds vmlinux at all (see
+# build-kernel-src.sh), which is why zlib/zstd/pkgconf — needed only to
+# build tools/bpf/resolve_btfids during that link — are gone.
+#
+# openssl (the CLI) stays, for a different reason than it was originally
+# added. It is no longer needed for certs/Makefile's gen_key rule, since
+# nothing links a vmlinux to sign, but certs/Kconfig probes the binary
+# directly:
+#
+#   config OPENSSL_SUPPORTS_ML_DSA
+#           def_bool $(success, openssl list -key-managers | grep -q ML-DSA-87)
+#
+# Without the CLI that comes out different from Dakota's own .config, and
+# build-kernel-src.sh's guard rightly refuses to build against a tree whose
+# configuration silently drifted. (Found by actually running the stage, not
+# by reading it.)
 RUN dnf install -y gcc make bison flex bc elfutils-libelf-devel \
         openssl openssl-devel perl findutils diffutils ncurses-devel \
-        dwarves zlib-devel libzstd-devel pkgconf-pkg-config \
-        git curl tar xz which hostname && \
+        dwarves git curl tar xz which hostname && \
     dnf clean all
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=kernel-headers /kernel-config /kernel-config
+COPY --from=kernel-headers /kernel-module-symvers /kernel-module-symvers
 COPY scripts/build-kernel-src.sh /build-kernel-src.sh
 RUN chmod +x /build-kernel-src.sh && \
-    /build-kernel-src.sh "$(cat /kernel-version)" /kernel-config /out
+    /build-kernel-src.sh "$(cat /kernel-version)" /kernel-config /out \
+        /kernel-module-symvers
 
 # ---------------------------------------------------------------------
 # libfprint-probe — locates the exact path of the libfprint shared
@@ -311,6 +332,7 @@ ENV PATH="/toolchain/bin:${PATH}"
 COPY --from=kernel-src-builder /out/ /kernel-src/
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=kernel-headers /kernel-module-abi.json /kernel-module-abi.json
+COPY scripts/kernel_elf.py /kernel_elf.py
 COPY scripts/module-abi.py /module-abi.py
 COPY scripts/build-nvidia.sh /build-nvidia.sh
 RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out
@@ -424,6 +446,16 @@ COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
+
+# Keeps fprintd resident (--no-timeout) instead of idle-exiting and
+# having to cold-reopen the Goodix 538d sensor on every fingerprint
+# verification — confirmed on real hardware to otherwise race GNOME
+# Shell's own verification timeout on a clockwork ~15-minute cadence
+# (every fingerprint-auth re-arm while the screen is locked). See
+# files/fprintd-no-timeout.conf and README.md, "Known limitations",
+# for the full chain from that timeout to the lock screen occasionally
+# showing no password/fingerprint prompt at all.
+COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
 
 # Kernel command-line args baked in via bootc's kargs.d mechanism
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc

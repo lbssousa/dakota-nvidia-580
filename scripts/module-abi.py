@@ -78,85 +78,9 @@ import os
 import struct
 import sys
 
-# ---------------------------------------------------------------------
-# Minimal little-endian ELF64 reader
-# ---------------------------------------------------------------------
-
-SHT_NOBITS = 8
-
-
-class Section:
-    __slots__ = ("index", "name", "_name_off", "type", "flags", "addr",
-                 "offset", "size", "link", "info", "entsize")
-
-
-class Elf:
-    def __init__(self, path):
-        self.path = path
-        self.f = open(path, "rb")
-        ident = self.f.read(16)
-        if ident[:4] != b"\x7fELF":
-            raise ValueError(f"{path}: not an ELF file")
-        if ident[4] != 2 or ident[5] != 1:
-            raise ValueError(f"{path}: only little-endian ELF64 is supported")
-        self.f.seek(16)
-        (_type, _machine, _version, _entry, _phoff, shoff, _flags, _ehsize,
-         _phentsize, _phnum, shentsize, shnum,
-         shstrndx) = struct.unpack("<HHIQQQIHHHHHH", self.f.read(48))
-
-        # A section count/name-index of 0/SHN_XINDEX means the real values
-        # live in section header 0 (ELF's escape hatch for >= 0xff00
-        # sections). vmlinux stays well under that, but honouring it costs
-        # three lines and avoids a mystifying failure if that ever changes.
-        first = self._read_shdr(shoff, shentsize, 0)
-        if shnum == 0:
-            shnum = first.size
-        if shstrndx == 0xFFFF:
-            shstrndx = first.link
-
-        self.sections = [self._read_shdr(shoff, shentsize, i)
-                         for i in range(shnum)]
-        shstrtab = self.raw(self.sections[shstrndx])
-        for sec in self.sections:
-            end = shstrtab.find(b"\0", sec._name_off)
-            sec.name = shstrtab[sec._name_off:end].decode("utf-8", "replace")
-
-    def _read_shdr(self, shoff, shentsize, i):
-        self.f.seek(shoff + i * shentsize)
-        (name_off, sh_type, flags, addr, offset, size, link, info,
-         _align, entsize) = struct.unpack("<IIQQQQIIQQ", self.f.read(64))
-        sec = Section()
-        sec.index, sec._name_off, sec.name = i, name_off, ""
-        sec.type, sec.flags, sec.addr = sh_type, flags, addr
-        sec.offset, sec.size = offset, size
-        sec.link, sec.info, sec.entsize = link, info, entsize
-        return sec
-
-    def raw(self, sec):
-        if sec.type == SHT_NOBITS or sec.size == 0:
-            return b""
-        self.f.seek(sec.offset)
-        return self.f.read(sec.size)
-
-    def find(self, name):
-        for sec in self.sections:
-            if sec.name == name:
-                return sec
-        return None
-
-    def symbol_names(self, symtab):
-        """Return the symbol names of `symtab`, indexed by symbol number."""
-        syms = self.raw(symtab)
-        strtab = self.raw(self.sections[symtab.link])
-        names = []
-        for off in range(0, len(syms), 24):
-            (name_off,) = struct.unpack_from("<I", syms, off)
-            end = strtab.find(b"\0", name_off)
-            names.append(strtab[name_off:end].decode("utf-8", "replace"))
-        return names
-
-    def close(self):
-        self.f.close()
+# The ELF reader lives in kernel_elf.py, shared with
+# gen-module-symvers.py, which reads the same two kinds of file.
+from kernel_elf import Elf  # noqa: E402  (kept beside the other imports)
 
 
 # ---------------------------------------------------------------------
