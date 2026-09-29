@@ -1,0 +1,226 @@
+name: Watch NVIDIA driver releases
+
+# Opens a PR when NVIDIA publishes a newer release in the driver branch
+# the Containerfile currently pins. Bumping WITHIN the branch is the
+# routine case this automates; changing branch is not (see the
+# `ARG NVIDIA_VERSION` comment in the Containerfile), so a newer branch
+# is reported and never proposed.
+#
+# The PR is the point: build.yml runs on `pull_request`, so the kmod is
+# actually compiled against both Dakota kernels — including
+# scripts/module-abi.py's loadability gate — before anything is merged.
+# Nothing here publishes an image.
+#
+# CI TRIGGERING: a PR created with the default GITHUB_TOKEN does not
+# trigger other workflows, so build.yml won't run on it. Set a repository
+# secret NVIDIA_WATCH_PR_TOKEN (a fine-grained PAT with `contents: write`
+# and `pull-requests: write` on this repo) to get that automatically.
+# Without it the PR still opens, and its body says to close/reopen it to
+# start CI.
+
+on:
+  schedule:
+    # NVIDIA publishes on no fixed cadence, so poll daily — at an hour
+    # that collides with neither build.yml (04:17) nor promote-stable
+    # (Sundays 06:00).
+    - cron: "23 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  NVIDIA_INDEX: "https://download.nvidia.com/XFree86/Linux-x86_64/"
+  NVIDIA_DOWNLOAD: "https://us.download.nvidia.com/XFree86/Linux-x86_64"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Which token pushes the bump branch is also what decides
+          # whether build.yml runs on the resulting PR — see the note at
+          # the top of this file.
+          token: ${{ secrets.NVIDIA_WATCH_PR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Find the newest release in the pinned branch
+        id: check
+        run: |
+          set -euo pipefail
+
+          # The Containerfile is the single source of truth for both the
+          # pinned version and, via its major, the branch to track — so
+          # this workflow needs no pin of its own to drift out of sync.
+          current="$(sed -n 's/^ARG NVIDIA_VERSION=//p' Containerfile | head -n1)"
+          if [ -z "$current" ]; then
+            echo "::error::Could not read ARG NVIDIA_VERSION from the Containerfile."
+            exit 1
+          fi
+          branch="${current%%.*}"
+          echo "Currently pinned: ${current} (branch ${branch})"
+
+          curl -fsSL --retry 3 --retry-delay 5 "$NVIDIA_INDEX" -o index.html
+
+          # NVIDIA's index is a directory listing whose release links look
+          # like <a href='580.178.04/'>. Both quote styles are accepted:
+          # the page has used double quotes and currently uses single
+          # ones, and since a silent parse failure here is indistinguishable
+          # from "NVIDIA never released anything again", an empty result is
+          # a hard error rather than a quiet no-op.
+          grep -oE "href=['\"][0-9]+\.[0-9]+(\.[0-9]+)?/['\"]" index.html \
+            | sed -E "s|href=['\"]||; s|/['\"]$||" \
+            | sort -uV > versions.txt
+
+          if [ ! -s versions.txt ]; then
+            echo "::error::Parsed zero versions out of ${NVIDIA_INDEX} — its format probably changed. Fix this workflow's parser instead of ignoring the silence."
+            exit 1
+          fi
+          echo "Parsed $(wc -l < versions.txt) published versions."
+
+          latest="$(grep -E "^${branch}\." versions.txt | tail -n1)" || latest=""
+          if [ -z "$latest" ]; then
+            echo "::error::No ${branch}.x releases in the index, yet ${current} is pinned — the parser or the branch assumption is wrong."
+            exit 1
+          fi
+          newest_branch="$(cut -d. -f1 versions.txt | sort -un | tail -n1)"
+
+          {
+            echo "### NVIDIA driver watch"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Pinned | \`${current}\` |"
+            echo "| Newest in branch ${branch} | \`${latest}\` |"
+            echo "| Newest branch published | \`${newest_branch}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          has_update=false
+          if [ "$latest" = "$current" ]; then
+            echo "Already on the newest ${branch}.x release."
+          elif [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)" != "$latest" ]; then
+            # Guards against a pin that is ahead of the index (a manual
+            # bump to something briefly unlisted, or a mirror hiccup).
+            echo "::warning::The newest listed ${branch}.x release (${latest}) sorts older than the pinned ${current}; not proposing a downgrade."
+          elif ! curl -fsI "${NVIDIA_DOWNLOAD}/${latest}/NVIDIA-Linux-x86_64-${latest}.run" -o /dev/null; then
+            # A release directory can appear before the x86_64 installer
+            # is actually in it. Opening a PR then costs a full CI run
+            # that 404s in build-nvidia.sh, so wait for the next poll.
+            echo "::warning::${latest} is listed but its x86_64 installer isn't downloadable yet; retrying on the next run."
+          else
+            has_update=true
+            echo "New release available: ${current} -> ${latest}"
+          fi
+
+          {
+            echo "has_update=${has_update}"
+            echo "current=${current}"
+            echo "latest=${latest}"
+            echo "branch=${branch}"
+            echo "newest_branch=${newest_branch}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.NVIDIA_WATCH_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          HAVE_PAT: ${{ secrets.NVIDIA_WATCH_PR_TOKEN != '' }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          LATEST: ${{ steps.check.outputs.latest }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          NEWEST_BRANCH: ${{ steps.check.outputs.newest_branch }}
+        run: |
+          set -euo pipefail
+          head="nvidia-driver/${LATEST}"
+
+          # Any earlier PR for this exact version — open, merged or
+          # closed — means it has already been seen. Without this check a
+          # version that was deliberately closed would be re-proposed
+          # every single day.
+          existing="$(gh pr list --head "$head" --state all \
+            --json number,state --jq '.[0] | select(.) | "#\(.number) (\(.state))"')"
+          if [ -n "$existing" ]; then
+            echo "Already proposed as ${existing}; nothing to do."
+            echo "\`${LATEST}\` was already proposed as ${existing}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$head"
+
+          # Anchored to the ARG line so it can't rewrite the explanatory
+          # comment above it, which also names version numbers.
+          sed -i "s|^ARG NVIDIA_VERSION=.*$|ARG NVIDIA_VERSION=${LATEST}|" Containerfile
+          if git diff --quiet -- Containerfile; then
+            echo "::error::The ARG NVIDIA_VERSION line did not change; refusing to open an empty PR."
+            exit 1
+          fi
+
+          git commit -qam "chore(nvidia): bump driver ${CURRENT} -> ${LATEST}"
+          # --force because the branch name is version-specific and owned
+          # by this workflow: a leftover branch from a run that pushed and
+          # then failed before opening its PR should just be replaced.
+          git push --force -u origin "$head"
+
+          cat > pr-body.md <<EOF
+          NVIDIA published \`${LATEST}\` in the ${BRANCH} branch; the Containerfile pinned \`${CURRENT}\`.
+
+          - Release notes: <https://download.nvidia.com/XFree86/Linux-x86_64/${LATEST}/README/>
+          - Supported GPUs in this release: <https://download.nvidia.com/XFree86/Linux-x86_64/${LATEST}/README/supportedchips.html>
+
+          ## What CI proves here
+
+          \`build.yml\` builds both the standard and gaming variants from this
+          branch. That includes \`scripts/module-abi.py\`, which fails the build
+          if the compiled modules' \`struct module\` layout doesn't match the
+          target kernel's — so a green build means these modules can actually
+          be *loaded*, not merely that they compiled. See "\`struct module\`
+          layout must match the running kernel" in the README.
+
+          ## What CI does not prove
+
+          - **No hardware test.** Nothing here runs the driver on a real GPU.
+          - **Version-specific workarounds.** \`build-nvidia.sh\` derives its
+            \`strncpy()\` shim targets by grepping the extracted source, so
+            that needs no manual re-derivation. The \`KCFLAGS\` diagnostic
+            demotions and the \`nvidia-installer\` flag list are still
+            hardcoded — if this version fails to build or to install on
+            either, re-check them against \`./nvidia-installer --help\` and
+            \`--advanced-options\` for this release.
+          EOF
+
+          if [ "$NEWEST_BRANCH" != "$BRANCH" ]; then
+            cat >> pr-body.md <<EOF
+
+          ## Note: a newer branch is published
+
+          NVIDIA also publishes a \`${NEWEST_BRANCH}.x\` branch. This watcher
+          never proposes a branch change: it would make the "${BRANCH}" in the
+          repo and image names wrong, and the kernel-7.x workarounds in
+          \`build-nvidia.sh\` would need re-deriving. That is a deliberate
+          manual decision — see the \`ARG NVIDIA_VERSION\` comment in the
+          Containerfile.
+          EOF
+          fi
+
+          if [ "$HAVE_PAT" != "true" ]; then
+            cat >> pr-body.md <<'EOF'
+
+          ---
+
+          **`build.yml` has not run on this PR.** It was created with the
+          default `GITHUB_TOKEN`, which by design does not trigger other
+          workflows. Close and reopen this PR to start CI, or add a
+          `NVIDIA_WATCH_PR_TOKEN` repository secret so future ones trigger it
+          automatically.
+          EOF
+          fi
+
+          url="$(gh pr create \
+            --title "chore(nvidia): bump driver ${CURRENT} -> ${LATEST}" \
+            --body-file pr-body.md \
+            --head "$head")"
+          echo "Opened ${url}"
+          echo "Opened ${url} to bump \`${CURRENT}\` -> \`${LATEST}\`." >> "$GITHUB_STEP_SUMMARY"

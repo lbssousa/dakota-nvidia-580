@@ -28,7 +28,15 @@
 # /usr/lib/modules/<kver>/config. See scripts/build-kernel-src.sh and
 # README.md for the full derivation and its residual risks.
 
-ARG NVIDIA_VERSION=580.173.02
+# Latest release of the 580 branch, which is what this repo is named
+# for and builds. Bumping WITHIN the branch is routine — the
+# .github/workflows/nvidia-driver-update.yml watcher opens a PR for it.
+# Changing the branch (590/595/610/615 are all published too, and still
+# list this repo's target Pascal GPUs as current) is not: it would make
+# the "580" in the repo and image names wrong, and the kernel-7.x
+# workarounds in scripts/build-nvidia.sh would need re-deriving. The
+# watcher therefore reports a newer branch without ever proposing it.
+ARG NVIDIA_VERSION=580.178.04
 ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 # Pinned to a tag, not a branch: a tag is an immutable, reviewed
 # release point, so bumping this value is a deliberate, visible change.

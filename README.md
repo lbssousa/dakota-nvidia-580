@@ -80,12 +80,23 @@ rolling tag since this repo has no `:next`/`:testing` split of its own:
 ## Status
 
 Both variants build and publish successfully end-to-end in CI
-(`.github/workflows/build.yml`). The container image builds, all four
+(`.github/workflows/build.yml`). The container image builds, all five
 NVIDIA kernel modules (`nvidia.ko`, `nvidia-uvm.ko`,
-`nvidia-modeset.ko`, `nvidia-drm.ko`) compile and link, and both images
-are signed with a valid SBOM attestation — see
+`nvidia-modeset.ko`, `nvidia-drm.ko`, `nvidia-peermem.ko`) compile and
+link, and both images are signed with a valid SBOM attestation — see
 ["Verification"](#verification) for how to check that yourself with
 `cosign verify`/`cosign verify-attestation`.
+
+Compiling was not enough, though: images built before the
+`struct module` fix produced modules that `insmod` rejected with
+`-ENOEXEC` on real hardware. The build now gates on
+`scripts/module-abi.py`, which compares each module's `struct module`
+layout against the target kernel's own BTF and fails the build on a
+mismatch, so a green CI run means the modules can be loaded — see
+["`struct module` layout must match the running
+kernel"](#struct-module-layout-must-match-the-running-kernel). **An
+image built before that fix needs rebuilding**; loading has not yet
+been re-confirmed on hardware with a post-fix image.
 
 Open items on real hardware, tracked in detail in ["Known
 limitations"](#known-limitations) below:
@@ -516,22 +527,32 @@ reconstructs itself from upstream source + the image's own shipped
   add a scoped `make path/to/that.ko` target — not a blanket `make
   modules`, which is prohibitively slow and memory-hungry against this
   `.config`.
-- **NVIDIA's legacy 580.xxx driver needs patches for kernel 7.x, and
-  the current fixes are pinned to driver 580.173.02** — re-derive them
-  if you bump `NVIDIA_VERSION`. `580.65.06` (the original pin) doesn't
-  compile against kernel 7.x at all. `build-nvidia.sh` applies:
+- **NVIDIA's legacy 580.xxx driver may need patches for kernel 7.x.**
+  The pin is `580.178.04`, the newest release in the 580 branch;
+  `580.65.06` (the original pin) doesn't compile against kernel 7.x at
+  all. `build-nvidia.sh` applies:
   - `KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion
-    -Wno-incompatible-pointer-types"` — GCC 14+ (Fedora 42, the build
-    stage) promotes these to hard errors unconditionally, not just via
+    -Wno-incompatible-pointer-types"` — GCC 14+ (the build stage)
+    promotes these to hard errors unconditionally, not just via
     `-Werror`; delivered via `KCFLAGS` since kernel 7.2.6's top-level
-    `Makefile` no longer reads `EXTRA_CFLAGS`.
-  - A small `strncpy()` → `sized_strscpy()` compatibility shim,
-    `#include`-injected into the exact source files that call it
-    (`nvidia/os-interface.c`, `nvidia/linux_nvswitch.c`,
-    `nvidia-uvm/uvm_pmm_gpu.c`, `nvidia-modeset/nvidia-modeset-linux.c`
-    — re-grep this list, `grep -rln '\bstrncpy(' kernel/nvidia*`, if
-    the version changes). `strncpy()` was fully removed from the
-    kernel's public string API on 7.x.
+    `Makefile` no longer reads `EXTRA_CFLAGS`. Kept even though
+    `580.178.04` no longer trips the first two, since they only demote
+    diagnostics and a later 580.x can reintroduce the pattern.
+  - A `strncpy()` → `sized_strscpy()` compatibility shim,
+    `#include`-injected into the files that call the old name
+    (`strncpy()` was removed from the kernel's public string API on
+    7.x). **Which files those are is derived at build time**, by
+    grepping the extracted source — it used to be a hardcoded list of
+    four and a documented chore on every version bump, and it shifts
+    between releases: `580.173.02` had four such files, `580.178.04`
+    has none at all, so on the current pin the shim is skipped
+    entirely.
+
+  What is still hardcoded, and therefore still worth a look when
+  `NVIDIA_VERSION` changes, is the `nvidia-installer` flag list
+  (`--advanced-options` output is not a stable interface across
+  branches). All thirteen flags this repo passes were re-confirmed
+  against `580.178.04`.
 - **`CONFIG_RUST` is force-disabled** in the reconstructed tree
   (`scripts/config --disable RUST` before `olddefconfig`). Both
   variants ship `CONFIG_RUST=y` for unrelated in-tree Rust drivers;
@@ -642,9 +663,10 @@ reconstructs itself from upstream source + the image's own shipped
   itself (the `goodixtls53xd` SIGFM matcher) — this image-build repo
   only bundles that fork's build output, so it can't fix this on its
   own; track/fix it in that repo instead.
-- **`nvidia-installer` flags** — checked against `--help`/
-  `--advanced-options` of recent versions, but they change between
-  branches. Re-validate before changing `NVIDIA_VERSION`.
+- **`nvidia-installer` flags** — they change between branches, so
+  they are re-validated against `--help`/`--advanced-options` on every
+  `NVIDIA_VERSION` change. All thirteen currently passed were confirmed
+  present in `580.178.04`.
 - **libfprint overwrite ABI assumption** — see the section above.
 - **pam-u2f's runtime dependency on a Homebrew-provided `libfido2` is
   unverified** — see ["How pam-u2f is
@@ -824,6 +846,40 @@ down to this repo's single rolling tag:
   should track; a rebuild happening on `:latest` doesn't affect a host
   already switched to `:stable` until the next weekly promotion picks
   it up.
+- **NVIDIA driver releases —
+  `.github/workflows/nvidia-driver-update.yml`.** Polls
+  [NVIDIA's Unix driver index](https://download.nvidia.com/XFree86/Linux-x86_64/)
+  daily (and on `workflow_dispatch`), and opens a PR bumping
+  `ARG NVIDIA_VERSION` when a newer release appears **in the branch
+  currently pinned**. It reads both the pinned version and — from its
+  major — the branch to track straight out of the `Containerfile`, so
+  it has no pin of its own to drift. Deliberate behaviors:
+  - **It never proposes a branch change.** NVIDIA publishes newer
+    branches (590/595/610/615 at the time of writing) which still list
+    this repo's target Pascal GPUs as current, but moving to one would
+    make the `580` in the repo and image names wrong and require
+    re-deriving the kernel-7.x workarounds. A newer branch is mentioned
+    in the PR body and the run summary, and left as a manual decision.
+  - **It won't downgrade**, and it won't propose a release whose
+    `x86_64` installer isn't downloadable yet (a release directory can
+    show up before the file `build-nvidia.sh` fetches is in it, and
+    that PR would just burn a CI run on a 404).
+  - **It won't nag.** A version already proposed — whether that PR was
+    merged or closed — is never proposed again.
+  - **A parse of zero versions is a hard failure**, not a quiet "no
+    news": the index's link format has changed before (double to single
+    quotes), and a silently broken parser looks exactly like NVIDIA
+    never releasing anything again.
+  - **`build.yml` runs on the PR**, which is the point — the kmod gets
+    compiled against both Dakota kernels, including
+    `scripts/module-abi.py`'s loadability gate, before anything merges.
+    For that to happen automatically the PR must be created by a real
+    token: GitHub deliberately does not trigger workflows from PRs made
+    with the default `GITHUB_TOKEN`. Add a `NVIDIA_WATCH_PR_TOKEN`
+    repository secret (a fine-grained PAT with `contents: write` and
+    `pull-requests: write` on this repo) and the workflow uses it; with
+    no such secret the PR still opens and says in its body to
+    close/reopen it to start CI.
 - `renovate.json5` tracks both base-image digests — `BASE_IMAGE`
   (`ghcr.io/projectbluefin/dakota:stable`) and `BASE_IMAGE_GAMING`
   (`ghcr.io/projectbluefin/dakota-gaming:stable`) — pinned in the
@@ -832,4 +888,6 @@ down to this repo's single rolling tag:
   rebuild, because a new base image can ship a new kernel and break
   the kmod until you confirm the build still passes. The two are kept
   separate because the gaming (OGC) kernel stream updates
-  independently of, and sometimes lags, the standard one.
+  independently of, and sometimes lags, the standard one. Renovate
+  handles the base images only; the NVIDIA driver has no Renovate
+  datasource, which is what the watcher above is for.

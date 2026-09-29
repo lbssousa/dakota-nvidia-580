@@ -8,7 +8,7 @@
 # hardcode here; capturing the real diff is more reliable.
 #
 # Usage: build-nvidia.sh <version> <kernel-src-root> <output>
-#   <version>          e.g. 580.173.02 (legacy branch — confirm at
+#   <version>          e.g. 580.178.04 (legacy branch — confirm at
 #                      https://www.nvidia.com/en-us/drivers/unix/
 #                      that it's the right version for your GPU before
 #                      pinning it; also confirm it's new enough to build
@@ -89,6 +89,14 @@ echo "==> Building the kmod against ${build_dir}..."
 # Epson's escpr driver for the identical GCC 14+ change (that build uses
 # autotools CFLAGS, not kbuild).
 #
+# Kept even though 580.178.04 no longer calls strncpy() at all (so the
+# first two of those three no longer have a trigger in this version):
+# they only demote diagnostics, `-Wno-incompatible-pointer-types` is
+# demoted by nvidia-drivers.bst upstream for its own reasons, and a
+# future 580.x can reintroduce the pattern. If NVIDIA's source ever
+# depends on one of these being an error, that's a compile failure, not
+# a silent miscompile.
+#
 # Delivered via KCFLAGS, not EXTRA_CFLAGS appended to kernel/Kbuild:
 # kernel 7.2.6's top-level Makefile only reads `KBUILD_CFLAGS +=
 # $(KCFLAGS)`, not EXTRA_CFLAGS.
@@ -126,21 +134,24 @@ static inline char *strncpy(char *dest, const char *src, size_t n)
 #endif
 EOF
 
-# The exact set of files calling strncpy() in this driver version —
-# found by grepping the extracted source, not guessed; re-check this
-# list (`grep -rln '\bstrncpy(' kernel/nvidia*`) whenever NVIDIA_VERSION
-# changes, since it can shift between driver releases.
-nv_strncpy_callers=(
-    kernel/nvidia/os-interface.c
-    kernel/nvidia/linux_nvswitch.c
-    kernel/nvidia-uvm/uvm_pmm_gpu.c
-    kernel/nvidia-modeset/nvidia-modeset-linux.c
-)
-for f in "${nv_strncpy_callers[@]}"; do
-    if [ -f "$f" ]; then
+# Which files call strncpy() is derived here, not hardcoded, because it
+# shifts between driver releases: 580.173.02 had four (nvidia/os-interface.c,
+# nvidia/linux_nvswitch.c, nvidia-uvm/uvm_pmm_gpu.c,
+# nvidia-modeset/nvidia-modeset-linux.c) and 580.178.04 has none at all —
+# NVIDIA moved them off the old name upstream. A hardcoded list rots
+# silently into either a pointless injection or a missed file, and
+# re-deriving it by hand was a documented chore on every version bump;
+# grepping for it makes the bump routine instead.
+mapfile -t nv_strncpy_callers < <(grep -rl '\bstrncpy(' kernel/nvidia* 2>/dev/null | sort)
+if [ "${#nv_strncpy_callers[@]}" -eq 0 ]; then
+    echo "==> No strncpy() callers in this driver version; skipping the compat shim."
+else
+    echo "==> Injecting the strncpy() -> sized_strscpy() shim into ${#nv_strncpy_callers[@]} file(s):"
+    printf '      %s\n' "${nv_strncpy_callers[@]}"
+    for f in "${nv_strncpy_callers[@]}"; do
         sed -i "1i #include \"${nv_strncpy_shim}\"" "$f"
-    fi
-done
+    done
+fi
 
 KCFLAGS="-Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types" \
 make -C kernel SYSSRC="${build_dir}" IGNORE_MISSING_MODULE_SYMVERS=1 modules
