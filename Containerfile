@@ -501,6 +501,32 @@ COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-no
 # showing no password/fingerprint prompt at all.
 COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
 
+# Makes a YubiKey that was already plugged in at boot visible to GnuPG
+# (`gpg --card-status`) without hand-restarting pcscd first. Replaces
+# the stock p11-kit module file registering OpenSC globally, whose own
+# FIXME-documented blacklist of desktop daemons is stale on current
+# Dakota, with a whitelist of command-line tools — no desktop daemon
+# can grab the card ahead of scdaemon's exclusive connect any more.
+# See files/opensc-p11-kit.module for the full diagnosis and README.md,
+# "Making the YubiKey visible to GnuPG at boot".
+COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
+
+# Guard for the COPY above: it only helps as long as the base image
+# still ships OpenSC and registers it nowhere else. If OpenSC ever
+# disappears from the base, the card contention disappears with it and
+# the override becomes dead weight to drop; if a second module file
+# starts registering opensc-pkcs11.so, the override is silently
+# bypassed through that one. Either way the build should say so rather
+# than ship something that quietly stopped doing its job.
+RUN set -eux; \
+    test -n "$(find /usr/lib /usr/lib64 -name 'opensc-pkcs11.so' -print -quit 2>/dev/null)"; \
+    others="$(grep -rlF 'opensc-pkcs11.so' /usr/share/p11-kit/modules \
+        | grep -vx '/usr/share/p11-kit/modules/opensc.module' || true)"; \
+    if [ -n "${others}" ]; then \
+        echo "OpenSC still registered by other p11-kit module file(s): ${others}" >&2; \
+        exit 1; \
+    fi
+
 # Kernel command-line args baked in via bootc's kargs.d mechanism
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
 # writes on every deployment, e.g. after `bootc switch`/`upgrade`).

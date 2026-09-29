@@ -472,7 +472,9 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha25
   └─→ final (FROM dakota-base again)
         COPY of all four /out trees (libfprint's overwrites the
         stock library in place; pam-u2f's adds new files alongside
-        it), nouveau blacklist, depmod + ldconfig -r, Epson
+        it), nouveau blacklist, p11-kit OpenSC whitelist (see
+        "Making the YubiKey visible to GnuPG at boot"),
+        depmod + ldconfig -r, Epson
         post-install steps (symlink, systemd enable, /etc/services
         entry), signing policy (scripts/configure-signing-policy.sh —
         see "Verification"), bootc container lint
@@ -592,6 +594,71 @@ comment in the `Containerfile` and ["Known
 limitations"](#known-limitations) below for why that's left to
 `brew install libfido2`, and why that hasn't been independently
 verified to actually resolve at runtime for a module living in `/usr`.
+
+## Making the YubiKey visible to GnuPG at boot
+
+With a YubiKey already plugged in when the machine boots,
+`gpg --card-status` reports no card at all — and keeps reporting none
+for the rest of the session, until `systemctl restart pcscd` is run by
+hand. The cause is not a pcscd/udev startup race (the first, wrong
+diagnosis, which is why
+[lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
+briefly shipped an `ExecStartPre=udevadm settle` drop-in and a udev
+rule restarting pcscd on every plug — both since removed). It is
+contention for *exclusive* access to the card:
+
+- GnuPG's `scdaemon` always connects `SCARD_SHARE_EXCLUSIVE`, which it
+  needs in order to unlock the card with the PIN without another
+  process injecting commands while it is unlocked.
+- The Dakota base registers OpenSC as a **global** p11-kit module
+  (`/usr/share/p11-kit/modules/opensc.module`), so any desktop daemon
+  touching NSS/PKCS#11 loads OpenSC, which opens the card via pcscd.
+- Whichever side gets there first at login wins. When it is a desktop
+  daemon, `scdaemon`'s exclusive connect fails, `journalctl -t pcscd`
+  shows `SCardConnect() Error Reader Exclusive`, and GnuPG stays
+  cardless — restarting pcscd "fixes" it only because that disconnects
+  *every* client at once, including whoever was holding the card.
+
+Upstream is aware: the stock module file carries a `FIXME` describing
+exactly this, and works around it with `disable-in:` naming five
+desktop daemons. That blacklist is stale on current Dakota, whose user
+session also runs `oo7-daemon` (the gnome-keyring replacement),
+`evolution-addressbook-factory`, `gnome-shell-calendar-server` and
+gsconnect's gjs daemon, none of them listed — and every daemon added
+upstream later reopens the hole. (Arch and NixOS escape this only by
+not installing and globally registering OpenSC at all; compare
+`p11-kit list-modules` there.)
+
+The final stage therefore replaces that file with
+`files/opensc-p11-kit.module`, which flips the blacklist into a
+whitelist: `enable-in:` lists only OpenSC's command-line tools
+(`opensc-tool`, `opensc-explorer`, `pkcs11-tool`, `pkcs15-tool`,
+`pkcs15-init`, `p11tool`), so no desktop daemon can load the module,
+and one added tomorrow is blocked without editing any list. A guard
+`RUN` next to the `COPY` fails the build if the base ever stops
+shipping OpenSC or starts registering it from a second module file,
+either of which would quietly make the override pointless.
+
+This is the same fix
+[`playbooks/dakota/yubikey.yml`](https://github.com/lbssousa/bluefin-initial-setup/blob/main/playbooks/dakota/yubikey.yml)
+(tag `yubikey-setup-pcscd`) applies at runtime for Dakota hosts not
+using this image, where it was verified on real hardware — it installs
+the same content as `/etc/pkcs11/modules/opensc.module`. Shipping it in
+`/usr` here leaves that `/etc` override free for the user; a host that
+ran the playbook and then switched to this image can delete its copy
+(the two are equivalent, so keeping it changes nothing either way).
+
+To verify on a running host — after a reboot with the YubiKey already
+plugged in, and **without** touching pcscd:
+
+```bash
+p11-kit list-modules     # must NOT list "module: opensc"
+opensc-tool --atr        # must still read the card
+gpg --card-status        # must still see the card
+```
+
+(`p11-kit` itself is deliberately left out of `enable-in`, which is
+what makes the first command a meaningful check.)
 
 ## How the NVIDIA userspace libraries are installed
 
@@ -957,6 +1024,16 @@ reconstructs itself from upstream source + the image's own shipped
   `libfido2.so.1` at runtime depends entirely on how Homebrew itself
   gets installed/registered on the running host. Re-verify with `ldd`
   against the real host before relying on this for login/`sudo`.
+- **PKCS#11 smartcard login in GUI programs is switched off** — the
+  `enable-in` whitelist described in ["Making the YubiKey visible to
+  GnuPG at boot"](#making-the-yubikey-visible-to-gnupg-at-boot) keeps
+  every desktop program, not just the daemons that cause the card
+  contention, from loading OpenSC's PKCS#11 module. Authenticating to
+  a site or service with a PIV/CAC certificate in Firefox/Chromium
+  therefore stops working until that program is added to `enable-in`
+  in `files/opensc-p11-kit.module`. Deliberate: the YubiKey on this
+  machine is used for the OpenPGP card (via `scdaemon`) and FIDO2/U2F
+  (via `pam_u2f`/`libfido2`), neither of which goes through PKCS#11.
 - **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
   scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
   in the image; see the pam-u2f bullet near the top of this README.

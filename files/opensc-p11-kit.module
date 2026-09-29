@@ -1,0 +1,71 @@
+# Replaces the stock /usr/share/p11-kit/modules/opensc.module shipped in
+# the Dakota base image, turning OpenSC's global PKCS#11 registration
+# from an (incomplete) blacklist into a whitelist.
+#
+# Why: with a YubiKey plugged in at boot, `gpg --card-status` reports no
+# card at all, and keeps reporting none until `systemctl restart pcscd`
+# is run by hand. That is not a pcscd/udev startup race (an earlier
+# diagnosis, and the reason bluefin-initial-setup once shipped an
+# `ExecStartPre=udevadm settle` drop-in plus a udev rule restarting
+# pcscd on every plug — both wrong, both since removed). It is
+# contention for *exclusive* access to the card:
+#
+#   1. GnuPG's scdaemon always connects in SCARD_SHARE_EXCLUSIVE; it
+#      needs that to unlock the card with the PIN without another
+#      process injecting commands while it is unlocked.
+#   2. This base image registers OpenSC as a *global* p11-kit module,
+#      so any desktop daemon that touches NSS/PKCS#11 loads OpenSC,
+#      which opens the card through pcscd.
+#   3. Whoever gets there first during login wins. When that is a
+#      desktop daemon via OpenSC, scdaemon's exclusive connect fails,
+#      pcscd logs
+#        pcscd: ../src/winscard.c:281:SCardConnect() Error Reader Exclusive
+#      and GnuPG stays cardless until something drops the other client
+#      — which is exactly what restarting pcscd does (it disconnects
+#      every client at once).
+#
+# Upstream knows: the file this one replaces carries a FIXME describing
+# precisely this, and prescribes the blacklist below as the workaround:
+#
+#   disable-in: goa-daemon gsd-smartcard evolution-source-registry \
+#               evolution-calendar-factory gnome-shell
+#
+# That list is stale on current Dakota/Bluefin, where the user session
+# also runs oo7-daemon (the gnome-keyring replacement),
+# evolution-addressbook-factory, gnome-shell-calendar-server and
+# gsconnect's gjs daemon — none of them listed. Every new desktop
+# daemon reopens the hole. (Arch/NixOS escape this only by not
+# installing and globally registering OpenSC in the first place;
+# compare `p11-kit list-modules` there.)
+#
+# So: `enable-in` instead of `disable-in`. OpenSC's module is loaded
+# only by the command-line tools below — programs that run when the
+# user invokes them, never a daemon — and a desktop daemon added
+# upstream tomorrow is blocked without editing any list.
+#
+# The cost: logging into a site or service with a PKCS#11 certificate
+# (a PIV/CAC smartcard in Firefox/Chromium, say) stops working until
+# that program is added to enable-in below. Not a loss on this machine:
+# the YubiKey here serves the OpenPGP card (scdaemon, which does not
+# use PKCS#11) and FIDO2/U2F (pam_u2f/libfido2, which does not either).
+#
+# Verify on a running host, after a reboot with the YubiKey already
+# plugged in and *without* touching pcscd:
+#
+#   p11-kit list-modules     # must NOT list "module: opensc"
+#   opensc-tool --atr        # must still read the card
+#   gpg --card-status        # must still see the card
+#
+# (`p11-kit` itself is deliberately left out of enable-in, which is
+# what makes the first command a meaningful check. `journalctl -t pcscd`
+# showing "Error Reader Exclusive" again means something still holds
+# the card.)
+#
+# Ported from bluefin-initial-setup, which installs the same content at
+# runtime as /etc/pkcs11/modules/opensc.module
+# (playbooks/templates/opensc-p11-kit.module.j2, tag
+# yubikey-setup-pcscd) for Dakota hosts not using this image. Shipping
+# it in /usr here leaves that /etc override free for the user; hosts
+# that ran the playbook and now boot this image can delete their copy.
+module: opensc-pkcs11.so
+enable-in: opensc-tool opensc-explorer pkcs11-tool pkcs15-tool pkcs15-init p11tool
