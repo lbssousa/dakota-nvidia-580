@@ -1,0 +1,62 @@
+[Unit]
+Description=Create NVIDIA device nodes
+Documentation=man:nvidia-modprobe(1) https://download.nvidia.com/XFree86/Linux-x86_64/580.178.04/README/appendices/DeviceNodes.html
+
+# systemd-modules-load.service is what pulls nvidia, nvidia-modeset,
+# nvidia-drm and nvidia-uvm in, in order — see
+# files/nvidia-modules-load.conf. Ordering against it, rather than
+# against the modules themselves, is the only guarantee available:
+# nvidia-modprobe loads the module itself if it isn't resident yet,
+# but /proc/driver/nvidia/gpus (which the per-GPU loop below reads) is
+# only populated once nvidia.ko has finished probing, and that is what
+# we are actually branching on.
+After=systemd-modules-load.service
+
+# The whole reason this unit exists. gnome-shell runs unprivileged, and
+# libEGL_nvidia/libnvidia-glsi only try to mknod /dev/nvidiactl and,
+# failing that, exec /usr/bin/nvidia-modprobe — which only works if
+# that binary is setuid root. This image deliberately does not make it
+# setuid (see build-nvidia.sh), so the nodes have to already exist
+# before the greeter's first EGL init. Without them Mutter gets a NULL
+# cogl_renderer and segfaults, which is the symptom README.md records
+# under "How the NVIDIA userspace libraries are installed".
+#
+# Note this bites hardest exactly where it is least obvious: on a
+# hybrid laptop where the Intel iGPU is primary, the desktop should be
+# renderable on Intel alone, so "no /dev/nvidia*" reads like an
+# offload-only problem. It is not — 10_nvidia.json in
+# /etc/glvnd/egl_vendor.d (which build-nvidia.sh installs precisely so
+# hybrid systems work) makes libglvnd load libEGL_nvidia.so.0 in every
+# session, including the Intel-rendered one, and a registered EGL
+# vendor that cannot open /dev/nvidiactl is what turns into the NULL
+# renderer.
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# One -c per GPU. /proc/driver/nvidia/gpus has one entry per device, so
+# this scales to multi-GPU boards instead of assuming index 0.
+# "-" prefixed steps tolerate absent hardware / module, so this unit
+# succeeds (and stays out of `systemctl --failed`) on a machine with
+# no NVIDIA GPU at all, which matters because it's enabled by preset.
+ExecStart=/bin/sh -c 'n=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l); i=0; while [ "$i" -lt "$n" ]; do /usr/bin/nvidia-modprobe -c "$i"; i=$((i+1)); done'
+# -u loads nvidia-uvm and creates its nodes; -c 0 creates the base and
+# tools nodes as a fallback for the loop above (e.g. if nvidia.ko was
+# loaded after this point raced us). Both are needed: without -u there
+# is no /dev/nvidia-uvm, so CUDA is dead even with the display working.
+ExecStart=-/usr/bin/nvidia-modprobe -u -c 0
+# -m loads the NVLink/shm state; harmless to skip, which is why it's
+# prefixed with -.
+ExecStart=-/usr/bin/nvidia-modprobe -m
+# Bounded wait for the resource manager to start accepting clients.
+# nvidia-modprobe returning success only means the nodes exist — the
+# NVIDIA RM still has to finish GSP init before libEGL_nvidia will
+# talk to it, and the greeter's EGL init races that. Ten seconds is
+# plenty on real hardware; the loop exits the unit cleanly either way
+# rather than blocking the display manager forever.
+ExecStart=-/bin/sh -c '[ -n "$(ls /proc/driver/nvidia/gpus 2>/dev/null)" ] || exit 0; i=0; while [ "$i" -lt 50 ]; do /usr/bin/nvidia-smi -L >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 0.2; done'
+
+[Install]
+WantedBy=multi-user.target

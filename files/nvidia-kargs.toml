@@ -2,4 +2,16 @@ kargs = [
     "rd.driver.blacklist=nouveau",
     "modprobe.blacklist=nouveau",
     "nvidia-drm.modeset=1",
+    "nvidia-drm.fbdev=1",
+    # simpledrm claims the framebuffer inside the initramfs, before
+    # pivot_root, and nvidia-drm then cannot attach — symptom is a black
+    # screen. /usr/lib/modprobe.d/blacklist-nouveau.conf does NOT help
+    # here because the GNOME OS initramfs is built upstream without
+    # knowledge of NVIDIA, so it never consults our modprobe.d. All
+    # three reference implementations carry this argument for that
+    # reason: projectbluefin/dakota's nvidia-kargs.bst (10-nvidia.toml),
+    # negativo17's nvidia-boot-update (CMDLINE_ARGS_ALWAYS_REMOVE), and
+    # BlueBuild's setdrmvariables.sh. Bazzite gets the equivalent effect
+    # from dracut's force_drivers in build_files/install-nvidia.
+    "initcall_blacklist=simpledrm_platform_driver_init",
 ]

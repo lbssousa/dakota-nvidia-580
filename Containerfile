@@ -504,6 +504,41 @@ COPY --from=pam-u2f-builder /out/usr/ /usr/
 # COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
+# Module options for nvidia.ko / nvidia-drm.ko, applied at load time.
+# The PreserveVideoMemoryAllocations pair is what makes the suspend /
+# hibernate units installed by build-nvidia.sh actually do something —
+# without it /proc/driver/nvidia/suspend never exists, the driver vetoes
+# kernel PM outright (nv_pmops_suspend returns -5) and the machine
+# cannot sleep at all. Same content negativo17's nvidia-kmod-common RPM
+# ships and projectbluefin/dakota ships, i.e. what Bazzite, Bluefin and
+# BlueBuild all end up with via that RPM.
+COPY files/nvidia-driver-params.conf /usr/lib/modprobe.d/nvidia.conf
+
+# Explicit, ordered load of nvidia / nvidia-modeset / nvidia-drm /
+# nvidia-uvm. Without this the modules only come in as a side effect of
+# the `nvidia-drm.modeset=1` karg (the kernel's unknown_bootoption path
+# calls request_module on it), which leaves the load order up to
+# nvidia-drm.ko's depends= list and never loads nvidia-uvm at all.
+COPY files/nvidia-modules-load.conf /usr/lib/modules-load.d/nvidia.conf
+
+# Creates /dev/nvidia* before GDM. The load-bearing fix for the missing
+# graphical environment: gnome-shell is unprivileged and cannot mknod,
+# and nvidia-modprobe is deliberately not setuid here, so the nodes have
+# to exist before the greeter's first EGL init. Same unit (and preset
+# convention) as projectbluefin/dakota's nvidia-device-nodes.bst.
+COPY files/nvidia-device-nodes.service /usr/lib/systemd/system/nvidia-device-nodes.service
+
+# udev equivalent, for the case the systemd unit can't cover: an
+# unprivileged (rootless) container asking for the GPU has no privilege
+# to mknod and nvidia.ko never creates the nodes. Ported from
+# negativo17/nvidia-kmod-common's 60-nvidia.rules, the RPM that
+# Bazzite, Bluefin and BlueBuild all install.
+COPY files/60-nvidia.rules /usr/lib/udev/rules.d/60-nvidia.rules
+
+# Enables the above plus the suspend/hibernate/resume units, via
+# systemd's preset mechanism rather than a baked enable symlink tree.
+COPY files/80-nvidia.preset /usr/lib/systemd/system-preset/80-nvidia.preset
+
 # Keeps fprintd resident (--no-timeout) instead of idle-exiting and
 # having to cold-reopen the Goodix 538d sensor on every fingerprint
 # verification — confirmed on real hardware to otherwise race GNOME
@@ -543,16 +578,30 @@ COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-no
 # Kernel command-line args baked in via bootc's kargs.d mechanism
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
 # writes on every deployment, e.g. after `bootc switch`/`upgrade`).
-# This is the actual fix for nouveau grabbing the GPU before nvidia.ko
-# ever gets a chance to: the modprobe.d blacklist above only takes
-# effect once /usr is mounted, but nouveau binds the PCI device
-# earlier, inside the initramfs (dracut honors rd.driver.blacklist=
-# from the kernel command line at that stage; `rhgb quiet` triggers
-# early KMS, which is what races nvidia.ko). See files/nvidia-kargs.toml
-# and README.md. Kargs only take effect on deployments created after
-# this file lands in the image — a fresh `bootc switch`/`upgrade` is
-# required, not just a reboot.
-COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia-blacklist-nouveau.toml
+#
+# Two separate things, both only fixable from here:
+#
+# 1. nouveau grabbing the GPU before nvidia.ko ever gets a chance to:
+#    the modprobe.d blacklist only takes effect once /usr is mounted,
+#    but nouveau binds the PCI device earlier, inside the initramfs
+#    (dracut honors rd.driver.blacklist= from the kernel command line
+#    at that stage; `rhgb quiet` triggers early KMS, which is what
+#    races nvidia.ko).
+#
+# 2. simpledrm claiming the framebuffer inside the initramfs, before
+#    pivot_root, after which nvidia-drm cannot attach at all — symptom
+#    is a black screen. initcall_blacklist= is the only lever, because
+#    the GNOME OS initramfs is built upstream without knowledge of
+#    NVIDIA and never consults our /usr/lib/modprobe.d. All three
+#    reference implementations carry this argument for exactly that
+#    reason: projectbluefin/dakota's nvidia-kargs.bst,
+#    negativo17's nvidia-boot-update (CMDLINE_ARGS_ALWAYS_REMOVE), and
+#    BlueBuild's setdrmvariables.sh.
+#
+# See files/nvidia-kargs.toml and README.md. Kargs only take effect on
+# deployments created after this file lands in the image — a fresh
+# `bootc switch`/`upgrade` is required, not just a reboot.
+COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia.toml
 
 # Rewrite this downstream image's identity into /etc/os-release,
 # overwriting the upstream Dakota base's own IMAGE_NAME/IMAGE_VENDOR/

@@ -107,7 +107,6 @@ been re-confirmed on hardware with a post-fix image.
 
 Two changes since then are also awaiting that same confirmation, and
 they are the first thing to suspect if a fresh image misbehaves:
-
 - The modules are now built with **Fedora's GCC/binutils** rather than a
   from-source toolchain matched to Dakota's kernel. Every check the build
   can make says the two are indistinguishable, but codegen is unobserved
@@ -116,8 +115,16 @@ they are the first thing to suspect if a fresh image misbehaves:
 - `Module.symvers` is now **derived from the image's own binaries**
   instead of produced by compiling the kernel. Validated against
   `System.map` and `depmod`'s `modules.symbols`, with every difference
-  accounted for — see ["Deriving `Module.symvers` instead of compiling
-  the kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel).
+  accounted for — see ["Deriving `Module.symvers` instead of compiling the
+  kernel"](#deriving-modulesymvers-instead-of-compiling-the-kernel).
+- `nvidia-modprobe` is no longer suppressed, and `/dev/nvidia*` is now
+  created before the display manager starts. This is the change that
+  most plausibly explains a previous image booting to no graphical
+  session, and it too is unobserved on hardware — see
+  ["Why the graphical environment needs
+  `nvidia-modprobe`"](#why-the-graphical-environment-needs-nvidia-modprobe)
+  for the reasoning and for how to confirm it on a real machine.
+
 
 Open items on real hardware, tracked in detail in ["Known
 limitations"](#known-limitations) below:
@@ -725,20 +732,53 @@ requires specific integration steps performed by `build-nvidia.sh`:
 - **EGL vendor configuration (`10_nvidia.json`)**: Dakota's `libEGL.so.1`
   scans `/etc/glvnd/egl_vendor.d` and `/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d`,
   never `/usr/share/glvnd/egl_vendor.d` (where `nvidia-installer` puts it).
-  `build-nvidia.sh` copies `10_nvidia.json` into `/etc/glvnd/egl_vendor.d/` so
-  `libglvnd` can discover the NVIDIA driver. Without this, Mutter fails to initialize
-  EGL on `/dev/dri/card0` and segfaults on NULL `cogl_renderer`.
-- **GBM backend placement (`nvidia-drm_gbm.so`)**: Mesa's `libgbm.so.1` searches
-  `/usr/lib/x86_64-linux-gnu/GL/lib/gbm` (a symlink to `../default/lib/gbm`).
-  `build-nvidia.sh` links `nvidia-drm_gbm.so` into `/usr/lib/x86_64-linux-gnu/GL/default/lib/gbm/`
-  using `ln -srf`. This makes it visible to `libgbm` without shadowing Mesa's `dri_gbm.so`
-  on hybrid systems (Intel + NVIDIA).
+  `build-nvidia.sh` installs `10_nvidia.json` into `/etc/glvnd/egl_vendor.d/`
+  so `libglvnd` can discover the NVIDIA driver. Same placement, and same
+  reason, as `projectbluefin/dakota`'s `nvidia-drivers.bst` — which
+  carries an `Upstream-Status: not-submitted` marker, because
+  freedesktop-sdk compiles its `libglvnd` with `datadir=${libdir}/GL` and
+  so will never search `/usr/share`. See the caveat in
+  [Why the graphical environment needs `nvidia-modprobe`](#why-the-graphical-environment-needs-nvidia-modprobe)
+  for what breaks when this file is present but the driver can't work.
+- **GBM backend placement (`nvidia-drm_gbm.so`)**: Mesa's `libgbm.so.1`
+  has its backend directory compiled in — `/usr/lib/x86_64-linux-gnu/GL/lib/gbm`,
+  a symlink to `../default/lib/gbm`. `build-nvidia.sh` reads the
+  `GBM_BACKEND_LIB_SYMLINK` rows out of the payload's `.manifest` and
+  links them into `/usr/lib/x86_64-linux-gnu/GL/default/lib/gbm/`, which
+  is the same directory by another name. This makes the backend visible to
+  `libgbm` without shadowing Mesa's `dri_gbm.so` on hybrid systems
+  (Intel + NVIDIA).
+
+  Two things worth knowing about this one. It used to use `ln -srf`,
+  where `-r` is `--relative`, not "recursive" — that silently rewrote the
+  target into a chain of `../../..` that happened to resolve back to the
+  same file and would break the moment anything moved; it's `ln -sfn`
+  against an absolute path now. And `ldconfig` cannot paper over a
+  missing entry: it only caches files whose name starts with `lib`, so
+  `dri_gbm.so` and `nvidia-drm_gbm.so` never appear in `/etc/ld.so.cache`
+  regardless of `/etc/ld.so.conf.d`. (Both facts verified against the
+  base image's own binaries rather than assumed.)
 - **EGL external platforms (`10_nvidia_wayland.json`, `15_nvidia_gbm.json`)**:
-  Mirrored to `/etc/egl/egl_external_platform.d/` and `GL/default/egl/egl_external_platform.d/`.
-- **Device node handling (`--no-nvidia-modprobe`)**: The installer's setuid
-  `nvidia-modprobe` binary is omitted; module loading and parameters are handled
-  cleanly via `/usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf` and
-  `/usr/lib/bootc/kargs.d/30-nvidia-blacklist-nouveau.toml`.
+  left where `nvidia-installer` puts them, in
+  `/usr/share/egl/egl_external_platform.d/`. `build-nvidia.sh` used to
+  mirror them into `/etc/egl/egl_external_platform.d/` and
+  `GL/default/egl/egl_external_platform.d/`; both copies were inert,
+  because this base image's `libEGL.so.1.1.0` contains no
+  external-platform search path at all (same `strings` check as above).
+  They're still asserted on, so a future payload that stops shipping them
+  fails the build rather than regressing silently.
+- **Vulkan ICD**: `/usr/share/vulkan/icd.d/nvidia_icd.json` only.
+  `build-nvidia.sh` used to also copy it into `/etc/vulkan/icd.d/`,
+  which is not "extra safety" — the Vulkan loader scans
+  `/etc/vulkan/icd.d` and `/usr/share/vulkan/icd.d` independently, so a
+  duplicate registers the same physical GPU twice. (For the same class of
+  collision, Bazzite's `build_files/install-nvidia` deletes
+  `/usr/share/vulkan/icd.d/nouveau_icd.*.json`.)
+- **Suspend/hibernate units**: `nvidia-installer` ships
+  `systemd/system/nvidia-{suspend,resume,hibernate,suspend-then-hibernate}.service`,
+  `systemd/nvidia-sleep.sh` and `systemd/system-sleep/nvidia` in the
+  payload but does not install them, so `build-nvidia.sh` does. They're
+  load-bearing, not cosmetic — see below.
 
 Separately, `build-nvidia.sh`'s file-diff (still filesystem-diff
 based, not a hardcoded manifest — see the script's own header comment)
@@ -753,6 +793,137 @@ them after the fact — which only works at all once the real files are
 somewhere that command actually scans, and doesn't cover
 non-SONAME symlinks the installer creates (e.g. its own
 `/usr/lib/libGL.so.1` compatibility shim) either way.
+
+That diff also used to write its three list files to `/tmp/`, which made
+them self-referential: `find / -xdev` sees `/tmp` too, so `after.list`
+listed itself (the shell creates it via the redirect before `find` runs)
+while `before.list` did not, `comm -13` classified it as a new file, and
+the image shipped a stray `/tmp/after.list`. They live in the script's
+`mktemp -d` workdir now.
+
+`build-nvidia.sh` additionally fails the build if any installed NVIDIA
+ELF has an NVIDIA-internal `DT_NEEDED` (`libnvidia-*`, `libcuda.so*`,
+`libnvcuvid.so*`, `libnvoptix.so*`) that isn't present in the library
+directory. Every one of those is `dlopen`'d by bare soname, so a library
+a newly split-out module depends on but the installer's manifest
+selection didn't ship fails only at run time, inside a compositor, as an
+unexplained EGL init error. Same check `projectbluefin/dakota` runs.
+
+## Why the graphical environment needs `nvidia-modprobe`
+
+This is the part that took the longest to get right, and the part whose
+absence made an earlier image of this repo boot to no graphical session
+at all. It's worth writing down because the failure is very
+counter-intuitive on a hybrid laptop.
+
+**NVIDIA's kernel modules do not create their own device nodes.** Per
+NVIDIA's own `README/appendices/DeviceNodes.html`, `/dev/nvidiactl` and
+`/dev/nvidia0..N` "must exist" for anything to talk to the driver, and
+they are normally created by either the X driver (running inside a setuid
+root X server) or by calling the setuid-root `nvidia-modprobe` utility —
+the same document says explicitly that a compositor such as
+`gnome-shell`, running as a normal user inside Wayland, is *not* in that
+list. Where a distribution packages the driver as RPMs, it ships
+`nvidia-modprobe` plus a rule that calls it as root from udev; where it
+doesn't, it has to provide an equivalent by hand.
+
+This repo previously passed `--no-nvidia-modprobe`, on the reasoning —
+recorded in this file until recently — that module loading and parameters
+were "handled cleanly via `/usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf`
+and `/usr/lib/bootc/kargs.d/*.toml`". That reasoning was wrong, and worth
+dissecting because both of those files are genuinely load-bearing for
+something else:
+
+- `nvidia-blacklist-nouveau.conf` stops nouveau from claiming the
+  discrete GPU. It has nothing to do with creating device nodes.
+- the kargs stop nouveau (and `simpledrm`) from claiming the GPU inside
+  the initramfs. The kernel's `unknown_bootoption()` path is what
+  turns `nvidia-drm.modeset=1` into a `request_module()` call, so the
+  modules *do* get loaded — which is exactly why the symptom is so
+  confusing — but no user-space component ever runs.
+
+So the modules load, `nvidia-drm.ko` registers a second `/dev/dri/card*`
+with KMS enabled, and nothing ever creates `/dev/nvidiactl`.
+
+**Why that takes down the desktop when the Intel GPU is primary.** The
+naive reading is "no `/dev/nvidia*` breaks NVIDIA, the desktop renders on
+Intel, so it should be fine." It isn't, because of `10_nvidia.json`:
+that file exists precisely so hybrid systems work — it makes `libglvnd`
+load `libEGL_nvidia.so.0` alongside Mesa's `libEGL_mesa.so.0`. So
+`libEGL_nvidia.so.0` gets `dlopen`'d in *every* session, including the
+Intel-rendered one, and then cannot open `/dev/nvidiactl`. A registered
+EGL vendor that can't initialise is what turns into the NULL
+`cogl_renderer` segfault in `gnome-shell` described above. In other
+words, the fix for "libglvnd doesn't know about the NVIDIA driver" and
+the cause of "libglvnd can't use the NVIDIA driver" were pointing at the
+same file, and only removing `--no-nvidia-modprobe` makes the first one
+true without causing the second.
+
+The reference implementations all avoid this by never separating the two:
+
+- **Bazzite / Bluefin / BlueBuild** install
+  `negativo17/nvidia-kmod-common`, whose `60-nvidia.rules` is
+  `ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000|0x030200", RUN+="/usr/bin/nvidia-modprobe -u -c 0"`
+  — triggered on the PCI device appearing, not on a display server
+  starting, with a comment that spells out the intent ("cover the
+  Wayland/EGLStream and compute case without a started display"). They
+  also flip dracut's `omit_drivers` to `force_drivers` and prepend the
+  iGPU, "else chromium web browsers fail to use hardware acceleration".
+- **`projectbluefin/dakota`** installs `nvidia-modprobe` at mode `0755`
+  (deliberately *not* setuid, with the comment "no unprivileged process
+  needs it") and drives it from a `Type=oneshot` unit,
+  `nvidia-device-nodes.service`, ordered `After=systemd-modules-load.service
+  Before=display-manager.service`.
+
+This repo now does the same thing, using Dakota's mechanism and
+Fedora's rule, because they cover complementary cases:
+
+- [`files/nvidia-device-nodes.service`](files/nvidia-device-nodes.service)
+  → `/usr/lib/systemd/system/nvidia-device-nodes.service`. The
+  load-bearing one: ordered before GDM, so the nodes exist before the
+  greeter's first EGL init. One `nvidia-modprobe -c N` per entry in
+  `/proc/driver/nvidia/gpus` (so multi-GPU boards work), then
+  `-u -c 0` for the UVM nodes, then `-m`, then a bounded 10-second wait
+  for `nvidia-smi -L` — `nvidia-modprobe` returning success only means
+  the nodes exist, and the greeter's EGL init otherwise races the
+  resource manager's GSP boot.
+- [`files/60-nvidia.rules`](files/60-nvidia.rules) →
+  `/usr/lib/udev/rules.d/60-nvidia.rules`. Ported from the RPM above, for
+  the case the systemd unit can't cover: an unprivileged (rootless)
+  container asking for the GPU has no privilege to `mknod`, and
+  `nvidia.ko` never creates the nodes for it.
+- [`files/80-nvidia.preset`](files/80-nvidia.preset) enables both, plus
+  the sleep units, via systemd presets rather than a baked
+  `systemctl enable` symlink tree — which is how all three
+  implementations ship theirs too.
+
+`build-nvidia.sh` now hard-fails if `nvidia-modprobe` is missing from the
+installer's output, and strips the setuid bit if it's set.
+
+### Module load order and suspend/resume
+
+Two smaller pieces that the RPM-based images also get and this repo was
+missing:
+
+- [`files/nvidia-modules-load.conf`](files/nvidia-modules-load.conf) →
+  `/usr/lib/modules-load.d/nvidia.conf`, loading `nvidia`,
+  `nvidia-modeset`, `nvidia-drm`, `nvidia-uvm` explicitly and in order.
+  Relying on the karg-triggered `request_module()` path instead leaves
+  the order up to `nvidia-drm.ko`'s `depends=` list, and never loads
+  `nvidia-uvm` at all — so `/dev/nvidia-uvm` doesn't appear and CUDA is
+  dead even when the display works.
+- [`files/nvidia-driver-params.conf`](files/nvidia-driver-params.conf) →
+  `/usr/lib/modprobe.d/nvidia.conf`, same content the RPM ships.
+  `NVreg_PreserveVideoMemoryAllocations=1` is what makes
+  `files/nvidia-sleep.sh` (installed by `build-nvidia.sh` along with
+  the four units and the `system-sleep/nvidia` hook) able to do anything:
+  without it `/proc/driver/nvidia/suspend` never exists, GPU context is
+  lost on resume, and the driver vetoes kernel PM outright
+  (`nv_pmops_suspend` returns `-5`) so the machine can't sleep at all.
+  `NVreg_TemporaryFilePath=/var/tmp` matters because the default `/tmp`
+  is tmpfs on this image, which would page the GPU's whole VRAM into RAM
+  on every suspend.
+
 
 ## Optional: reverting Bluefin's GNOME desktop tweaks
 

@@ -1,0 +1,36 @@
+# Create /dev/nvidia* (and /dev/nvidia-uvm*) from udev, as a fallback for
+# the systemd unit in nvidia-device-nodes.service and as the mechanism
+# that covers unprivileged containers.
+#
+# nvidia-device-nodes.service is the load-bearing one: it is ordered
+# Before=display-manager.service, so the nodes exist before the greeter's
+# first EGL init. This rule exists for the case that unit cannot cover —
+# an unprivileged (rootless) container asking for the GPU has no
+# privilege to mknod, and nvidia.ko never creates these nodes for it.
+# Hence: create them once, from udev, when the PCI device shows up.
+#
+# Ported from negativo17/nvidia-kmod-common's 60-nvidia.rules (the RPM
+# Bazzite, Bluefin and BlueBuild all install), which carries the same
+# explanation: "Device nodes are created by nvidia-modprobe, which is
+# called by the nvidia DDX. In case the DDX is not started, the device
+# nodes are never created, so call nvidia-modprobe in the udev rules to
+# cover the Wayland/EGLStream and compute case without a started
+# display."
+#
+# Two differences from the RPM's rule, both deliberate:
+#
+#   - Triggers on the NVIDIA PCI device (ATTR{vendor}/ATTR{class}) like
+#     the RPM's current rule, rather than on KERNEL=="nvidia". The
+#     kernel-side one only fires once something already created the
+#     node, which is the thing we're trying to achieve.
+#   - No softdep on nvidia-uvm, which the RPM's changelog records as
+#     having been added ("Add a softdep on nvidia-uvm, required for some
+#     GPUs") and later dropped. It has no equivalent here to begin
+#     with: OPTIONS+="softdep=..." is rejected outright by current udev
+#     (`udevadm verify`: "Invalid value for OPTIONS key"), and the
+#     dependency it expressed is already covered upstream of this file —
+#     `nvidia-modprobe -u` loads nvidia-uvm itself, and
+#     files/nvidia-modules-load.conf loads it at boot.
+#
+# Minor 0 tells nvidia-modprobe to create both UVM nodes.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000|0x030200", RUN+="/usr/bin/nvidia-modprobe -u -c 0"

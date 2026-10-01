@@ -227,6 +227,19 @@ echo "==> Installing userspace components (--no-kernel-module, the kmod was alre
 # weight nothing on the target image could ever load. See README.md,
 # "Known limitations" for the gaming-variant caveat (32-bit Wine/Proton
 # titles needing 32-bit OpenGL would need this revisited).
+#
+# The three list files must live on a filesystem that `find / -xdev`
+# never descends into — hence the literal /tmp paths rather than the
+# relative names: the redirect creates each list file *before* find
+# runs, so a list file on the scanned filesystem would appear in its own
+# output. before.list would then contain itself (fine, it is on both
+# sides of the comm) but after.list would not exist during the first
+# find and does exist during the second, so `comm -13` would classify
+# it as newly installed and copy the installer's /dev node inventory
+# into the image. -xdev is what keeps that from happening: /tmp is a
+# tmpfs, so it is a separate mount and out of reach. Do not move these
+# into $workdir — `mktemp -d` honours TMPDIR, so that is only safe for
+# as long as nobody points TMPDIR at the root filesystem.
 find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/before.list
 
 ./nvidia-installer \
@@ -236,7 +249,6 @@ find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/before.list
     --ui=none \
     --no-kernel-module \
     --no-nouveau-check \
-    --no-nvidia-modprobe \
     --no-rpms \
     --no-backup \
     --no-check-for-alternate-installs \
@@ -267,65 +279,253 @@ while IFS= read -r f; do
     cp -a "$f" "${out_dir}${f}"
 done < /tmp/new-files.list
 
+# nvidia-modprobe is deliberately NOT suppressed (--no-nvidia-modprobe
+# used to be passed here; see below). Its mode in the .run payload is
+# 0755, not setuid, which is exactly what this image wants: nothing
+# unprivileged needs to call it, because files/nvidia-device-nodes.service
+# calls it as root, Before=display-manager.service, and files/60-nvidia.rules
+# calls it from udev (also root) to cover unprivileged containers.
+# projectbluefin/dakota makes the same choice for the same reason
+# ("nvidia-modprobe stays 0755 (not NVIDIA's 4755):
+# nvidia-device-nodes.service invokes it as root, so no unprivileged
+# process needs it").
+echo "==> Verifying nvidia-modprobe is present and not setuid..."
+if [ ! -x "${out_dir}/usr/bin/nvidia-modprobe" ]; then
+    echo "ERROR: ${out_dir}/usr/bin/nvidia-modprobe missing from the installer's payload." >&2
+    echo "Without it neither files/nvidia-device-nodes.service nor" >&2
+    echo "files/60-nvidia.rules can create /dev/nvidia*, and every" >&2
+    echo "non-root client (gnome-shell, CUDA, nvidia-smi) loses it too." >&2
+    exit 1
+fi
+if [ -u "${out_dir}/usr/bin/nvidia-modprobe" ]; then
+    echo "WARNING: nvidia-modprobe is setuid in the payload. Nothing needs" >&2
+    echo "it to be — files/nvidia-device-nodes.service runs it as root —" >&2
+    echo "and a setuid root helper is a needless escalation surface." >&2
+    echo "Stripping it; NVIDIA's own docs treat it as optional for this reason." >&2
+    chmod 0755 "${out_dir}/usr/bin/nvidia-modprobe"
+fi
+
 # ---------------------------------------------------------------------
-# Dakota / freedesktop-sdk integration fixes:
+# Dakota / freedesktop-sdk integration fixes.
 #
-# 1. EGL vendor ICD: Dakota's freedesktop-sdk libEGL searches
-#    /etc/glvnd/egl_vendor.d and /usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d,
-#    NEVER /usr/share/glvnd/egl_vendor.d. Without 10_nvidia.json in /etc,
-#    libglvnd cannot discover the NVIDIA EGL driver, causing Mutter's
-#    EGL display initialization to fail and crash with SIGSEGV.
+# These are all about where the driver's own files have to land for the
+# freedesktop-sdk graphics stack to find them. Reference implementation:
+# projectbluefin/dakota's elements/bluefin-nvidia/nvidia-drivers.bst,
+# which solves the same problem against the same stack (and is where
+# this repo's 10_nvidia.json placement came from originally).
 #
-# 2. GBM backend: Dakota's Mesa libgbm searches /usr/lib/x86_64-linux-gnu/GL/lib/gbm
-#    (symlinked to ../default/lib/gbm). Placing a relative symlink to
-#    nvidia-drm_gbm.so directly inside GL/default/lib/gbm allows libgbm to
-#    load the NVIDIA backend without shadowing Mesa's dri_gbm.so on hybrid systems.
+# 1. EGL vendor ICD. libglvnd only scans /etc/glvnd/egl_vendor.d and
+#    ${libdir}/GL/glvnd/egl_vendor.d — never /usr/share/glvnd/egl_vendor.d,
+#    where nvidia-installer puts it. Verified against the base image's
+#    own libEGL.so.1.1.0 rather than trusted:
+#      $ strings libEGL.so.1.1.0 | grep egl_vendor.d
+#      /etc/glvnd/egl_vendor.d:/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d
+#    So the load-bearing copy goes to /etc. /usr/share is kept too, as
+#    convention (and because nvidia-installer wrote it there anyway).
+#    The GL/ copy is deliberately NOT created: that path is a symlink
+#    into the Mesa extension tree, and a real directory there shadows
+#    Mesa's own 50_mesa.json at the OCI merge.
+#    Upstream-Status: not-submitted (fdsdk libglvnd sets
+#      datadir=${libdir}/GL, so it will never search /usr/share)
 #
-# 3. EGL external platforms (Wayland & GBM): copy 10_nvidia_wayland.json and
-#    15_nvidia_gbm.json into /etc/egl/egl_external_platform.d and
-#    GL/default/egl/egl_external_platform.d.
-#
-# 4. Vulkan ICD: ensure nvidia_icd.json is mirrored into /etc/vulkan/icd.d.
+# 2. GBM backend. Mesa's libgbm has its backend directory compiled in —
+#    also verified against the base image's binary:
+#      $ strings libgbm.so.1 | grep GL/
+#      /usr/lib/x86_64-linux-gnu/GL/lib/gbm
+#    which is a symlink to ../default/lib/gbm. The installer's own
+#    --gbm-backend-dir output lands in ${libdir}/gbm/, a directory
+#    nothing ever looks in, so the symlink is placed where libgbm
+#    actually probes. Note that ldconfig will not help here: it only
+#    caches files whose name starts with "lib", so dri_gbm.so and
+#    nvidia-drm_gbm.so never appear in /etc/ld.so.cache no matter which
+#    directories are configured. (Verified with a no-DT_SONAME .so.)
 # ---------------------------------------------------------------------
-echo "==> Configuring Dakota-compatible paths for EGL, GBM, and Vulkan..."
+echo "==> Configuring Dakota-compatible paths for EGL and GBM..."
 
 mkdir -p "${out_dir}/etc/glvnd/egl_vendor.d"
-if [ -f "${out_dir}/usr/share/glvnd/egl_vendor.d/10_nvidia.json" ]; then
-    cp -a "${out_dir}/usr/share/glvnd/egl_vendor.d/10_nvidia.json" \
-        "${out_dir}/etc/glvnd/egl_vendor.d/10_nvidia.json"
-elif [ -f "10_nvidia.json" ]; then
-    install -Dm644 "10_nvidia.json" \
-        "${out_dir}/etc/glvnd/egl_vendor.d/10_nvidia.json"
+if [ ! -f "10_nvidia.json" ]; then
+    echo "ERROR: 10_nvidia.json missing from the driver payload." >&2
+    echo "libglvnd would then find only Mesa's 50_mesa.json and never" >&2
+    echo "load libEGL_nvidia.so.0 at all." >&2
+    exit 1
 fi
+install -Dm644 "10_nvidia.json" "${out_dir}/etc/glvnd/egl_vendor.d/10_nvidia.json"
 
-mkdir -p "${out_dir}${libdir}/GL/default/lib/gbm"
-if [ -e "${out_dir}${libdir}/gbm/nvidia-drm_gbm.so" ]; then
-    ln -srf "${out_dir}${libdir}/gbm/nvidia-drm_gbm.so" \
-        "${out_dir}${libdir}/GL/default/lib/gbm/nvidia-drm_gbm.so"
-elif [ -e "${out_dir}${libdir}/libnvidia-allocator.so.1" ]; then
-    ln -srf "${out_dir}${libdir}/libnvidia-allocator.so.1" \
-        "${out_dir}${libdir}/GL/default/lib/gbm/nvidia-drm_gbm.so"
+# GBM: manifest-driven rather than hardcoded, so a new release that
+# splits out another allocator/driver library keeps working. Row shape
+# (from the payload's .manifest):
+#   nvidia-drm_gbm.so 0000 GBM_BACKEND_LIB_SYMLINK NATIVE libnvidia-allocator.so.1 MODULE:nvalloc
+mapfile -t gbm_symlinks < <(awk '$3 == "GBM_BACKEND_LIB_SYMLINK" && $4 == "NATIVE" { print $1, $5 }' .manifest)
+if [ "${#gbm_symlinks[@]}" -eq 0 ]; then
+    echo "ERROR: .manifest declares no NATIVE GBM_BACKEND_LIB_SYMLINK rows." >&2
+    echo "libgbm would fall back to dri_gbm.so only, and any GBM surface" >&2
+    echo "that needs the NVIDIA backend (PRIME render-node buffers) fails." >&2
+    exit 1
 fi
-
-mkdir -p "${out_dir}/etc/egl/egl_external_platform.d"
-mkdir -p "${out_dir}${libdir}/GL/default/egl/egl_external_platform.d"
-for f in 10_nvidia_wayland.json 15_nvidia_gbm.json; do
-    src=""
-    if [ -f "${out_dir}/usr/share/egl/egl_external_platform.d/$f" ]; then
-        src="${out_dir}/usr/share/egl/egl_external_platform.d/$f"
-    elif [ -f "$f" ]; then
-        src="$f"
+gbm_dir="${out_dir}${libdir}/GL/default/lib/gbm"
+mkdir -p "$gbm_dir"
+for row in "${gbm_symlinks[@]}"; do
+    name="${row%% *}"
+    target="${row##* }"
+    resolved="${out_dir}${libdir}/${target}"
+    if [ ! -e "$resolved" ]; then
+        echo "ERROR: .manifest wants GL/default/lib/gbm/${name} -> ${target}," >&2
+        echo "but ${libdir}/${target} is not in the installer's output." >&2
+        echo "That symlink would dangle and libgbm would silently skip the" >&2
+        echo "NVIDIA GBM backend." >&2
+        exit 1
     fi
-    if [ -n "$src" ]; then
-        cp -a "$src" "${out_dir}/etc/egl/egl_external_platform.d/$f"
-        cp -a "$src" "${out_dir}${libdir}/GL/default/egl/egl_external_platform.d/$f"
+    # ln -sfn with an absolute final path, NOT `ln -srf`: -r is
+    # --relative, not "recursive", so it silently rewrites the target
+    # into a chain of ../ that happens to resolve to the same file here
+    # and breaks the moment anything moves. Absolute, because the
+    # resulting link ships into a different tree than it was built in.
+    ln -sfn "${libdir}/${target}" "${gbm_dir}/${name}"
+    echo "    GL/default/lib/gbm/${name} -> ${libdir}/${target}"
+done
+
+# ---------------------------------------------------------------------
+# 3. Vulkan ICD: /usr/share/vulkan/icd.d only, as nvidia-installer wrote
+#    it. A second copy under /etc/vulkan/icd.d is actively harmful —
+#    the Vulkan loader scans /etc/vulkan/icd.d and /usr/share/vulkan/icd.d
+#    independently, so a duplicate registers the same physical GPU
+#    twice. This script used to add that copy "to be safe"; it isn't.
+#    (Bazzite's install-nvidia does the inverse cleanup, dropping
+#    /usr/share/vulkan/icd.d/nouveau_icd.*.json so it can't collide
+#    with NVIDIA's on a machine that has both.)
+if [ ! -f "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" ]; then
+    echo "ERROR: ${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json missing." >&2
+    echo "Vulkan applications would have no NVIDIA ICD at all." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# 4. EGL external-platform JSONs (10_nvidia_wayland.json,
+#    15_nvidia_gbm.json, ...): left exactly where nvidia-installer put
+#    them, under /usr/share/egl/egl_external_platform.d, which is what
+#    projectbluefin/dakota does too. This script used to mirror them
+#    into /etc/egl/egl_external_platform.d and
+#    ${libdir}/GL/default/egl/egl_external_platform.d on the theory
+#    that libglvnd might look there. It doesn't: the base image's
+#    libEGL.so.1.1.0 contains no external-platform search path at all
+#    (see the strings output above), so both copies were inert weight.
+#    They are still worth asserting on, though — if they ever vanish
+#    from the payload, and a future libglvnd *does* read that dir, the
+#    Wayland/GBM platform dispatch silently regresses.
+for f in 10_nvidia_wayland.json 15_nvidia_gbm.json; do
+    if [ ! -f "${out_dir}/usr/share/egl/egl_external_platform.d/$f" ]; then
+        echo "ERROR: expected EGL external-platform JSON $f was not installed" >&2
+        echo "by nvidia-installer (looked in /usr/share/egl/egl_external_platform.d)." >&2
+        exit 1
     fi
 done
 
-if [ -f "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" ]; then
-    mkdir -p "${out_dir}/etc/vulkan/icd.d"
-    cp -a "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" \
-        "${out_dir}/etc/vulkan/icd.d/nvidia_icd.json"
+# ---------------------------------------------------------------------
+# 5. Suspend/hibernate/resume units. nvidia-installer ships these in the
+#    payload's systemd/ tree but does not install them here — most
+#    likely because it looks for a systemd install prefix and the
+#    builder stage's answer doesn't match the target image's
+#    /usr/lib/systemd. They are load-bearing, not cosmetic:
+#    nvidia-sleep.sh exits immediately unless /proc/driver/nvidia/suspend
+#    exists, which only happens with
+#    NVreg_PreserveVideoMemoryAllocations=1 (files/nvidia-driver-params.conf).
+#    Without these units a suspend loses GPU context and hard-locks the
+#    machine; with them and the param, it round-trips cleanly.
+# ---------------------------------------------------------------------
+echo "==> Installing NVIDIA power-management units..."
+systemd_dir="${out_dir}/usr/lib/systemd"
+for svc in nvidia-suspend nvidia-resume nvidia-hibernate nvidia-suspend-then-hibernate; do
+    if [ ! -f "systemd/system/${svc}.service" ]; then
+        echo "ERROR: systemd/system/${svc}.service missing from driver payload." >&2
+        exit 1
+    fi
+    install -Dm644 "systemd/system/${svc}.service" "${systemd_dir}/system/${svc}.service"
+done
+
+for f in systemd/nvidia-sleep.sh systemd/system-sleep/nvidia; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: $f missing from driver payload." >&2
+        echo "The units above ExecStart it; without it they fail on every" >&2
+        echo "suspend." >&2
+        exit 1
+    fi
+done
+install -Dm755 systemd/nvidia-sleep.sh "${out_dir}/usr/bin/nvidia-sleep.sh"
+install -Dm755 systemd/system-sleep/nvidia "${systemd_dir}/system-sleep/nvidia"
+
+# NVIDIA's no-freeze drop-ins. systemd freezes user sessions before
+# sleep, which deadlocks against the VT switch nvidia-sleep.sh performs;
+# these units unset Conflicts=shutdown.target on the relevant targets.
+# These ship with 615.x and later but are NOT present in 580.178.04's
+# payload — warn rather than fail, since that's a property of this
+# branch, not a broken build.
+shopt -s nullglob
+nofreeze=(systemd/system/systemd-*.service.d)
+shopt -u nullglob
+if [ "${#nofreeze[@]}" -eq 0 ]; then
+    echo "    NOTE: no nvidia-suspend-nofreeze drop-ins in this driver version's payload." >&2
+    echo "    Suspend with an active X session may still deadlock. Harmless on a" >&2
+    echo "    Wayland-only session (nothing is frozen that nvidia-sleep.sh" >&2
+    echo "    conflicts with). Track it on the next version bump." >&2
+else
+    for d in "${nofreeze[@]}"; do
+        install -Dm644 "${d}/nvidia-suspend-nofreeze.conf" \
+            "${systemd_dir}/system/$(basename "$d")/nvidia-suspend-nofreeze.conf"
+    done
+    echo "    installed ${#nofreeze[@]} nvidia-suspend-nofreeze drop-in(s)"
+fi
+
+# nvidia-powerd (Dynamic Boost). The unit and its D-Bus policy are
+# installed, but it is deliberately NOT enabled: Dynamic Boost is an
+# RTX 50 laptop feature, and this branch's payload ships neither
+# dlsnetparams.csv (its data table) nor anything else that would make it
+# do anything. projectbluefin/dakota hard-fails on the missing table
+# because 615.x has it; failing here would just mean the 580 branch can
+# never build. Same call as Dakota's on the unit itself: absent the
+# hardware it exits 0, so leaving it disabled loses nothing.
+for f in systemd/system/nvidia-powerd.service nvidia-dbus.conf; do
+    if [ -f "$f" ]; then
+        case "$f" in
+            systemd/*) install -Dm644 "$f" "${systemd_dir}/system/$(basename "$f")" ;;
+            *)         install -Dm644 "$f" "${out_dir}/usr/share/dbus-1/system.d/$(basename "$f")" ;;
+        esac
+    fi
+done
+if [ ! -f dlsnetparams.csv ]; then
+    echo "    NOTE: dlsnetparams.csv absent (580 branch has no Dynamic Boost)." >&2
+    echo "    nvidia-powerd.service installed but not enabled — see" >&2
+    echo "    files/80-nvidia.preset." >&2
+fi
+
+# ---------------------------------------------------------------------
+# 6. DT_NEEDED closure. Every libnvidia-* is dlopen'd by bare soname, so
+#    a library that a newly-split-out module needs (libnvidia-gpucomp,
+#    libnvidia-api, ...) but that the installer's own manifest selection
+#    didn't put on disk fails only at run time, inside a compositor, as
+#    an unexplained EGL init failure. Catch it in the build instead.
+#    Same check projectbluefin/dakota runs; it is the one guard that
+#    would have caught the regression this file's kargs section
+#    documents.
+# ---------------------------------------------------------------------
+echo "==> Checking DT_NEEDED closure of the installed NVIDIA libraries..."
+closure_status=0
+for obj in "${out_dir}${libdir}"/lib*.so.* "${out_dir}${libdir}"/vdpau/lib*.so.* "${out_dir}/usr/bin"/*; do
+    [ -f "$obj" ] && [ ! -L "$obj" ] || continue
+    for dep in $(objdump -p "$obj" 2>/dev/null | awk '/NEEDED/{print $2}'); do
+        case "$dep" in
+            libnvidia-*|libcuda.so*|libnvcuvid.so*|libnvoptix.so*)
+                if [ ! -e "${out_dir}${libdir}/${dep}" ]; then
+                    echo "ERROR: $(basename "$obj") needs ${dep}, which is not installed" >&2
+                    closure_status=1
+                fi
+                ;;
+        esac
+    done
+done
+if [ "$closure_status" -ne 0 ]; then
+    echo "ERROR: NVIDIA userspace library closure is incomplete — the image" >&2
+    echo "would ship libraries that dlopen a soname that isn't present." >&2
+    exit 1
 fi
 
 echo "==> build-nvidia.sh done."
