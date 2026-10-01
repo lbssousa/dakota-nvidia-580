@@ -110,7 +110,7 @@ ARG DISABLE_BLUEFIN_GNOME_TWEAKS=true
 # differ by nothing but these three ARG values.
 ARG IMAGE_NAME=dakota-nvidia-580
 ARG IMAGE_VENDOR=lbssousa
-ARG IMAGE_TAG=testing
+ARG IMAGE_TAG=next
 
 # ---------------------------------------------------------------------
 # dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
@@ -122,12 +122,21 @@ ARG IMAGE_TAG=testing
 # both variants from that PR.
 #
 # On `main` both pins track the upstream :stable images. On the `next`
-# branch they track :next instead (GNOME rolling master), which is what
-# makes that branch worth having: a new upstream base arrives there days
-# before it reaches :stable, so the kmod gets exercised against a new
-# kernel on the bleeding-edge stream instead of on the one machines
-# track. Both branches keep the same ARG names, so build.yml's matrix
-# needs no per-branch override — it reads whatever this file says.
+# branch (i.e. on this branch) they track :next instead (GNOME rolling
+# master), which is what makes that branch worth having: a new upstream
+# base arrives there days before it reaches :stable, so the kmod gets
+# exercised against a new kernel on the bleeding-edge stream instead of
+# on the one machines track. Both branches keep the same ARG names, so
+# build.yml's matrix needs no per-branch override — it reads whatever
+# this file says.
+#
+# On this branch the digests are bumped BY HAND. renovate.json5's rules
+# resolve the `main` (`:stable`) pins only — Renovate takes its config
+# from the repository's default branch — so there's no PR automation for
+# the two lines below. That costs little: upstream rebuilds `:next`
+# nightly, so this branch is never more than one build behind, and a
+# missed bump just means `:next` carries yesterday's base for a cycle.
+# Re-run the skopeo commands at the bottom of this block and commit.
 #
 # BASE_IMAGE is what FROM actually resolves below — the "standard"
 # Dakota variant, built by default. BASE_IMAGE_GAMING isn't consumed
@@ -139,11 +148,11 @@ ARG IMAGE_TAG=testing
 # Containerfile changes needed. Keeping both pins here, not only in
 # the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:stable@sha256:ddab2e2d816976a8f181603987e76d1c992109f435b2abdf1eae76f40f7139f8
-ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:e0670ab927e6762e175a73a1ed47b54215163170a5efe407472640c1ac9951ea
-# ^ resolved via (re-run before every build — these drift):
-#   skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
-#   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:next@sha256:95224152c7429c521ef070a7ffca6047c523b5b59a9599a6a43a084fb064af8e
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:next@sha256:725956cdac3c7f93a1b41e9cf7f76bd27d55ff38e17e59c79cbd1bb882cf40d6
+# ^ resolved via (re-run before every build — these drift nightly):
+#   skopeo inspect docker://ghcr.io/projectbluefin/dakota:next | jq -r .Digest
+#   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:next | jq -r .Digest
 
 FROM ${BASE_IMAGE} AS dakota-base
 

@@ -24,14 +24,25 @@
 #   - /usr/lib/modules/<kver>/config — the exact .config the running
 #     kernel was built with.
 #   - <kver> itself, which tells us which upstream tree to fetch:
-#       - a plain version (e.g. "7.2.6")      -> vanilla kernel.org
+#       - a plain release (e.g. "7.2.6")       -> vanilla kernel.org
 #         source at tag v<kver> (freedesktop-sdk's own linux.bst
 #         source pin, per elements/include/linux.yml — its only two
 #         patches touch riscv/powerpc-only code, irrelevant on x86_64,
 #         so vanilla upstream is faithful here).
+#       - a release candidate (e.g. "7.3.0-rc3") -> the same vanilla
+#         tree, cloned from git at tag v7.3-rc3. Note the tag drops the
+#         SUBLEVEL: the release string "7.3.0-rc3" is tagged "v7.3-rc3",
+#         and kernel.org publishes NO tarball for a release candidate at
+#         all (only git tags — v7.x/ lists releases only), so this case
+#         cannot go through the tarball path below.
 #       - a "-ogc<N>" suffix (e.g. "7.2.6-ogc1") -> the Open Gaming
 #         Collective kernel fork at the matching tag, from
 #         elements/core/linux-ogc.bst's own source pin.
+#
+# The rc case is not hypothetical: it is what the `next` branch builds.
+# Upstream's :next images track GNOME rolling master and ship whatever
+# kernel is current, which during an rc cycle is an rc — the pin this
+# branch was created with is dakota:next at kernel 7.3.0-rc3.
 #
 # Usage: build-kernel-src.sh <kver> <config-file> <output-dir> <module-symvers>
 #   <module-symvers>  a Module.symvers derived from the target image's own
@@ -67,6 +78,21 @@ if [[ "${kver}" == *-ogc* ]]; then
     # checkout of an exact tag, even for a --depth 1 clone of that tag.
     # Removing .git makes this identical to the tarball path below,
     # which has no git metadata to inspect.
+    rm -rf src/.git
+elif [[ "${kver}" =~ ^([0-9]+)\.([0-9]+)\.0-rc([0-9]+)$ ]]; then
+    # A release candidate. kernel.org publishes no tarball for an rc, so
+    # this has to come from git. The tag drops the SUBLEVEL: kernel
+    # release "7.3.0-rc3" is tagged "v7.3-rc3" (Makefile carries
+    # SUBLEVEL = 0, EXTRAVERSION = -rc3, so `make kernelrelease` still
+    # reproduces 7.3.0-rc3 — the check further down verifies that, and
+    # aborts if the tag and the image's kernel version ever disagree).
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    rcnum="${BASH_REMATCH[3]}"
+    tag="v${major}.${minor}-rc${rcnum}"
+    echo "==> ${kver} is a release candidate; cloning torvalds/linux at tag ${tag}"
+    echo "==> (no kernel.org tarball exists for an rc — tags only)"
+    git clone --branch "${tag}" --depth 1 https://github.com/torvalds/linux.git src
     rm -rf src/.git
 else
     series="${kver%%.*}"

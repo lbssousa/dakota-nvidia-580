@@ -169,16 +169,26 @@ does ship:
 - `/usr/lib/modules/<kver>/config` — the exact `.config` the running
   kernel was built with (present on both variants; this is the ground
   truth, no guessing).
-- `<kver>` itself, which tells us which source to fetch: a plain
-  version (e.g. `7.2.6`) means the standard variant's kernel, and
-  matches
-  [freedesktop-sdk's own source pin](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/blob/master/elements/include/linux.yml)
-  — vanilla `kernel.org` at tag `v<kver>` (its two patches only touch
-  riscv/powerpc code, irrelevant on x86_64). A `-ogc<N>` suffix (e.g.
-  `7.2.6-ogc1`) means the gaming variant's [Open Gaming Collective
-  kernel](https://github.com/OpenGamingCollective/linux) fork, at the
-  matching tag — `linux-ogc.bst` pins it explicitly
-  (`ogc-localversion: '-ogc1'`, not autodetected).
+- `<kver>` itself, which tells us which source to fetch. There are three
+  cases:
+  - A plain release (e.g. `7.2.6`) means the standard variant's kernel,
+    and matches
+    [freedesktop-sdk's own source pin](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/blob/master/elements/include/linux.yml)
+    — vanilla `kernel.org` at tag `v<kver>` (its two patches only touch
+    riscv/powerpc code, irrelevant on x86_64).
+  - A release candidate (e.g. `7.3.0-rc3`) is the same vanilla tree, but
+    it has to come from **git**, not a tarball: `kernel.org` publishes
+    no tarball for an rc at all (`v7.x/` lists final releases only), and
+    the tag drops the `SUBLEVEL` — release string `7.3.0-rc3` is tagged
+    `v7.3-rc3`. `make kernelrelease` still reproduces `7.3.0-rc3` from
+    that tree, which the script's own version check verifies. This is
+    what the `next` branch builds: upstream's `:next` images track GNOME
+    rolling master and ship whatever kernel is current, which mid-cycle
+    is an rc.
+  - A `-ogc<N>` suffix (e.g. `7.2.6-ogc1`) means the gaming variant's
+    [Open Gaming Collective kernel](https://github.com/OpenGamingCollective/linux)
+    fork, at the matching tag — `linux-ogc.bst` pins it explicitly
+    (`ogc-localversion: '-ogc1'`, not autodetected).
 
 `scripts/build-kernel-src.sh` fetches that source, drops in the
 shipped `.config`, runs `make olddefconfig` + `make modules_prepare`
@@ -816,6 +826,11 @@ reconstructs itself from upstream source + the image's own shipped
     `Makefile` no longer reads `EXTRA_CFLAGS`. Kept even though
     `580.178.04` no longer trips the first two, since they only demote
     diagnostics and a later 580.x can reintroduce the pattern.
+
+  These were derived against kernel 7.2.6, which is what `:stable` ships.
+  The `next` branch builds against `7.3.0-rc3` and nothing here has been
+  verified there — expect the first few `:next` builds to be where a
+  7.3-specific compile error shows up, which is the point of the stream.
   - A `strncpy()` → `sized_strscpy()` compatibility shim,
     `#include`-injected into the files that call the old name
     (`strncpy()` was removed from the kernel's public string API on
