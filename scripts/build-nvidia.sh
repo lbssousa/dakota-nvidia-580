@@ -236,7 +236,6 @@ find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/before.list
     --ui=none \
     --no-kernel-module \
     --no-nouveau-check \
-    --no-nvidia-modprobe \
     --no-rpms \
     --no-backup \
     --no-check-for-alternate-installs \
