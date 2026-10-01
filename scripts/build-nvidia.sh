@@ -385,19 +385,32 @@ for row in "${gbm_symlinks[@]}"; do
 done
 
 # ---------------------------------------------------------------------
-# 3. Vulkan ICD: /usr/share/vulkan/icd.d only, as nvidia-installer wrote
-#    it. A second copy under /etc/vulkan/icd.d is actively harmful —
-#    the Vulkan loader scans /etc/vulkan/icd.d and /usr/share/vulkan/icd.d
-#    independently, so a duplicate registers the same physical GPU
-#    twice. This script used to add that copy "to be safe"; it isn't.
-#    (Bazzite's install-nvidia does the inverse cleanup, dropping
-#    /usr/share/vulkan/icd.d/nouveau_icd.*.json so it can't collide
-#    with NVIDIA's on a machine that has both.)
-if [ ! -f "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" ]; then
-    echo "ERROR: ${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json missing." >&2
-    echo "Vulkan applications would have no NVIDIA ICD at all." >&2
+# 3. Vulkan ICD. nvidia-installer installs this only if it finds a
+#    Vulkan ICD loader on the build host, warning otherwise:
+#      "This NVIDIA driver package includes Vulkan components, but no
+#       Vulkan ICD loader was detected on this system."
+#    This builder stage deliberately has none, so the installer skips
+#    nvidia_icd.json (VULKAN_ICD_JSON in the .manifest) and every
+#    published image so far shipped with no NVIDIA Vulkan driver at all
+#    — the previous `if [ -f ... ]` here just fell through silently.
+#    Verified by running the installer with exactly these flags: the
+#    other EGL/Vulkan manifests are installed, nvidia_icd.json is not.
+#    So place it from the payload ourselves.
+#
+#    /usr/share/vulkan/icd.d is the one correct location — the loader
+#    scans /etc/vulkan/icd.d and /usr/share/vulkan/icd.d
+#    independently, so a second copy under /etc registers the same
+#    physical GPU twice. This script used to add that copy "to be
+#    safe"; it isn't. (Bazzite's install-nvidia does the inverse
+#    cleanup, dropping /usr/share/vulkan/icd.d/nouveau_icd.*.json so it
+#    can't collide with NVIDIA's on a machine that has both.)
+if [ ! -f "nvidia_icd.json" ]; then
+    echo "ERROR: nvidia_icd.json missing from the driver payload." >&2
+    echo "It is in the .manifest (VULKAN_ICD_JSON), so this is a payload" >&2
+    echo "change, not an installer quirk — investigate before continuing." >&2
     exit 1
 fi
+install -Dm644 "nvidia_icd.json" "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json"
 
 # ---------------------------------------------------------------------
 # 4. EGL external-platform JSONs (10_nvidia_wayland.json,
