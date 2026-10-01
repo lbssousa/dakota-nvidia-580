@@ -121,10 +121,10 @@ ARG IMAGE_TAG=testing
 # (renovate.json5) opens a PR when either digest below changes; CI builds
 # both variants from that PR.
 #
-# On `main` both pins track the upstream :stable images. On the `next`
+# On `main` both pins track the upstream :testing images. On the `next`
 # branch they track :next instead (GNOME rolling master), which is what
 # makes that branch worth having: a new upstream base arrives there days
-# before it reaches :stable, so the kmod gets exercised against a new
+# before it reaches :testing, so the kmod gets exercised against a new
 # kernel on the bleeding-edge stream instead of on the one machines
 # track. Both branches keep the same ARG names, so build.yml's matrix
 # needs no per-branch override — it reads whatever this file says.
@@ -139,11 +139,11 @@ ARG IMAGE_TAG=testing
 # Containerfile changes needed. Keeping both pins here, not only in
 # the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:stable@sha256:ddab2e2d816976a8f181603987e76d1c992109f435b2abdf1eae76f40f7139f8
-ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:e0670ab927e6762e175a73a1ed47b54215163170a5efe407472640c1ac9951ea
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:testing@sha256:9d7596053c652eb38f0e0a77edbc5856f353bbed0cef97b50eb2aa62339ff970
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:339d92970c617573c2feb99a3b292d464add4bda3104ab8ae65c1f2b0257c5cb
 # ^ resolved via (re-run before every build — these drift):
-#   skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
-#   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
+#   skopeo inspect docker://ghcr.io/projectbluefin/dakota:testing | jq -r .Digest
+#   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Digest
 
 FROM ${BASE_IMAGE} AS dakota-base
 

@@ -236,12 +236,13 @@ find / -xdev \( -type f -o -type l \) 2>/dev/null | sort > /tmp/before.list
     --ui=none \
     --no-kernel-module \
     --no-nouveau-check \
+    --no-nvidia-modprobe \
     --no-rpms \
     --no-backup \
     --no-check-for-alternate-installs \
     --skip-depmod \
     --skip-module-load \
-    --install-libglvnd \
+    --no-install-libglvnd \
     --no-install-compat32-libs \
     --opengl-libdir="${relative_libdir}" \
     --utility-libdir="${relative_libdir}" \
@@ -265,5 +266,66 @@ while IFS= read -r f; do
     mkdir -p "${out_dir}$(dirname "$f")"
     cp -a "$f" "${out_dir}${f}"
 done < /tmp/new-files.list
+
+# ---------------------------------------------------------------------
+# Dakota / freedesktop-sdk integration fixes:
+#
+# 1. EGL vendor ICD: Dakota's freedesktop-sdk libEGL searches
+#    /etc/glvnd/egl_vendor.d and /usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d,
+#    NEVER /usr/share/glvnd/egl_vendor.d. Without 10_nvidia.json in /etc,
+#    libglvnd cannot discover the NVIDIA EGL driver, causing Mutter's
+#    EGL display initialization to fail and crash with SIGSEGV.
+#
+# 2. GBM backend: Dakota's Mesa libgbm searches /usr/lib/x86_64-linux-gnu/GL/lib/gbm
+#    (symlinked to ../default/lib/gbm). Placing a relative symlink to
+#    nvidia-drm_gbm.so directly inside GL/default/lib/gbm allows libgbm to
+#    load the NVIDIA backend without shadowing Mesa's dri_gbm.so on hybrid systems.
+#
+# 3. EGL external platforms (Wayland & GBM): copy 10_nvidia_wayland.json and
+#    15_nvidia_gbm.json into /etc/egl/egl_external_platform.d and
+#    GL/default/egl/egl_external_platform.d.
+#
+# 4. Vulkan ICD: ensure nvidia_icd.json is mirrored into /etc/vulkan/icd.d.
+# ---------------------------------------------------------------------
+echo "==> Configuring Dakota-compatible paths for EGL, GBM, and Vulkan..."
+
+mkdir -p "${out_dir}/etc/glvnd/egl_vendor.d"
+if [ -f "${out_dir}/usr/share/glvnd/egl_vendor.d/10_nvidia.json" ]; then
+    cp -a "${out_dir}/usr/share/glvnd/egl_vendor.d/10_nvidia.json" \
+        "${out_dir}/etc/glvnd/egl_vendor.d/10_nvidia.json"
+elif [ -f "10_nvidia.json" ]; then
+    install -Dm644 "10_nvidia.json" \
+        "${out_dir}/etc/glvnd/egl_vendor.d/10_nvidia.json"
+fi
+
+mkdir -p "${out_dir}${libdir}/GL/default/lib/gbm"
+if [ -e "${out_dir}${libdir}/gbm/nvidia-drm_gbm.so" ]; then
+    ln -srf "${out_dir}${libdir}/gbm/nvidia-drm_gbm.so" \
+        "${out_dir}${libdir}/GL/default/lib/gbm/nvidia-drm_gbm.so"
+elif [ -e "${out_dir}${libdir}/libnvidia-allocator.so.1" ]; then
+    ln -srf "${out_dir}${libdir}/libnvidia-allocator.so.1" \
+        "${out_dir}${libdir}/GL/default/lib/gbm/nvidia-drm_gbm.so"
+fi
+
+mkdir -p "${out_dir}/etc/egl/egl_external_platform.d"
+mkdir -p "${out_dir}${libdir}/GL/default/egl/egl_external_platform.d"
+for f in 10_nvidia_wayland.json 15_nvidia_gbm.json; do
+    src=""
+    if [ -f "${out_dir}/usr/share/egl/egl_external_platform.d/$f" ]; then
+        src="${out_dir}/usr/share/egl/egl_external_platform.d/$f"
+    elif [ -f "$f" ]; then
+        src="$f"
+    fi
+    if [ -n "$src" ]; then
+        cp -a "$src" "${out_dir}/etc/egl/egl_external_platform.d/$f"
+        cp -a "$src" "${out_dir}${libdir}/GL/default/egl/egl_external_platform.d/$f"
+    fi
+done
+
+if [ -f "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" ]; then
+    mkdir -p "${out_dir}/etc/vulkan/icd.d"
+    cp -a "${out_dir}/usr/share/vulkan/icd.d/nvidia_icd.json" \
+        "${out_dir}/etc/vulkan/icd.d/nvidia_icd.json"
+fi
 
 echo "==> build-nvidia.sh done."

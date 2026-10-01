@@ -13,12 +13,12 @@
   // streams — the gaming variant's OGC kernel can (and does) lag behind
   // or diverge from the standard Dakota kernel, so a bump to one
   // shouldn't block or be conflated with the other. The second axis is
-  // the stream tag, and it matters even more: `main` pins :stable while
+  // the stream tag, and it matters even more: `main` pins :testing while
   // `next` pins :next, and those move on completely different
-  // schedules. :stable is the one a real machine tracks, so it must
-  // never sit blocked behind an unrelated :next bump — hence the
-  // per-tag groups, keyed on currentValue (the tag in
-  // `image:tag@sha256:digest`).
+  // schedules. :testing is what builds on main (and is promoted to
+  // :stable weekly), so it must never sit blocked behind an unrelated
+  // :next bump — hence the per-tag groups, keyed on currentValue (the
+  // tag in `image:tag@sha256:digest`).
   //
   // Caveat on the `next` branch: Renovate resolves its base branch (and
   // this config file) from the repo's default branch, so these rules
@@ -29,15 +29,15 @@
     {
       matchManagers: ["dockerfile"],
       matchPackageNames: ["ghcr.io/projectbluefin/dakota"],
-      matchCurrentValue: "stable",
-      groupName: "dakota base image (:stable)",
+      matchCurrentValue: "testing",
+      groupName: "dakota base image (:testing)",
       commitMessagePrefix: "chore(base):",
     },
     {
       matchManagers: ["dockerfile"],
       matchPackageNames: ["ghcr.io/projectbluefin/dakota-gaming"],
-      matchCurrentValue: "stable",
-      groupName: "dakota gaming base image (:stable)",
+      matchCurrentValue: "testing",
+      groupName: "dakota gaming base image (:testing)",
       commitMessagePrefix: "chore(base-gaming):",
     },
     {

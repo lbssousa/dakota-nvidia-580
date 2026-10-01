@@ -421,8 +421,8 @@ Epson utility) is derived from that image at build time, so it needs
 no per-variant changes.
 
 ```
-dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:stable@sha256:...
-             or ghcr.io/projectbluefin/dakota-gaming:stable@sha256:... for the gaming variant)
+dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha256:...
+             or ghcr.io/projectbluefin/dakota-gaming:testing@sha256:... for the gaming variant)
   │
   ├─→ kernel-headers            extracts kernel version, its shipped .config,
   │     │                       the authoritative struct module layout from the
@@ -714,6 +714,31 @@ the 32-bit libraries Fedora's builder would otherwise produce could
 never be loaded by anything on this image, so they'd just be dead
 weight. See ["Known limitations"](#known-limitations) for the
 gaming-variant caveat this implies.
+
+Beyond directory placement flags, Dakota's freedesktop-sdk graphics stack
+requires specific integration steps performed by `build-nvidia.sh`:
+
+- **Preserve system `libglvnd` (`--no-install-libglvnd`)**: Dakota's
+  native `libglvnd` is compiled to dispatch to Mesa under `/usr/lib/x86_64-linux-gnu/GL/`.
+  Installing NVIDIA's generic `libglvnd` bundle would overwrite the system's
+  dispatchers and break Mesa integration.
+- **EGL vendor configuration (`10_nvidia.json`)**: Dakota's `libEGL.so.1`
+  scans `/etc/glvnd/egl_vendor.d` and `/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d`,
+  never `/usr/share/glvnd/egl_vendor.d` (where `nvidia-installer` puts it).
+  `build-nvidia.sh` copies `10_nvidia.json` into `/etc/glvnd/egl_vendor.d/` so
+  `libglvnd` can discover the NVIDIA driver. Without this, Mutter fails to initialize
+  EGL on `/dev/dri/card0` and segfaults on NULL `cogl_renderer`.
+- **GBM backend placement (`nvidia-drm_gbm.so`)**: Mesa's `libgbm.so.1` searches
+  `/usr/lib/x86_64-linux-gnu/GL/lib/gbm` (a symlink to `../default/lib/gbm`).
+  `build-nvidia.sh` links `nvidia-drm_gbm.so` into `/usr/lib/x86_64-linux-gnu/GL/default/lib/gbm/`
+  using `ln -srf`. This makes it visible to `libgbm` without shadowing Mesa's `dri_gbm.so`
+  on hybrid systems (Intel + NVIDIA).
+- **EGL external platforms (`10_nvidia_wayland.json`, `15_nvidia_gbm.json`)**:
+  Mirrored to `/etc/egl/egl_external_platform.d/` and `GL/default/egl/egl_external_platform.d/`.
+- **Device node handling (`--no-nvidia-modprobe`)**: The installer's setuid
+  `nvidia-modprobe` binary is omitted; module loading and parameters are handled
+  cleanly via `/usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf` and
+  `/usr/lib/bootc/kargs.d/30-nvidia-blacklist-nouveau.toml`.
 
 Separately, `build-nvidia.sh`'s file-diff (still filesystem-diff
 based, not a hardcoded manifest — see the script's own header comment)
@@ -1064,14 +1089,14 @@ laptop.
 ```bash
 # 1. Confirm the current digests and paste them into the Containerfile
 #    (the `ARG BASE_IMAGE=...` / `ARG BASE_IMAGE_GAMING=...` lines):
-skopeo inspect docker://ghcr.io/projectbluefin/dakota:stable | jq -r .Digest
-skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:stable | jq -r .Digest
+skopeo inspect docker://ghcr.io/projectbluefin/dakota:testing | jq -r .Digest
+skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Digest
 
 # 2. Confirm the image still ships the .config kernel-src-builder
 #    needs (see the section above) — for whichever variant(s) you're
 #    about to build:
-./scripts/check-kernel-headers.sh stable dakota
-./scripts/check-kernel-headers.sh stable dakota-gaming
+./scripts/check-kernel-headers.sh testing dakota
+./scripts/check-kernel-headers.sh testing dakota-gaming
 
 # 3. Build the standard variant (uses the Containerfile's BASE_IMAGE
 #    default, no override needed):
@@ -1080,7 +1105,7 @@ podman build --file Containerfile --tag localhost/dakota-nvidia-580:dev .
 #    ...or the gaming variant (override BASE_IMAGE with the pinned
 #    BASE_IMAGE_GAMING value from the Containerfile):
 podman build --file Containerfile \
-  --build-arg BASE_IMAGE=ghcr.io/projectbluefin/dakota-gaming:stable@sha256:<digest> \
+  --build-arg BASE_IMAGE=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:<digest> \
   --tag localhost/dakota-nvidia-580-gaming:dev .
 
 # 4. Basic smoke test before installing on any real machine:
@@ -1293,8 +1318,8 @@ split, including the tag names and the clock times (see
     PAT, a GitHub App, or one manual step. See ["Making the watcher's PRs
     trigger CI"](#making-the-watchers-prs-trigger-ci).
 - `renovate.json5` tracks both base-image digests — `BASE_IMAGE`
-  (`ghcr.io/projectbluefin/dakota:stable`) and `BASE_IMAGE_GAMING`
-  (`ghcr.io/projectbluefin/dakota-gaming:stable`) — pinned in the
+  (`ghcr.io/projectbluefin/dakota:testing`) and `BASE_IMAGE_GAMING`
+  (`ghcr.io/projectbluefin/dakota-gaming:testing`) — pinned in the
   `Containerfile`, and opens a **separate** PR per variant when either
   changes upstream — **every bump is a reviewable PR**, not a silent
   rebuild, because a new base image can ship a new kernel and break
@@ -1302,14 +1327,14 @@ split, including the tag names and the clock times (see
   separate because the gaming (OGC) kernel stream updates
   independently of, and sometimes lags, the standard one. The rules are
   additionally split per stream tag, so a `:next` bump never blocks or
-  gets conflated with a `:stable` one — the tag a real machine tracks
+  gets conflated with a `:testing` one — the tag a real machine tracks
   has to be able to move on its own. Renovate
   handles the base images only; the NVIDIA driver has no Renovate
   datasource, which is what the watcher above is for.
 
   One gap worth knowing: Renovate resolves its base branch and this
   config file from the repository's **default** branch, so these rules
-  describe the `main` (`:stable`) pins. The `next` branch's `:next`
+  describe the `main` (`:testing`) pins. The `next` branch's `:next`
   digests are bumped by hand. That's tolerable precisely because
   upstream rebuilds `:next` nightly — the branch is never more than one
   build behind, and a missed bump shows up as a `:next` that's simply
