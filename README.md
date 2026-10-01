@@ -59,17 +59,25 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `cups-devel`/autotools, not present on Dakota.
 
 Like the upstream project, this repo builds two variants from the same
-`Containerfile`, both published under two tags each — mirroring
-upstream Dakota's own rolling-vs-promoted tag split (`:testing`
-promoted to `:stable` on a fixed cadence), simplified to a single
-rolling tag since this repo has no `:next`/`:testing` split of its own:
+`Containerfile`, published under three tags each — the same
+rolling-vs-promoted split upstream Dakota uses, and the same
+build cadences:
 
-- `:latest` — rebuilt on every push to `main`, on a weekly safety-net
-  schedule (Mondays), and on manual dispatch. This is the rolling tag;
-  see ["CI and automatic updates"](#ci-and-automatic-updates).
-- `:stable` — a straight registry retag of whatever `:latest` digest
+- `:testing` — rebuilt on every push to `main`, on a daily schedule
+  (13:00 UTC), and on manual dispatch. The rolling stream a real change
+  lands on first; what `:stable` is promoted from. Built against the
+  upstream `:stable` base images.
+- `:next` — rebuilt on every push to the `next` branch, nightly
+  (03:00 UTC), and on manual dispatch. The bleeding-edge stream: same
+  `Containerfile`, but built against the upstream `:next` base images
+  (GNOME rolling master), so a new upstream base — and usually a new
+  kernel — gets exercised here days before it reaches `:testing`.
+- `:stable` — a straight registry retag of whatever `:testing` digest
   is current at promotion time (no rebuild), promoted weekly. This is
   the tag a real machine should track.
+
+See ["CI and automatic updates"](#ci-and-automatic-updates) for the
+schedules and how `:next` gets triggered.
 
   - `ghcr.io/lbssousa/dakota-nvidia-580` — standard Dakota base.
   - `ghcr.io/lbssousa/dakota-nvidia-580-gaming` — Dakota gaming base
@@ -1122,8 +1130,11 @@ ujust rebase-helper
 
 `:stable` is the tag to track on a real machine — see ["CI and
 automatic updates"](#ci-and-automatic-updates) for what it actually
-points at and how often it moves. `:latest` also exists (rebuilt on
-every push) for testing a fix ahead of that weekly promotion.
+points at and how often it moves. `:testing` also exists (rebuilt on
+every push, daily) for testing a fix ahead of that weekly promotion,
+and `:next` (nightly, upstream GNOME master base) if you want the
+bleeding edge — but expect `:next` to be visibly ahead of `:testing`,
+including on the kernel.
 
 A reboot is required afterwards. Validate `modprobe nvidia`,
 `nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
@@ -1172,16 +1183,16 @@ repository secrets, set once with `cosign generate-key-pair` +
 
 ## CI and automatic updates
 
-Tagging mirrors upstream Dakota's own rolling-vs-promoted split
-(there, `:testing`/`:next` built continuously and promoted to
-`:stable` on a fixed release cadence via a separate workflow), scaled
-down to this repo's single rolling tag:
+Tagging and cadence mirror upstream Dakota's own rolling-vs-promoted
+split, including the tag names and the clock times (see
+`projectbluefin/dakota`'s `build.yml`, `publish.yml`,
+`nightly-next-build.yml` and `execute-release.yml`):
 
-- **`:latest` — `.github/workflows/build.yml`.** Runs a two-way matrix
+- **`:testing` — `.github/workflows/build.yml`.** Runs a two-way matrix
   (`standard`, `gaming`) from the same `Containerfile`, building and
-  publishing both `ghcr.io/lbssousa/dakota-nvidia-580:latest` and
-  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:latest` on push to `main`,
-  on a weekly schedule (Mondays 04:17 UTC), and via
+  publishing both `ghcr.io/lbssousa/dakota-nvidia-580:testing` and
+  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:testing` on push to
+  `main`, on a daily schedule (13:00 UTC), and via
   `workflow_dispatch`. Each
   matrix leg resolves its base image by reading the
   `BASE_IMAGE`/`BASE_IMAGE_GAMING` `ARG` default straight out of the
@@ -1189,43 +1200,64 @@ down to this repo's single rolling tag:
   digest lives in one place. `fail-fast: false` means one variant
   failing (e.g. the gaming kernel breaking the kmod build) doesn't
   cancel the other's build/publish. Every push builds a fresh image;
-  `IMAGE_TAG` defaults to `latest` in the `Containerfile`, matching
-  what's actually published (baked into `/etc/os-release` and
-  `image-info.json` — see ["Known limitations"](#known-limitations)),
-  so the image's own self-reported identity stays correct even after
-  it's later promoted to `:stable` below.
+  `IMAGE_TAG` is passed explicitly as the stream tag (baked into
+  `/etc/os-release` and `image-info.json` — see ["Known
+  limitations"](#known-limitations)), so the image's own self-reported
+  identity stays correct even after it's later promoted to `:stable`
+  below.
 
-  **Why weekly and not daily.** The schedule used to be daily, to cover a
-  Renovate base-digest bump that got merged without anyone triggering a
-  rebuild. It never needed to: `renovate.json5` sets no automerge, so
-  those PRs are merged by hand, and merging one *is* a push to `main`,
-  which triggers this workflow — and the PR itself is built beforehand via
-  `pull_request`, so a new kernel is validated before it lands. The daily
-  run was therefore rebuilding everything from scratch, including a
-  from-source GCC, to produce an equivalent image six days out of seven.
+  **Why daily.** This matches upstream's `:testing` build schedule. It
+  was weekly here once, on the argument that a daily rebuild mostly
+  reproduced a byte-equivalent image — true when nothing unpinned had
+  moved, but the point of the periodic run is precisely to catch when
+  something *has*: the builder stages' `dnf install` lines take whatever
+  Fedora currently ships, and `LIBFPRINT_REF`/`PAM_U2F_REF` are git
+  tags Renovate isn't configured to track. With two live streams, a new
+  upstream base image also reaches `:next` nightly, and a fresh
+  `:testing` build is what tells you whether anything downstream of it
+  broke.
+- **`:next` — the same `build.yml`, on the `next` branch.** GitHub runs
+  a workflow from the ref being built, so `next` gets its own copy of
+  `build.yml`, its own `Containerfile` pins and its own `IMAGE_TAG` with
+  no extra plumbing; the stream tag is derived from `GITHUB_REF_NAME`
+  rather than hardcoded. It triggers on push to `next`, on
+  `workflow_dispatch`, and nightly at 03:00 UTC via
+  `.github/workflows/nightly-next-build.yml`. That dispatcher exists
+  because a GitHub `schedule:` event *always* runs on the repository's
+  default branch — a cron in `build.yml` cannot target `next` at all,
+  which is why upstream has the same dispatcher. It skips dispatching
+  when a `next` build is already running or queued, so builds can't
+  stack up.
 
-  What the periodic run is actually worth keeping for is drift in what
-  this repo does *not* pin: the builder stages' `dnf install` lines take
-  whatever Fedora currently ships, and `LIBFPRINT_REF`/`PAM_U2F_REF` are
-  git tags that Renovate isn't configured to track (no `# renovate:`
-  datasource annotations, and its rules here cover only the two base
-  images). A weekly build surfaces breakage from those on its own
-  schedule rather than in the middle of an unrelated change. It runs
-  **Mondays** so that `promote-stable.yml`'s premise survives: that
-  workflow promotes whatever `:latest` is every Sunday at 06:00 UTC, and
-  its whole point is letting a build soak on `:latest` first — a Sunday
-  build would be promoted about 100 minutes later, a Monday one gets
-  nearly a week.
+  The `next` branch differs from `main` in exactly three `Containerfile`
+  `ARG` values: `BASE_IMAGE` and `BASE_IMAGE_GAMING` repinned to the
+  upstream `:next` images, and `IMAGE_TAG=next`. Same NVIDIA version,
+  same libfprint/pam-u2f refs, same everything else — so a failure on
+  `:next` is a signal about the newer base, not about a different
+  recipe.
 - **`:stable` — `.github/workflows/promote-stable.yml`.** Runs weekly
   (Sundays) and via `workflow_dispatch`. For each variant, resolves the
-  current `:latest` digest, `cosign verify`s it against `cosign.pub`,
+  current `:testing` digest, `cosign verify`s it against `cosign.pub`,
   and — only if it differs from what `:stable` currently points at —
   retags it to `:stable` with a server-side `skopeo copy
   --preserve-digests` (no rebuild: `:stable` is always some past
-  `:latest` digest, never new bytes). This is the tag a real machine
-  should track; a rebuild happening on `:latest` doesn't affect a host
+  `:testing` digest, never new bytes). This is the tag a real machine
+  should track; a rebuild happening on `:testing` doesn't affect a host
   already switched to `:stable` until the next weekly promotion picks
   it up.
+
+  Only `:testing` is ever promoted. `:next` is bleeding-edge and is
+  never a promotion candidate — to reach `:stable` it has to land on
+  `main` and build as `:testing` first.
+
+  **One deliberate difference from upstream:** upstream cuts `:stable`
+  purely on demand (a maintainer dispatches `execute-release.yml`), with
+  no scheduled promotion at all. The weekly schedule here is kept on
+  purpose: there's one maintainer and no separate testing gate to pass, so
+  a human look at the `:testing` diff is the entire gate, and the fixed
+  weekly point is what makes that review actually happen rather than only
+  when someone remembers. `workflow_dispatch` still covers cutting it
+  early, or rolling `:stable` back to a known-good digest.
 - **NVIDIA driver releases —
   `.github/workflows/nvidia-driver-update.yml`.** Polls
   [NVIDIA's Unix driver index](https://download.nvidia.com/XFree86/Linux-x86_64/)
@@ -1268,9 +1300,20 @@ down to this repo's single rolling tag:
   rebuild, because a new base image can ship a new kernel and break
   the kmod until you confirm the build still passes. The two are kept
   separate because the gaming (OGC) kernel stream updates
-  independently of, and sometimes lags, the standard one. Renovate
+  independently of, and sometimes lags, the standard one. The rules are
+  additionally split per stream tag, so a `:next` bump never blocks or
+  gets conflated with a `:stable` one — the tag a real machine tracks
+  has to be able to move on its own. Renovate
   handles the base images only; the NVIDIA driver has no Renovate
   datasource, which is what the watcher above is for.
+
+  One gap worth knowing: Renovate resolves its base branch and this
+  config file from the repository's **default** branch, so these rules
+  describe the `main` (`:stable`) pins. The `next` branch's `:next`
+  digests are bumped by hand. That's tolerable precisely because
+  upstream rebuilds `:next` nightly — the branch is never more than one
+  build behind, and a missed bump shows up as a `:next` that's simply
+  yesterday's base.
 
 ### Making the watcher's PRs trigger CI
 
@@ -1328,7 +1371,7 @@ gh workflow run nvidia-driver-update.yml --ref test/watcher-token
 gh run watch
 
 # 3. It should open a PR from nvidia-driver/580.178.04. The thing to look
-#    at is whether "Build and publish latest" appears as a check on it.
+#    at is whether "Build and publish" appears as a check on it.
 #    If it does, the token works. If the PR body carries the
 #    "build.yml has not run on this PR" warning instead, the secret
 #    isn't being seen.

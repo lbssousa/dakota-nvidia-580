@@ -8,23 +8,51 @@
   // and publishes both variants from that PR; there's no "silent"
   // automatic rebuild without a reviewable PR.
   //
-  // The two base images are kept in separate PRs (separate groups)
-  // because they track independent upstream streams — the gaming
-  // variant's OGC kernel can (and does) lag behind or diverge from the
-  // standard Dakota kernel, so a bump to one shouldn't block or be
-  // conflated with the other.
+  // Deps are split four ways rather than two. The two that mattered
+  // before still do: standard and gaming track independent upstream
+  // streams — the gaming variant's OGC kernel can (and does) lag behind
+  // or diverge from the standard Dakota kernel, so a bump to one
+  // shouldn't block or be conflated with the other. The second axis is
+  // the stream tag, and it matters even more: `main` pins :stable while
+  // `next` pins :next, and those move on completely different
+  // schedules. :stable is the one a real machine tracks, so it must
+  // never sit blocked behind an unrelated :next bump — hence the
+  // per-tag groups, keyed on currentValue (the tag in
+  // `image:tag@sha256:digest`).
+  //
+  // Caveat on the `next` branch: Renovate resolves its base branch (and
+  // this config file) from the repo's default branch, so these rules
+  // describe the `main` pins. The `next` branch's :next digests are
+  // bumped by hand — which is tolerable because upstream rebuilds
+  // :next nightly, so the branch is never more than a build behind.
   packageRules: [
     {
       matchManagers: ["dockerfile"],
       matchPackageNames: ["ghcr.io/projectbluefin/dakota"],
-      groupName: "dakota base image",
+      matchCurrentValue: "stable",
+      groupName: "dakota base image (:stable)",
       commitMessagePrefix: "chore(base):",
     },
     {
       matchManagers: ["dockerfile"],
       matchPackageNames: ["ghcr.io/projectbluefin/dakota-gaming"],
-      groupName: "dakota gaming base image",
+      matchCurrentValue: "stable",
+      groupName: "dakota gaming base image (:stable)",
       commitMessagePrefix: "chore(base-gaming):",
+    },
+    {
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["ghcr.io/projectbluefin/dakota"],
+      matchCurrentValue: "next",
+      groupName: "dakota base image (:next)",
+      commitMessagePrefix: "chore(base-next):",
+    },
+    {
+      matchManagers: ["dockerfile"],
+      matchPackageNames: ["ghcr.io/projectbluefin/dakota-gaming"],
+      matchCurrentValue: "next",
+      groupName: "dakota gaming base image (:next)",
+      commitMessagePrefix: "chore(base-gaming-next):",
     },
   ],
 }

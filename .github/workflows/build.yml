@@ -1,41 +1,48 @@
-name: Build and publish latest
+name: Build and publish
+
+# One workflow, two streams, distinguished by the ref it runs on —
+# mirroring how upstream Dakota drives its own build.yml off the
+# `testing` and `next` branches (see projectbluefin/dakota's
+# build.yml/publish.yml, where publish.yml derives the stream tag from
+# the head branch). GitHub Actions runs the workflow file *from the ref
+# being built*, so `next` picks up its own copy of this file, its own
+# base-image pins and its own IMAGE_TAG with no extra plumbing here.
+#
+#   main -> :testing   (what :stable is promoted from)
+#   next -> :next      (upstream :next base, GNOME rolling master)
+#
+# Neither stream is ever built as :stable — that's a server-side retag
+# of an already-published, already-signed digest, done by
+# promote-stable.yml.
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
   schedule:
-    # Weekly, not daily. The stated reason for a daily rebuild was to
-    # cover a Renovate base-digest bump that never got a manual rebuild —
-    # but renovate.json5 sets no automerge, so those PRs are merged by
-    # hand, and merging one is itself a push to main that triggers this
-    # workflow. (The PR is built too, via `pull_request` above, so the
-    # new kernel is validated before it is merged at all.) A daily run
-    # therefore rebuilt everything from scratch — including a from-source
-    # GCC — to produce a byte-for-byte equivalent image six days out of
-    # seven.
+    # Daily at 13:00 UTC, matching upstream's own :testing build
+    # schedule (projectbluefin/dakota build.yml) rather than the weekly
+    # run this used to have. A schedule event always runs on the
+    # repository's default branch, so this fires only for main -> :next
+    # is driven by nightly-next-build.yml, which dispatches this
+    # workflow with --ref next (upstream does the same, for the same
+    # reason).
     #
-    # What the periodic run is genuinely for is drift in what this repo
-    # does NOT pin: the builder stages' `dnf install` lines take whatever
-    # Fedora currently ships, and LIBFPRINT_REF / PAM_U2F_REF are git
-    # tags that renovate.json5's dockerfile-manager rules don't track. A
-    # weekly build surfaces breakage from those on its own schedule
-    # instead of during an unrelated change.
-    #
-    # Mondays specifically, to keep promote-stable.yml's premise intact:
-    # it promotes whatever :latest is every Sunday at 06:00 UTC, and its
-    # whole rationale is giving a build some soak time on :latest first.
-    # Building Sunday morning would hand it a fresh, unsoaked image
-    # roughly 100 minutes later; building Monday leaves nearly a week.
-    #
-    # Note that .github/workflows/nvidia-driver-update.yml stays daily:
-    # polling an index costs one HTTP request, and it opens a PR rather
-    # than publishing anything.
-    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+    # This went daily for the first time; see the note below on what the
+    # periodic run is actually for.
+    - cron: "0 13 * * *"
   workflow_dispatch: {}
 
 env:
   IMAGE_NAME: ghcr.io/lbssousa/dakota-nvidia-580
+
+# Separate queue per stream so a :next build can't sit behind — or
+# cancel — a :testing one. cancel-in-progress: false so a rebuild in
+# flight is never killed by a new push; upstream's publish.yml groups
+# its publish jobs the same way for the same reason.
+concurrency:
+  group: build-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -62,6 +69,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Which stream tag this run publishes. Derived from the ref, not
+      # hardcoded, so the same workflow file works unchanged on both
+      # branches. A pull_request run has neither `main` nor `next` as
+      # its ref name (it's `<pr>/merge`), and lands on :testing — the
+      # PR is only built for validation and never pushes, so the tag it
+      # would have used is irrelevant beyond naming the local image.
+      - name: Resolve stream tag
+        id: stream
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            next) stream_tag=next ;;
+            *)    stream_tag=testing ;;
+          esac
+          echo "stream_tag=${stream_tag}" >> "$GITHUB_OUTPUT"
+          echo "Publishing stream: :${stream_tag} (ref ${GITHUB_REF_NAME})"
+
       - name: Resolve base image for this variant
         id: base
         run: |
@@ -78,16 +101,20 @@ jobs:
           # the same name) is what gets baked into /etc/os-release and
           # image-info.json so `uwelcome` shows this image instead of
           # the upstream Dakota base — must match the repo name half of
-          # the tag below. IMAGE_TAG is left at the Containerfile's own
-          # default ("latest"), matching what this workflow actually
-          # publishes — see "CI and automatic updates" in README.md for
-          # why :stable (a later, separate promotion, not a rebuild)
-          # doesn't need its own build-arg here.
+          # the tag below. IMAGE_TAG is passed explicitly rather than
+          # left to the Containerfile default so the image's
+          # self-reported identity always matches the tag it is
+          # published under, whichever branch is building.
+          #
+          # :stable is deliberately absent: it's a retag of an
+          # already-signed :testing digest (promote-stable.yml), never a
+          # build of its own, exactly as upstream does it.
           podman build \
             --file Containerfile \
             --build-arg "BASE_IMAGE=${{ steps.base.outputs.base_image }}" \
             --build-arg "IMAGE_NAME=dakota-nvidia-580${{ matrix.tag_suffix }}" \
-            --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:latest" \
+            --build-arg "IMAGE_TAG=${{ steps.stream.outputs.stream_tag }}" \
+            --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:${{ steps.stream.outputs.stream_tag }}" \
             .
 
       - name: Log in to GHCR
@@ -105,7 +132,7 @@ jobs:
         id: push
         run: |
           podman push --digestfile /tmp/push-digest \
-            "${IMAGE_NAME}${{ matrix.tag_suffix }}:latest"
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}:${{ steps.stream.outputs.stream_tag }}"
           echo "digest=$(cat /tmp/push-digest)" >> "$GITHUB_OUTPUT"
 
       # Signing and SBOM generation mirror lbssousa/bluefin's own

@@ -95,26 +95,39 @@ ARG DISABLE_BLUEFIN_GNOME_TWEAKS=true
 # tooling may read, but image-info.json is the one that drives the
 # banner. CI overrides IMAGE_NAME per matrix leg (standard vs
 # "-gaming") — see .github/workflows/build.yml. IMAGE_TAG default
-# matches what CI actually publishes on every build ("latest" — see
-# README.md, "CI and automatic updates"): :stable is a later,
-# unrelated registry retag of a past :latest digest, promoted weekly
-# with no rebuild, so the image never gets built with IMAGE_TAG=stable
-# — its self-reported identity correctly says "latest" even once
-# viewed through the :stable tag, the same way upstream Dakota's own
-# build always embeds "latest" as its OCI_IMAGE_VERSION regardless of
-# which stream tag (:testing/:next/:stable) ends up pointing at it.
+# matches what CI actually publishes on every build ("testing" on
+# main; see README.md, "CI and automatic updates"): :stable is a
+# later, unrelated registry retag of a past :testing digest, promoted
+# weekly with no rebuild, so the image never gets built with
+# IMAGE_TAG=stable — its self-reported identity correctly says
+# "testing" even once viewed through the :stable tag, the same way
+# upstream Dakota's own build always embeds "latest" as its
+# OCI_IMAGE_VERSION regardless of which stream tag
+# (:testing/:next/:stable) ends up pointing at it.
+#
+# The `next` branch overrides this to "next" and repins the two base
+# digests below to the upstream :next images, so the two streams
+# differ by nothing but these three ARG values.
 ARG IMAGE_NAME=dakota-nvidia-580
 ARG IMAGE_VENDOR=lbssousa
-ARG IMAGE_TAG=latest
+ARG IMAGE_TAG=testing
 
 # ---------------------------------------------------------------------
 # dakota-base — ALWAYS pinned by digest, never a floating tag ("stable"
-# changes content over time). The NVIDIA module below is compiled
-# against this exact image's kernel; if the digest changes without a
-# rebuild, the result is a new kernel paired with a stale .ko (it won't
-# load, or worse, it loads and is unstable). Renovate (renovate.json5)
-# opens a PR when either digest below changes; CI builds both variants
-# from that PR.
+# and "next" both change content over time). The NVIDIA module below is
+# compiled against this exact image's kernel; if the digest changes
+# without a rebuild, the result is a new kernel paired with a stale .ko
+# (it won't load, or worse, it loads and is unstable). Renovate
+# (renovate.json5) opens a PR when either digest below changes; CI builds
+# both variants from that PR.
+#
+# On `main` both pins track the upstream :stable images. On the `next`
+# branch they track :next instead (GNOME rolling master), which is what
+# makes that branch worth having: a new upstream base arrives there days
+# before it reaches :stable, so the kmod gets exercised against a new
+# kernel on the bleeding-edge stream instead of on the one machines
+# track. Both branches keep the same ARG names, so build.yml's matrix
+# needs no per-branch override — it reads whatever this file says.
 #
 # BASE_IMAGE is what FROM actually resolves below — the "standard"
 # Dakota variant, built by default. BASE_IMAGE_GAMING isn't consumed

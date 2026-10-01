@@ -2,10 +2,22 @@ name: Promote stable
 
 # Mirrors upstream Dakota's own testing->stable promotion (see
 # projectbluefin/dakota's execute-release.yml): :stable is never its
-# own build, just a server-side retag of whatever :latest digest is
-# current at promotion time — a weekly cadence gives a build some
-# soak time on :latest before it reaches a real machine tracking
-# :stable. See README.md, "CI and automatic updates".
+# own build, just a server-side retag of whatever :testing digest is
+# current at promotion time — the weekly cadence gives a build several
+# days of soak time on :testing before it reaches a real machine
+# tracking :stable. See README.md, "CI and automatic updates".
+#
+# This repo keeps a weekly schedule where upstream cuts :stable on
+# demand only: there is one maintainer and no separate testing gate to
+# pass, so a human review of the :testing diff is the entire gate, and
+# the schedule makes that review happen at a predictable weekly point
+# rather than only when someone remembers. workflow_dispatch remains
+# for cutting :stable early (or rolling it back to a known-good digest)
+# outside the weekly rhythm.
+#
+# Only :testing is ever promoted. :next is bleeding-edge and is never a
+# promotion candidate — it never becomes :stable without first landing
+# on main and building as :testing.
 
 on:
   schedule:
@@ -42,14 +54,14 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Resolve :latest digest
-        id: latest
+      - name: Resolve :testing digest
+        id: candidate
         run: |
           digest="$(skopeo inspect --no-tags \
             --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}:latest" | jq -r .Digest)"
+            "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}:testing" | jq -r .Digest)"
           if [ -z "$digest" ] || [ "$digest" = "null" ]; then
-            echo "ERROR: could not resolve :latest digest for ${IMAGE_NAME}${{ matrix.tag_suffix }}" >&2
+            echo "ERROR: could not resolve :testing digest for ${IMAGE_NAME}${{ matrix.tag_suffix }}" >&2
             exit 1
           fi
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
@@ -62,10 +74,10 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62 # v3
 
-      - name: Verify :latest signature
+      - name: Verify :testing signature
         run: |
           cosign verify --key cosign.pub --insecure-ignore-tlog=true \
-            "${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.latest.outputs.digest }}"
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.candidate.outputs.digest }}"
 
       - name: Compare against current :stable
         id: compare
@@ -78,31 +90,31 @@ jobs:
               --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
               "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}:stable" | jq -r .Digest)"
           fi
-          if [ "$stable_digest" = "${{ steps.latest.outputs.digest }}" ]; then
+          if [ "$stable_digest" = "${{ steps.candidate.outputs.digest }}" ]; then
             echo "should_promote=false" >> "$GITHUB_OUTPUT"
             echo ":stable already points at ${stable_digest} — nothing to promote"
           else
             echo "should_promote=true" >> "$GITHUB_OUTPUT"
-            echo ":latest (${{ steps.latest.outputs.digest }}) differs from :stable (${stable_digest:-not found}) — promoting"
+            echo ":testing (${{ steps.candidate.outputs.digest }}) differs from :stable (${stable_digest:-not found}) — promoting"
           fi
 
       # Server-side retag: layers never leave the registry, and
       # --preserve-digests means :stable ends up pointing at exactly
       # the digest that was just verified above, not a re-encoded copy.
-      - name: Promote :latest to :stable
+      - name: Promote :testing to :stable
         if: steps.compare.outputs.should_promote == 'true'
         run: |
           skopeo copy --preserve-digests \
             --src-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
             --dest-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.latest.outputs.digest }}" \
+            "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}@${{ steps.candidate.outputs.digest }}" \
             "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}:stable"
 
           promoted="$(skopeo inspect --no-tags \
             --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
             "docker://${IMAGE_NAME}${{ matrix.tag_suffix }}:stable" | jq -r .Digest)"
-          if [ "$promoted" != "${{ steps.latest.outputs.digest }}" ]; then
-            echo "ERROR: :stable points at ${promoted}, expected ${{ steps.latest.outputs.digest }}" >&2
+          if [ "$promoted" != "${{ steps.candidate.outputs.digest }}" ]; then
+            echo "ERROR: :stable points at ${promoted}, expected ${{ steps.candidate.outputs.digest }}" >&2
             exit 1
           fi
           echo "Promoted ${IMAGE_NAME}${{ matrix.tag_suffix }}:stable -> ${promoted}"
