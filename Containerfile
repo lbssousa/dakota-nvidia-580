@@ -486,9 +486,9 @@ ARG DISABLE_BLUEFIN_GNOME_TWEAKS
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
-COPY --from=libfprint-builder /out/usr/ /usr/
+# COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
-COPY --from=epson-builder /out/ /
+# COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Keeps fprintd resident (--no-timeout) instead of idle-exiting and
@@ -499,7 +499,7 @@ COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-no
 # files/fprintd-no-timeout.conf and README.md, "Known limitations",
 # for the full chain from that timeout to the lock screen occasionally
 # showing no password/fingerprint prompt at all.
-COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
+# COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
 
 # Makes a YubiKey that was already plugged in at boot visible to GnuPG
 # (`gpg --card-status`) without hand-restarting pcscd first. Replaces
@@ -509,7 +509,7 @@ COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-
 # can grab the card ahead of scdaemon's exclusive connect any more.
 # See files/opensc-p11-kit.module for the full diagnosis and README.md,
 # "Making the YubiKey visible to GnuPG at boot".
-COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
+# COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
 
 # Guard for the COPY above: it only helps as long as the base image
 # still ships OpenSC and registers it nowhere else. If OpenSC ever
@@ -518,14 +518,14 @@ COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
 # starts registering opensc-pkcs11.so, the override is silently
 # bypassed through that one. Either way the build should say so rather
 # than ship something that quietly stopped doing its job.
-RUN set -eux; \
-    test -n "$(find /usr/lib /usr/lib64 -name 'opensc-pkcs11.so' -print -quit 2>/dev/null)"; \
-    others="$(grep -rlF 'opensc-pkcs11.so' /usr/share/p11-kit/modules \
-        | grep -vx '/usr/share/p11-kit/modules/opensc.module' || true)"; \
-    if [ -n "${others}" ]; then \
-        echo "OpenSC still registered by other p11-kit module file(s): ${others}" >&2; \
-        exit 1; \
-    fi
+# RUN set -eux; \
+#     test -n "$(find /usr/lib /usr/lib64 -name 'opensc-pkcs11.so' -print -quit 2>/dev/null)"; \
+#     others="$(grep -rlF 'opensc-pkcs11.so' /usr/share/p11-kit/modules \
+#         | grep -vx '/usr/share/p11-kit/modules/opensc.module' || true)"; \
+#     if [ -n "${others}" ]; then \
+#         echo "OpenSC still registered by other p11-kit module file(s): ${others}" >&2; \
+#         exit 1; \
+#     fi
 
 # Kernel command-line args baked in via bootc's kargs.d mechanism
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
@@ -577,19 +577,19 @@ RUN set -eux; \
 # since Bluefin's files never set that key. glib-compile-schemas is
 # already shipped in the Dakota base image, so no extra tooling stage
 # is needed to rerun it.
-RUN if [ "${DISABLE_BLUEFIN_GNOME_TWEAKS}" = "true" ]; then \
-        printf '%s\n' \
-            '[org.gnome.desktop.wm.preferences]' \
-            "button-layout=':close'" \
-            '' \
-            '[org.gnome.desktop.interface]' \
-            'enable-hot-corners=true' \
-            '' \
-            '[org.gnome.shell]' \
-            "disabled-extensions=['blur-my-shell@aunetx', 'dash-to-dock@micxgx.gmail.com']" \
-            > /usr/share/glib-2.0/schemas/zz9-dakota-nvidia-580-gnome-tweaks.gschema.override; \
-        glib-compile-schemas /usr/share/glib-2.0/schemas; \
-    fi
+# RUN if [ "${DISABLE_BLUEFIN_GNOME_TWEAKS}" = "true" ]; then \
+#         printf '%s\n' \
+#             '[org.gnome.desktop.wm.preferences]' \
+#             "button-layout=':close'" \
+#             '' \
+#             '[org.gnome.desktop.interface]' \
+#             'enable-hot-corners=true' \
+#             '' \
+#             '[org.gnome.shell]' \
+#             "disabled-extensions=['blur-my-shell@aunetx', 'dash-to-dock@micxgx.gmail.com']" \
+#             > /usr/share/glib-2.0/schemas/zz9-dakota-nvidia-580-gnome-tweaks.gschema.override; \
+#         glib-compile-schemas /usr/share/glib-2.0/schemas; \
+#     fi
 
 # Signing policy — mirrors lbssousa/bluefin's build_files/00-signing.sh
 # and Dakota's own convention for verified registries (its shipped
@@ -625,15 +625,15 @@ RUN kver="$(cat /kernel-version)" && \
 # safe to edit since /etc is mutable in bootc and 3-way merged on
 # upgrade. (The GUI setup/maintenance utility itself is not shipped —
 # see scripts/install-epson-utility.sh for why.)
-RUN systemctl enable ecbd.service && \
-    if ! grep -q 'cbtd' /etc/services 2>/dev/null; then \
-        printf '\ncbtd\t35587/tcp\t# Epson printer backend\n' >> /etc/services; \
-    fi
+# RUN systemctl enable ecbd.service && \
+#     if ! grep -q 'cbtd' /etc/services 2>/dev/null; then \
+#         printf '\ncbtd\t35587/tcp\t# Epson printer backend\n' >> /etc/services; \
+#     fi
 
 # Device nodes (e.g. /dev/ecblp0) created by the epson-printer-utility
 # RPM's post-install scriptlet on a real install cannot be stored in
 # OCI image layers; none should exist here since we never ran the
 # scriptlet, but clean up defensively to avoid rechunking failures.
-RUN find / -xdev \( -type c -o -type b -o -type p -o -type s \) -name 'ecblp*' -delete 2>/dev/null || true
+# RUN find / -xdev \( -type c -o -type b -o -type p -o -type s \) -name 'ecblp*' -delete 2>/dev/null || true
 
 RUN bootc container lint
