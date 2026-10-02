@@ -95,6 +95,28 @@ jobs:
           fi
           echo "base_image=${base}" >> "$GITHUB_OUTPUT"
 
+      - name: Pre-pull Fedora builder images
+        run: |
+          # registry.fedoraproject.org intermittently answers 503, which
+          # kills the build at the first `FROM fedora:NN`. Pull the
+          # builder bases up front with retries, falling back to the
+          # official quay.io mirror and tagging it under the name the
+          # short-name alias resolves to, so `podman build` finds it
+          # locally and never touches the flaky registry.
+          for rel in 44 42; do
+            ref="registry.fedoraproject.org/fedora:${rel}"
+            ok=
+            for attempt in 1 2 3 4 5; do
+              if podman pull "$ref"; then ok=1; break; fi
+              echo "pull of $ref failed (attempt $attempt), retrying..."
+              sleep $((attempt * 15))
+            done
+            if [ -z "$ok" ]; then
+              podman pull "quay.io/fedora/fedora:${rel}"
+              podman tag "quay.io/fedora/fedora:${rel}" "$ref"
+            fi
+          done
+
       - name: Build image (${{ matrix.variant }})
         run: |
           # IMAGE_NAME (the Containerfile ARG, not this job's env var of
