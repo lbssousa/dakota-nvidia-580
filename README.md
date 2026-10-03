@@ -984,44 +984,28 @@ missing:
   on every suspend.
 
 
-## Optional: reverting Bluefin's GNOME desktop tweaks
+## Optional: switching between pure GNOME and Bluefin's desktop
 
-Bluefin (which Dakota is built on) bakes a set of desktop defaults into
-`/usr/share/glib-2.0/schemas/zz0-bluefin-modifications.gschema.override`
-(plus a second file, `zz3-bluefin-unsupported-stuff.gschema.override`,
-that re-lists `enabled-extensions` with a few more entries). These are
-GSettings *default-value* overrides — compiled into `gschemas.compiled`
-at build time — not hardcoded behavior, and not a per-user dconf
-setting, so a user can still change any of them individually with
-`gnome-tweaks`/`dconf-editor`; this only changes what a fresh account
-starts with.
+Bluefin (which Dakota is built on) bakes its desktop defaults into
+`/usr/share/glib-2.0/schemas/zz*-bluefin-*.gschema.override` — GSettings
+*default-value* overrides compiled into the system `gschemas.compiled`.
+The image itself ships them untouched; instead it adds a `ujust` recipe
+(`files/60-custom.just`) that switches **per user**, through dconf:
 
-This repo turns that reversion **on by default** (pass
-`--build-arg DISABLE_BLUEFIN_GNOME_TWEAKS=false` to keep Bluefin's own
-desktop defaults instead). When enabled, the `final` stage adds one
-more override file,
-`zz9-dakota-nvidia-580-gnome-tweaks.gschema.override` — named to sort
-after Bluefin's own `zz0`/`zz3` files, since `glib-compile-schemas`
-resolves same-key collisions in filename order — and reruns
-`glib-compile-schemas` (already shipped in the Dakota base image, so no
-extra build stage is needed). It reverts:
+```bash
+ujust gnome-pure-toggle           # flip the current state
+ujust gnome-pure-toggle pure      # stock GNOME defaults
+ujust gnome-pure-toggle bluefin   # back to Bluefin's defaults
+```
 
-- **Window titlebar buttons** — Bluefin sets
-  `org.gnome.desktop.wm.preferences` `button-layout` to
-  `:minimize,maximize,close`; this reverts it to `:close` (close button
-  only, no minimize/maximize).
-- **Hot corners** — Bluefin sets `org.gnome.desktop.interface`
-  `enable-hot-corners` to `false`; this reverts it to `true`.
-- **Blur my Shell** (`blur-my-shell@aunetx`) and **Dash to Dock**
-  (`dash-to-dock@micxgx.gmail.com`) — force-disabled via
-  `org.gnome.shell` `disabled-extensions`, which
-  `org.gnome.shell.gschema.xml` documents as taking precedence over
-  `enabled-extensions`. This was chosen over editing
-  `enabled-extensions` directly because that list is defined in two
-  separate Bluefin files and changes over time; overriding
-  `disabled-extensions` instead only names the two extensions this
-  toggle cares about, regardless of what else Bluefin enables by
-  default.
+- `pure` writes, for every key Bluefin's override files set, the stock
+  default (read from a scratch schema cache compiled without any
+  override) into the user's dconf.
+- `bluefin` resets those keys so Bluefin's defaults show through again.
+- Wallpapers (`org.gnome.desktop.background`/`screensaver`) are never
+  touched. Relocatable schemas (Ptyxis profiles, custom keybindings) are
+  skipped.
+- Both directions overwrite the user's own values for those keys.
 
 ## Why downstream instead of forking BuildStream
 
@@ -1366,12 +1350,8 @@ To change the driver version: `--build-arg NVIDIA_VERSION=580.xx.xx`
 [nvidia.com/en-us/drivers/unix](https://www.nvidia.com/en-us/drivers/unix/)
 before pinning it).
 
-This image reverts Bluefin's minimize/maximize titlebar buttons, Blur
-my Shell, Dash to Dock and disabled hot corners back to stock GNOME
-behavior **by default**; pass `--build-arg
-DISABLE_BLUEFIN_GNOME_TWEAKS=false` to keep Bluefin's own desktop
-defaults instead — see the `ARG DISABLE_BLUEFIN_GNOME_TWEAKS` comment
-in the `Containerfile` for exactly what it changes and how.
+Bluefin's GNOME customizations are kept by default; see `ujust
+gnome-pure-toggle` above to switch to stock GNOME.
 
 ## Using it on a real Dakota host
 
