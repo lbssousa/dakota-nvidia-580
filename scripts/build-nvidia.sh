@@ -506,8 +506,7 @@ for f in systemd/system/nvidia-powerd.service nvidia-dbus.conf; do
 done
 if [ ! -f dlsnetparams.csv ]; then
     echo "    NOTE: dlsnetparams.csv absent (580 branch has no Dynamic Boost)." >&2
-    echo "    nvidia-powerd.service installed but not enabled — see" >&2
-    echo "    files/80-nvidia.preset." >&2
+    echo "    nvidia-powerd.service installed but not enabled." >&2
 fi
 
 # ---------------------------------------------------------------------

@@ -892,13 +892,72 @@ Fedora's rule, because they cover complementary cases:
   the case the systemd unit can't cover: an unprivileged (rootless)
   container asking for the GPU has no privilege to `mknod`, and
   `nvidia.ko` never creates the nodes for it.
-- [`files/80-nvidia.preset`](files/80-nvidia.preset) enables both, plus
-  the sleep units, via systemd presets rather than a baked
-  `systemctl enable` symlink tree — which is how all three
-  implementations ship theirs too.
+- The `Containerfile` enables all five units with symlinks under
+  `/usr/lib/systemd/system` — see
+  ["Why the enablement is a symlink and not a preset"](#why-the-enablement-is-a-symlink-and-not-a-preset).
 
 `build-nvidia.sh` now hard-fails if `nvidia-modprobe` is missing from the
 installer's output, and strips the setuid bit if it's set.
+
+### Why the enablement is a symlink and not a preset
+
+A systemd preset is, on this image, inert — and when it is inert the
+machine boots to **no graphical session at all**, which is how this was
+found.
+
+Presets are applied at boot by `global-preset-all.service` (the systemd
+257+ name for what used to be `systemd-preset-all.service`; it runs
+`systemctl --global preset-all`). That unit carries
+`ConditionFirstBoot=yes`, and per `machine-id(5)` "First Boot Semantics" a
+boot is **not** a first boot when `/etc/machine-id` already holds a valid
+machine-id. In a bootc/composefs deployment it does: systemd writes the
+ID it generated straight into the image's `/etc` instead of overmounting a
+tmpfs over the file, so by the time conditions are evaluated the ID is
+already valid. The tell is
+`systemd-machine-id-commit.service ... skipped, unmet condition check
+ConditionPathIsMountPoint=/etc/machine-id` — the commit unit exists to
+write a *transient* ID to disk and is skipped precisely when there was no
+overmount. So `ConditionFirstBoot` evaluates false,
+`global-preset-all.service` is skipped, and **all five** units
+stay `disabled`.
+
+The consequence chain, confirmed on a live boot of this image:
+
+```
+nvidia-device-nodes.service  disabled; preset: enabled   (never ran — no journal entries)
+/dev/nvidiactl, /dev/nvidia0                             missing
+/dev/nvidia-uvm, /dev/nvidia-uvm-tools                  present
+gnome-shell    SIGSEGV in cogl_renderer_is_hardware_accelerated
+               <- create_render_device <- add_drm_device <- meta_backend_native_init_basic
+gdm            "GdmLocalDisplayFactory: maximum number of display failures reached. Giving up."
+```
+
+Two details make this one expensive to debug. First,
+`/dev/nvidia-uvm*` *does* exist — the `nvidia_uvm` module registers its
+own device, so udev creates those nodes — which looks like the NVIDIA
+device plumbing is healthy. It is only the nodes `nvidia.ko` does *not*
+create that are missing. Second, `gdm.service` stays **active** while
+having no session, so `systemctl --failed` is empty and
+`systemctl status gdm` reports success; the greeter just silently never
+comes up.
+
+The fix is to stop depending on first-boot detection: the `Containerfile`
+ships the enablement as symlinks in `/usr/lib/systemd/system`, which is a
+unit search path and part of the immutable `/usr`, so they apply on every
+boot and survive `bootc switch`. Each link mirrors the unit's `[Install]`
+section: `nvidia-device-nodes.service` goes in `multi-user.target.wants`,
+but the sleep units go in `systemd-suspend.service.wants`,
+`systemd-hibernate.service.wants` and
+`systemd-suspend-then-hibernate.service.wants` — linking them into
+`multi-user.target` would run `nvidia-sleep.sh` at boot.
+
+To bring an already-deployed machine back without rebuilding:
+
+```bash
+sudo systemctl enable --now nvidia-device-nodes.service
+sudo systemctl restart gdm
+ls /dev/nvidia*   # expect nvidiactl, nvidia0, nvidia-uvm, nvidia-uvm-tools
+```
 
 ### Module load order and suspend/resume
 

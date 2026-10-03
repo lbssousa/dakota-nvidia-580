@@ -524,8 +524,7 @@ COPY files/nvidia-modules-load.conf /usr/lib/modules-load.d/nvidia.conf
 # Creates /dev/nvidia* before GDM. The load-bearing fix for the missing
 # graphical environment: gnome-shell is unprivileged and cannot mknod,
 # and nvidia-modprobe is deliberately not setuid here, so the nodes have
-# to exist before the greeter's first EGL init. Same unit (and preset
-# convention) as projectbluefin/dakota's nvidia-device-nodes.bst.
+# to exist before the greeter's first EGL init. Same unit as projectbluefin/dakota's nvidia-device-nodes.bst.
 COPY files/nvidia-device-nodes.service /usr/lib/systemd/system/nvidia-device-nodes.service
 
 # udev equivalent, for the case the systemd unit can't cover: an
@@ -535,9 +534,33 @@ COPY files/nvidia-device-nodes.service /usr/lib/systemd/system/nvidia-device-nod
 # Bazzite, Bluefin and BlueBuild all install.
 COPY files/60-nvidia.rules /usr/lib/udev/rules.d/60-nvidia.rules
 
-# Enables the above plus the suspend/hibernate/resume units, via
-# systemd's preset mechanism rather than a baked enable symlink tree.
-COPY files/80-nvidia.preset /usr/lib/systemd/system-preset/80-nvidia.preset
+# Enablement is baked as symlinks under /usr/lib/systemd/system, mirroring
+# each unit's [Install] section — NOT shipped as a systemd preset. Presets
+# are applied only by global-preset-all.service, gated on
+# ConditionFirstBoot=yes, and per machine-id(5) a bootc/composefs boot is
+# never a first boot (/etc/machine-id already holds a valid ID), so a
+# preset leaves every unit disabled. Here that means no
+# nvidia-device-nodes.service, hence no /dev/nvidiactl or /dev/nvidia0,
+# hence gnome-shell SIGSEGV in cogl_renderer_is_hardware_accelerated and
+# GDM giving up — while gdm.service stays active and `systemctl --failed`
+# stays empty. Symlinks in the immutable /usr need no first-boot
+# detection and survive `bootc switch`. See README.md, "Why the
+# enablement is a symlink and not a preset".
+#
+# The sleep units are WantedBy the systemd-*.service they hook, not
+# multi-user.target: linking them there would run nvidia-sleep.sh at boot.
+RUN cd /usr/lib/systemd/system && \
+    mkdir -p multi-user.target.wants \
+             systemd-suspend.service.wants \
+             systemd-hibernate.service.wants \
+             systemd-suspend-then-hibernate.service.wants && \
+    ln -s ../nvidia-device-nodes.service multi-user.target.wants/ && \
+    ln -s ../nvidia-suspend.service systemd-suspend.service.wants/ && \
+    ln -s ../nvidia-resume.service systemd-suspend.service.wants/ && \
+    ln -s ../nvidia-hibernate.service systemd-hibernate.service.wants/ && \
+    ln -s ../nvidia-resume.service systemd-hibernate.service.wants/ && \
+    ln -s ../nvidia-suspend-then-hibernate.service systemd-suspend-then-hibernate.service.wants/ && \
+    ln -s ../nvidia-resume.service systemd-suspend-then-hibernate.service.wants/
 
 # Keeps fprintd resident (--no-timeout) instead of idle-exiting and
 # having to cold-reopen the Goodix 538d sensor on every fingerprint

@@ -40,7 +40,7 @@ RemainAfterExit=yes
 # this scales to multi-GPU boards instead of assuming index 0.
 # "-" prefixed steps tolerate absent hardware / module, so this unit
 # succeeds (and stays out of `systemctl --failed`) on a machine with
-# no NVIDIA GPU at all, which matters because it's enabled by preset.
+# no NVIDIA GPU at all, which matters because it's enabled unconditionally.
 ExecStart=/bin/sh -c 'n=$(ls /proc/driver/nvidia/gpus 2>/dev/null | wc -l); i=0; while [ "$i" -lt "$n" ]; do /usr/bin/nvidia-modprobe -c "$i"; i=$((i+1)); done'
 # -u loads nvidia-uvm and creates its nodes; -c 0 creates the base and
 # tools nodes as a fallback for the loop above (e.g. if nvidia.ko was
