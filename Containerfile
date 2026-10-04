@@ -5,7 +5,7 @@
 # dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
 # branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
 # (Goodix 538d) + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
-# pamu2fcfg) + Epson's epson-printer-utility, baked in via downstream
+# pamu2fcfg), baked in via downstream
 # OCI image layering — not via forking the upstream BuildStream build.
 # See README.md for the full reasoning (why downstream instead of a
 # BuildStream fork) and known limitations.
@@ -443,23 +443,6 @@ RUN pamdir="$(cat /pam-u2f-libdir)" && \
     DESTDIR=/out cmake --install /src/build
 
 # ---------------------------------------------------------------------
-# epson-builder — Fedora used only to download and unpack Epson's
-# binary epson-printer-utility RPM, keeping just the CUPS backend
-# (rastertoepson filter) and the ecbd network-discovery daemon — not
-# the Qt5 setup/maintenance GUI, which Dakota can't run (see
-# scripts/install-epson-utility.sh) — via
-# scripts/install-epson-utility.sh, adapted from lbssousa/bluefin's
-# build_files/20-epson.sh. Only rpm2cpio/cpio/curl are needed; nothing
-# here is compiled, and no dnf/rpm database ends up in the final
-# image, since Dakota (GNOME OS) has neither.
-# ---------------------------------------------------------------------
-FROM fedora:42 AS epson-builder
-RUN dnf install -y curl cpio rpm && \
-    dnf clean all
-COPY scripts/install-epson-utility.sh /install-epson-utility.sh
-RUN chmod +x /install-epson-utility.sh && /install-epson-utility.sh /out
-
-# ---------------------------------------------------------------------
 # final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
@@ -475,9 +458,8 @@ ARG IMAGE_TAG
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
-# COPY --from=libfprint-builder /out/usr/ /usr/
+COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
-# COPY --from=epson-builder /out/ /
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Module options for nvidia.ko / nvidia-drm.ko, applied at load time.
@@ -546,7 +528,7 @@ RUN cd /usr/lib/systemd/system && \
 # files/fprintd-no-timeout.conf and README.md, "Known limitations",
 # for the full chain from that timeout to the lock screen occasionally
 # showing no password/fingerprint prompt at all.
-# COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
+COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
 
 # Makes a YubiKey that was already plugged in at boot visible to GnuPG
 # (`gpg --card-status`) without hand-restarting pcscd first. Replaces
@@ -556,7 +538,7 @@ RUN cd /usr/lib/systemd/system && \
 # can grab the card ahead of scdaemon's exclusive connect any more.
 # See files/opensc-p11-kit.module for the full diagnosis and README.md,
 # "Making the YubiKey visible to GnuPG at boot".
-# COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
+COPY files/opensc-p11-kit.module /usr/share/p11-kit/modules/opensc.module
 
 # Guard for the COPY above: it only helps as long as the base image
 # still ships OpenSC and registers it nowhere else. If OpenSC ever
@@ -565,14 +547,14 @@ RUN cd /usr/lib/systemd/system && \
 # starts registering opensc-pkcs11.so, the override is silently
 # bypassed through that one. Either way the build should say so rather
 # than ship something that quietly stopped doing its job.
-# RUN set -eux; \
-#     test -n "$(find /usr/lib /usr/lib64 -name 'opensc-pkcs11.so' -print -quit 2>/dev/null)"; \
-#     others="$(grep -rlF 'opensc-pkcs11.so' /usr/share/p11-kit/modules \
-#         | grep -vx '/usr/share/p11-kit/modules/opensc.module' || true)"; \
-#     if [ -n "${others}" ]; then \
-#         echo "OpenSC still registered by other p11-kit module file(s): ${others}" >&2; \
-#         exit 1; \
-#     fi
+RUN set -eux; \
+    test -n "$(find /usr/lib /usr/lib64 -name 'opensc-pkcs11.so' -print -quit 2>/dev/null)"; \
+    others="$(grep -rlF 'opensc-pkcs11.so' /usr/share/p11-kit/modules \
+        | grep -vx '/usr/share/p11-kit/modules/opensc.module' || true)"; \
+    if [ -n "${others}" ]; then \
+        echo "OpenSC still registered by other p11-kit module file(s): ${others}" >&2; \
+        exit 1; \
+    fi
 
 # Kernel command-line args baked in via bootc's kargs.d mechanism
 # (/usr/lib/bootc/kargs.d/*.toml — applied to the BLS entry bootc
@@ -658,25 +640,5 @@ RUN kver="$(cat /kernel-version)" && \
     depmod -a "$kver" && \
     ldconfig -r / && \
     rm -f /kernel-version
-
-# Epson epson-printer-utility post-install steps (replicated from the
-# RPM's post-install scriptlet, which cannot run in a container build;
-# see scripts/install-epson-utility.sh for the file-layout half of
-# this). Only the pieces printing actually needs — systemctl enable
-# registers the ecbd daemon (network printer discovery) to start at
-# boot; the /etc/services entry registers its port (cbtd 35587/tcp),
-# safe to edit since /etc is mutable in bootc and 3-way merged on
-# upgrade. (The GUI setup/maintenance utility itself is not shipped —
-# see scripts/install-epson-utility.sh for why.)
-# RUN systemctl enable ecbd.service && \
-#     if ! grep -q 'cbtd' /etc/services 2>/dev/null; then \
-#         printf '\ncbtd\t35587/tcp\t# Epson printer backend\n' >> /etc/services; \
-#     fi
-
-# Device nodes (e.g. /dev/ecblp0) created by the epson-printer-utility
-# RPM's post-install scriptlet on a real install cannot be stored in
-# OCI image layers; none should exist here since we never ran the
-# scriptlet, but clean up defensively to avoid rechunking failures.
-# RUN find / -xdev \( -type c -o -type b -o -type p -o -type s \) -name 'ecblp*' -delete 2>/dev/null || true
 
 RUN bootc container lint

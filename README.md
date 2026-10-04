@@ -45,18 +45,6 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   turns out to be a plain, directly-editable file (confirmed by
   inspecting the published image), not `authselect`-templated, so that
   gap may be easier to close than documented there.
-- **Epson printer support** (CUPS `rastertoepson` filter + `ecbd`
-  network-discovery daemon), extracted from Epson's binary
-  `epson-printer-utility` RPM the same way as in
-  [ublue-os/bluefin](https://github.com/ublue-os/bluefin)
-  (`build_files/20-epson.sh`) — downloaded and unpacked rather than
-  installed via `rpm`/`dnf`, since Dakota has neither. This repo does
-  **not** ship the RPM's Qt5 setup/maintenance GUI (Dakota/GNOME OS has
-  no Qt5 runtime, and bundling one just for an optional utility isn't
-  worth the image-size cost; printing itself doesn't need it — see
-  ["Known limitations"](#known-limitations)). Nor does it install bluefin's `epson-inkjet-printer-escpr`
-  driver package, which needs building from source against
-  `cups-devel`/autotools, not present on Dakota.
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, published under three tags each — the same
@@ -423,8 +411,8 @@ The same `Containerfile` builds both variants — `dakota-base` resolves
 to whichever image `BASE_IMAGE` points at (standard Dakota by
 default; the gaming base when CI overrides it for the `-gaming` leg —
 see ["CI and automatic updates"](#ci-and-automatic-updates) below).
-Everything downstream (kernel headers, kmod build, libfprint, pam-u2f,
-Epson utility) is derived from that image at build time, so it needs
+Everything downstream (kernel headers, kmod build, libfprint, pam-u2f)
+is derived from that image at build time, so it needs
 no per-variant changes.
 
 ```
@@ -479,24 +467,17 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
   │           to -DPAM_DIR=<probed dir> and pamu2fcfg to /usr/bin,
   │           DESTDIR=/out
   │
-  ├─→ epson-builder           (Fedora, build environment only)
-  │         downloads Epson's binary epson-printer-utility RPM and
-  │         unpacks it (no rpm/dnf install) into /out
-  │         (scripts/install-epson-utility.sh)
-  │
   └─→ final (FROM dakota-base again)
-        COPY of all four /out trees (libfprint's overwrites the
+        COPY of the /out trees (libfprint's overwrites the
         stock library in place; pam-u2f's adds new files alongside
         it), nouveau blacklist, p11-kit OpenSC whitelist (see
         "Making the YubiKey visible to GnuPG at boot"),
-        depmod + ldconfig -r, Epson
-        post-install steps (symlink, systemd enable, /etc/services
-        entry), signing policy (scripts/configure-signing-policy.sh —
+        depmod + ldconfig -r, signing policy (scripts/configure-signing-policy.sh —
         see "Verification"), bootc container lint
 ```
 
-The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`,
-`pam-u2f-builder` and `epson-builder` stages use Fedora **only as a
+The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`
+and `pam-u2f-builder` stages use Fedora **only as a
 build environment** (it has `dnf`, `gcc`, `meson`, `cmake`,
 `rpm2cpio`...) — nothing from them ends up in the final image except
 what the scripts/build commands explicitly package into `/out`. The
@@ -1024,8 +1005,7 @@ a `Containerfile` that starts `FROM` the already-published image and
 only compiles what actually needs compiling (the out-of-tree kmod, the
 libfprint fork, and Yubico's pam-u2f) against a kernel tree it
 reconstructs itself from upstream source + the image's own shipped
-`.config` (see above) — plus unpacking Epson's binary
-`epson-printer-utility` RPM, which needs no compilation at all.
+`.config` (see above).
 
 ## Known limitations
 
@@ -1284,12 +1264,6 @@ reconstructs itself from upstream source + the image's own shipped
 - **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
   scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
   in the image; see the pam-u2f bullet near the top of this README.
-- **Epson printing**: `ecbd.service` and the CUPS `rastertoepson`
-  filter's dependencies are expected to resolve cleanly (the GUI
-  utility is no longer shipped at all — see the Epson bullet near the
-  top of this README). Actual print jobs through CUPS
-  (network-discovered printer + real print job) haven't been exercised
-  end-to-end, only the daemon/filter wiring.
 
 ## Local build
 
@@ -1328,9 +1302,6 @@ podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-drm
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-uvm
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-modeset
 podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
-podman run --rm localhost/dakota-nvidia-580:dev sh -c \
-  'readlink -f /usr/bin/epson-printer-utility && test -x /usr/bin/epson-printer-utility'
-podman run --rm localhost/dakota-nvidia-580:dev systemctl is-enabled ecbd.service
 
 # The built image contains both the kernel's vmlinux and the modules, so
 # the struct module ABI check can be re-run against the finished image —
@@ -1373,9 +1344,7 @@ including on the kernel.
 
 A reboot is required afterwards. Validate `modprobe nvidia`,
 `nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
-`fprintd-verify`), and the Epson utility (`systemctl status
-ecbd.service`, launching "Epson Printer Utility" from the app grid, or
-`epson-printer-utility` on the command line) before considering the
+`fprintd-verify`) before considering the
 migration done — and keep a way back (`bootc switch` to the original
 `dakota:stable`/`dakota-gaming:stable` image) until you've validated
 it on real hardware.
