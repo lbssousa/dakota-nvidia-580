@@ -1,0 +1,721 @@
+gcr-ssh-agent: route security key prompts through GCR
+
+gcr-ssh-agent spawns OpenSSH's ssh-agent with no askpass of its own, so
+when that ssh-agent signs with a FIDO ("sk") key it asks for the PIN and
+shows the "Confirm user presence" request through whatever SSH_ASKPASS is
+in the environment, or /usr/libexec/ssh-askpass, which GNOME systems
+usually don't have. The PIN prompt fails ("incorrect passphrase supplied
+to decrypt private key", agent refused operation) and the touch request is
+never shown (gcr#116, gcr#136). gcr4-ssh-askpass also ignores
+SSH_ASKPASS_PROMPT, so a confirmation for an `ssh-add -c` key, or a touch
+notification, turns into a password prompt, and the latter is left behind
+when OpenSSH kills the notifier.
+
+Based on gcr!173 ("ssh-agent: route askpass prompts through GCR"), with
+two differences:
+
+- Only the gcr-ssh-agent and gcr4-ssh-askpass executables change; libgcr
+  (whose GcrSshAskpass gcr-ssh-agent links to) is left as it is. The
+  ssh-agent child gets its askpass through the public
+  gcr_ssh_askpass_child_setup() plus SSH_ASKPASS_REQUIRE=force, and a
+  confirmation is told apart by a prefix on the relayed message, which
+  the library passes through untouched.
+- The touch request is shown rather than dropped: with
+  SSH_ASKPASS_PROMPT=none, gcr4-ssh-askpass opens a system prompt itself
+  and waits. When OpenSSH kills it after the touch, the prompter closes
+  the dialog because the caller left the bus.
+
+The security key PIN and the confirmation use an interaction with no
+keyring fields, so nothing is looked up in or stored to the login keyring.
+The askpass also joined its arguments with a leading space instead of
+between them.
+
+diff --git a/gcr/gcr-ssh-agent-interaction.c b/gcr/gcr-ssh-agent-interaction.c
+index 25a962f..e1d5978 100644
+--- a/gcr/gcr-ssh-agent-interaction.c
++++ b/gcr/gcr-ssh-agent-interaction.c
+@@ -23,6 +23,7 @@
+ #include "config.h"
+ 
+ #include "gcr-ssh-agent-interaction.h"
++#include "gcr-ssh-askpass-prompt.h"
+ 
+ #include "gcr-ssh-agent-private.h"
+ #include "gcr-prompt.h"
+@@ -110,7 +111,7 @@ on_prompt_password (GObject *source_object,
+ 				       strlen (secure_value),
+ 				       (GDestroyNotify) egg_secure_free);
+ 
+-	if (gcr_prompt_get_choice_chosen (prompt)) {
++	if (self->fields && gcr_prompt_get_choice_chosen (prompt)) {
+ 		gchar *label;
+ 
+ 		label = g_strdup_printf (_("Unlock password for: %s"), self->label);
+@@ -130,6 +131,39 @@ on_prompt_password (GObject *source_object,
+ 	g_object_unref (prompt);
+ }
+ 
++static gboolean
++password_is_confirmation (GTlsPassword *password)
++{
++	return g_str_has_prefix (g_tls_password_get_description (password),
++	                         GCR_SSH_ASKPASS_CONFIRM_PREFIX);
++}
++
++static void
++on_prompt_confirm (GObject *source_object,
++                   GAsyncResult *result,
++                   gpointer user_data)
++{
++	GTask *task = G_TASK (user_data);
++	GTlsPassword *password = g_task_get_task_data (task);
++	GcrPrompt *prompt = GCR_PROMPT (source_object);
++	GcrPromptReply reply;
++	GError *error = NULL;
++
++	reply = gcr_prompt_confirm_finish (prompt, result, &error);
++	if (reply == GCR_PROMPT_REPLY_CONTINUE) {
++		/* What OpenSSH's confirm_key() takes as an affirmative answer */
++		g_tls_password_set_value (password, (const guchar *) "yes", 3);
++		g_task_return_int (task, G_TLS_INTERACTION_HANDLED);
++	} else if (error) {
++		g_task_return_error (task, error);
++	} else {
++		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "cancelled");
++	}
++
++	g_object_unref (prompt);
++	g_object_unref (task);
++}
++
+ static void
+ on_prompt_open (GObject *source_object,
+                 GAsyncResult *result,
+@@ -149,6 +183,27 @@ on_prompt_open (GObject *source_object,
+ 		return;
+ 	}
+ 
++	if (password_is_confirmation (password)) {
++		gcr_prompt_set_title (prompt, _("Confirm private key use"));
++		gcr_prompt_set_message (prompt, _("An application wants to use a private key"));
++		gcr_prompt_set_description (prompt, g_tls_password_get_description (password) +
++		                            strlen (GCR_SSH_ASKPASS_CONFIRM_PREFIX));
++		gcr_prompt_set_continue_label (prompt, _("Allow"));
++		gcr_prompt_confirm_async (prompt, g_task_get_cancellable (task), on_prompt_confirm, task);
++		return;
++	}
++
++	if (!GCR_SSH_AGENT_INTERACTION (g_task_get_source_object (task))->fields) {
++		gcr_prompt_set_title (prompt, _("Authenticate security key"));
++		gcr_prompt_set_message (prompt, _("Enter the PIN for your security key"));
++		gcr_prompt_set_description (prompt, g_tls_password_get_description (password));
++		gcr_prompt_set_continue_label (prompt, _("Continue"));
++		if (g_tls_password_get_flags (password) & G_TLS_PASSWORD_RETRY)
++			gcr_prompt_set_warning (prompt, _("The PIN was incorrect"));
++		gcr_prompt_password_async (prompt, g_task_get_cancellable (task), on_prompt_password, task);
++		return;
++	}
++
+ 	gcr_prompt_set_title (prompt, _("Unlock private key"));
+ 	gcr_prompt_set_message (prompt, _("Enter password to unlock the private key"));
+ 
+@@ -208,11 +263,19 @@ gcr_ssh_agent_interaction_ask_password_async (GTlsInteraction *interaction,
+ 	task = g_task_new (interaction, cancellable, callback, user_data);
+ 	g_task_set_task_data (task, g_object_ref (password), g_object_unref);
+ 
+-	secret_password_lookupv (&schema,
+-				 self->fields,
+-				 cancellable,
+-				 on_lookup_password_ready,
+-				 task);
++	/* Nothing to look up for a confirmation or a security key PIN */
++	if (self->fields && !password_is_confirmation (password)) {
++		secret_password_lookupv (&schema,
++					 self->fields,
++					 cancellable,
++					 on_lookup_password_ready,
++					 task);
++	} else {
++		gcr_system_prompt_open_for_prompter_async (self->prompter_name, 60,
++							   cancellable,
++							   on_prompt_open,
++							   task);
++	}
+ }
+ 
+ static GTlsInteractionResult
+@@ -260,7 +323,7 @@ gcr_ssh_agent_interaction_finalize (GObject *object)
+ 
+ 	g_free (self->prompter_name);
+ 	g_free (self->label);
+-	g_hash_table_unref (self->fields);
++	g_clear_pointer (&self->fields, g_hash_table_unref);
+ 
+ 	G_OBJECT_CLASS (gcr_ssh_agent_interaction_parent_class)->finalize (object);
+ }
+diff --git a/gcr/gcr-ssh-agent-process.c b/gcr/gcr-ssh-agent-process.c
+index 9cfaee9..2a48a8f 100644
+--- a/gcr/gcr-ssh-agent-process.c
++++ b/gcr/gcr-ssh-agent-process.c
+@@ -31,6 +31,10 @@
+ #include <glib-unix.h>
+ #include <glib/gstdio.h>
+ 
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++
+ enum {
+ 	PROP_0,
+ 	PROP_PATH,
+@@ -49,6 +53,7 @@ struct _GcrSshAgentProcess
+ 	GObject object;
+ 	gchar *path;
+         GStrv ssh_agent_args;
++	GcrSshAskpass *askpass;
+ 	gint output;
+ 	GMutex lock;
+ 	GPid pid;
+@@ -82,6 +87,7 @@ gcr_ssh_agent_process_finalize (GObject *object)
+ 	g_unlink (self->path);
+ 	g_free (self->path);
+         g_strfreev (self->ssh_agent_args);
++	g_clear_object (&self->askpass);
+ 	g_mutex_clear (&self->lock);
+ 
+ 	G_OBJECT_CLASS (gcr_ssh_agent_process_parent_class)->finalize (object);
+@@ -185,6 +191,42 @@ on_output_watch (gint fd,
+ 	return TRUE;
+ }
+ 
++/**
++ * gcr_ssh_agent_askpass_child_setup:
++ * @askpass: a #GcrSshAskpass object
++ *
++ * Like gcr_ssh_askpass_child_setup(), and additionally makes OpenSSH use
++ * the askpass for everything: the security key PIN, key use confirmation
++ * and the user presence notification. Without SSH_ASKPASS_REQUIRE=force
++ * these depend on DISPLAY/WAYLAND_DISPLAY being set when the child starts.
++ */
++void
++gcr_ssh_agent_askpass_child_setup (gpointer askpass)
++{
++	int saved_stdout;
++	int devnull;
++
++	/* g_setenv() logs a debug message once threads exist, and with
++	 * G_MESSAGES_DEBUG set that goes to stdout. For ssh-agent, stdout is
++	 * the pipe whose first output means "ready to connect", so keep it
++	 * quiet until exec. */
++	saved_stdout = dup (STDOUT_FILENO);
++	devnull = open ("/dev/null", O_WRONLY);
++	if (devnull >= 0) {
++		dup2 (devnull, STDOUT_FILENO);
++		close (devnull);
++	}
++
++	gcr_ssh_askpass_child_setup (askpass);
++	setenv ("SSH_ASKPASS_REQUIRE", "force", 1);
++	unsetenv ("SSH_ASKPASS_PROMPT");
++
++	if (saved_stdout >= 0) {
++		dup2 (saved_stdout, STDOUT_FILENO);
++		close (saved_stdout);
++	}
++}
++
+ static gboolean
+ agent_start_inlock (GcrSshAgentProcess *self,
+ 		    GError **error)
+@@ -211,8 +253,9 @@ agent_start_inlock (GcrSshAgentProcess *self,
+ 
+ 	ok = g_spawn_async_with_pipes ("/", argv, NULL,
+                                        G_SPAWN_DO_NOT_REAP_CHILD |
+-                                       G_SPAWN_CLOEXEC_PIPES, NULL,
+-                                       NULL, &pid, NULL,
++                                       G_SPAWN_CLOEXEC_PIPES,
++                                       self->askpass ? gcr_ssh_agent_askpass_child_setup : NULL,
++                                       self->askpass, &pid, NULL,
+                                        &self->output, NULL, error);
+ 	g_free (argv);
+ 	if (!ok)
+@@ -303,6 +346,27 @@ gcr_ssh_agent_process_new (const gchar *path,
+                              NULL);
+ }
+ 
++/**
++ * gcr_ssh_agent_process_set_askpass:
++ * @self: a #GcrSshAgentProcess
++ * @askpass: (nullable): the askpass the spawned ssh-agent should use
++ *
++ * ssh-agent itself asks for a security key's PIN, confirms the use of
++ * keys added with `ssh-add -c` and notifies that a security key wants a
++ * touch. Without this, it does so through whatever SSH_ASKPASS happens
++ * to be in the environment, which usually doesn't exist.
++ */
++void
++gcr_ssh_agent_process_set_askpass (GcrSshAgentProcess *self,
++                                   GcrSshAskpass *askpass)
++{
++	g_return_if_fail (GCR_IS_SSH_AGENT_PROCESS (self));
++	g_return_if_fail (askpass == NULL || GCR_IS_SSH_ASKPASS (askpass));
++	g_return_if_fail (self->pid == 0);
++
++	g_set_object (&self->askpass, askpass);
++}
++
+ GPid
+ gcr_ssh_agent_process_get_pid (GcrSshAgentProcess *self)
+ {
+diff --git a/gcr/gcr-ssh-agent-process.h b/gcr/gcr-ssh-agent-process.h
+index 23e1a5b..ae93277 100644
+--- a/gcr/gcr-ssh-agent-process.h
++++ b/gcr/gcr-ssh-agent-process.h
+@@ -26,6 +26,8 @@
+ 
+ #include <gio/gio.h>
+ 
++#include "gcr-ssh-askpass.h"
++
+ #include "egg/egg-buffer.h"
+ 
+ #define GCR_TYPE_SSH_AGENT_PROCESS gcr_ssh_agent_process_get_type ()
+@@ -33,9 +35,13 @@ G_DECLARE_FINAL_TYPE(GcrSshAgentProcess, gcr_ssh_agent_process, GCR, SSH_AGENT_P
+ 
+ GcrSshAgentProcess *gcr_ssh_agent_process_new         (const gchar *path,
+                                                        GStrv ssh_agent_args);
++void                gcr_ssh_agent_process_set_askpass (GcrSshAgentProcess *self,
++                                                       GcrSshAskpass *askpass);
+ GSocketConnection  *gcr_ssh_agent_process_connect     (GcrSshAgentProcess *self,
+                                                        GCancellable *cancellable,
+                                                        GError **error);
+ GPid                gcr_ssh_agent_process_get_pid     (GcrSshAgentProcess *self);
+ 
++void                gcr_ssh_agent_askpass_child_setup (gpointer askpass);
++
+ #endif /* GCR_SSH_AGENT_PROCESS_H */
+diff --git a/gcr/gcr-ssh-agent-service.c b/gcr/gcr-ssh-agent-service.c
+index d3e30c2..2db4241 100644
+--- a/gcr/gcr-ssh-agent-service.c
++++ b/gcr/gcr-ssh-agent-service.c
+@@ -65,6 +65,7 @@ struct _GcrSshAgentService
+         GStrv ssh_agent_args;
+ 	GcrSshAgentPreload *preload;
+ 	GcrSshAgentProcess *process;
++	GcrSshAskpass *agent_askpass;
+ 	/* for mocking */
+ 	GTlsInteraction *interaction;
+ 	GSocketAddress *address;
+@@ -138,6 +139,7 @@ gcr_ssh_agent_service_finalize (GObject *object)
+ 	g_clear_object (&self->interaction);
+ 
+ 	g_object_unref (self->process);
++	g_clear_object (&self->agent_askpass);
+ 	g_object_unref (self->listener);
+ 	g_clear_object (&self->address);
+ 	g_mutex_clear (&self->lock);
+@@ -279,7 +281,7 @@ ensure_key (GcrSshAgentService *self,
+ 
+ 	if (!g_spawn_sync (NULL, argv, NULL,
+ 	                   G_SPAWN_STDOUT_TO_DEV_NULL,
+-	                   gcr_ssh_askpass_child_setup, askpass,
++	                   gcr_ssh_agent_askpass_child_setup, askpass,
+ 	                   NULL, &standard_error, &status, &error)) {
+ 		g_warning ("couldn't run %s: %s", argv[0], error->message);
+ 	} else if (!g_spawn_check_exit_status (status, &error)) {
+@@ -386,6 +388,21 @@ gboolean
+ gcr_ssh_agent_service_start (GcrSshAgentService *self)
+ {
+ 	GError *error = NULL;
++	GTlsInteraction *interaction;
++
++	/* Prompts from ssh-agent itself (security key PIN, confirmation,
++	 * user presence) aren't about any one key file, so the interaction
++	 * has no keyring fields: nothing is looked up or stored. */
++	if (!self->agent_askpass) {
++		if (self->interaction)
++			interaction = g_object_ref (self->interaction);
++		else
++			interaction = gcr_ssh_agent_interaction_new (NULL, NULL, NULL);
++
++		self->agent_askpass = gcr_ssh_askpass_new (interaction);
++		g_object_unref (interaction);
++		gcr_ssh_agent_process_set_askpass (self->process, self->agent_askpass);
++	}
+ 
+ #if WITH_SYSTEMD
+ 	int ret;
+diff --git a/gcr/gcr-ssh-askpass-prompt.h b/gcr/gcr-ssh-askpass-prompt.h
+new file mode 100644
+index 0000000..f52e5e3
+--- /dev/null
++++ b/gcr/gcr-ssh-askpass-prompt.h
+@@ -0,0 +1,20 @@
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as
++ * published by the Free Software Foundation; either version 2.1 of
++ * the License, or (at your option) any later version.
++ */
++
++#ifndef GCR_SSH_ASKPASS_PROMPT_H
++#define GCR_SSH_ASKPASS_PROMPT_H
++
++/*
++ * gcr4-ssh-askpass puts this in front of the message it relays to
++ * gcr-ssh-agent when OpenSSH asks for a yes/no confirmation
++ * (SSH_ASKPASS_PROMPT=confirm) rather than a secret. The library's
++ * askpass relay passes the message through untouched, so the agent's
++ * interaction can tell the two apart without any library change.
++ */
++#define GCR_SSH_ASKPASS_CONFIRM_PREFIX "\x1f" "confirm:"
++
++#endif /* GCR_SSH_ASKPASS_PROMPT_H */
+diff --git a/gcr/gcr-ssh-askpass.c b/gcr/gcr-ssh-askpass.c
+index c432ea5..036e077 100644
+--- a/gcr/gcr-ssh-askpass.c
++++ b/gcr/gcr-ssh-askpass.c
+@@ -433,9 +433,76 @@ gcr_ssh_askpass_class_init (GcrSshAskpassClass *klass)
+ 
+ #include "egg/egg-secure-memory.h"
+ 
++#include "gcr-ssh-askpass-prompt.h"
++#include "gcr-prompt.h"
++#include "gcr-system-prompt.h"
++
+ EGG_SECURE_DEFINE_GLIB_GLOBALS ();
+ EGG_SECURE_DECLARE ("ssh-askpass");
+ 
++typedef struct {
++	GMainLoop *loop;
++	const gchar *message;
++} NotifyContext;
++
++static void
++on_notify_confirm (GObject *source_object,
++                   GAsyncResult *result,
++                   gpointer user_data)
++{
++	NotifyContext *ctx = user_data;
++
++	gcr_prompt_confirm_finish (GCR_PROMPT (source_object), result, NULL);
++	g_main_loop_quit (ctx->loop);
++}
++
++static void
++on_notify_open (GObject *source_object,
++                GAsyncResult *result,
++                gpointer user_data)
++{
++	NotifyContext *ctx = user_data;
++	GcrPrompt *prompt;
++	GError *error = NULL;
++
++	prompt = gcr_system_prompt_open_finish (result, &error);
++	if (!prompt) {
++		g_debug ("couldn't open prompt for notification: %s", error->message);
++		g_error_free (error);
++		g_main_loop_quit (ctx->loop);
++		return;
++	}
++
++	/* The prompt stays referenced until the process exits */
++	gcr_prompt_set_title (prompt, _("Use your security key"));
++	gcr_prompt_set_message (prompt, _("Touch your security key to continue"));
++	gcr_prompt_set_description (prompt, ctx->message);
++	gcr_prompt_set_continue_label (prompt, _("Hide"));
++	gcr_prompt_confirm_async (prompt, NULL, on_notify_confirm, ctx);
++}
++
++/*
++ * SSH_ASKPASS_PROMPT=none: OpenSSH shows a message while it waits for a
++ * security key touch, and kills the askpass with SIGTERM once the key
++ * answers. There is nothing to send back, so this doesn't go through
++ * gcr-ssh-agent's socket (that would leave a password prompt behind when
++ * the process dies). The prompt is opened straight with the system
++ * prompter, which closes it by itself when this process leaves the bus.
++ * Best effort: if no prompter is reachable, just exit.
++ */
++static int
++show_notification (const gchar *message)
++{
++	NotifyContext ctx = { NULL, message };
++
++	ctx.loop = g_main_loop_new (NULL, FALSE);
++	gcr_system_prompt_open_async (-1, NULL, on_notify_open, &ctx);
++	g_main_loop_run (ctx.loop);
++	g_main_loop_unref (ctx.loop);
++
++	return 0;
++}
++
+ int
+ main (int argc,
+       char *argv[])
+@@ -449,9 +516,25 @@ main (int argc,
+ 	int ret;
+ 	int fd;
+ 
++	message = g_string_new ("");
++	if (g_strcmp0 (g_getenv ("SSH_ASKPASS_PROMPT"), "confirm") == 0)
++		g_string_append (message, GCR_SSH_ASKPASS_CONFIRM_PREFIX);
++	for (i = 1; i < argc; i++) {
++		if (i > 1)
++			g_string_append_c (message, ' ');
++		g_string_append (message, argv[i]);
++	}
++
++	if (g_strcmp0 (g_getenv ("SSH_ASKPASS_PROMPT"), "none") == 0) {
++		ret = show_notification (message->str);
++		g_string_free (message, TRUE);
++		return ret;
++	}
++
+ 	path = g_getenv ("GCR_SSH_ASKPASS_SOCKET");
+ 	if (path == NULL) {
+ 		g_printerr (GCR_SSH_ASKPASS_BIN ": this program is not meant to be run directly");
++		g_string_free (message, TRUE);
+ 		return 2;
+ 	}
+ 
+@@ -469,15 +552,6 @@ main (int argc,
+ 		return -1;
+ 	}
+ 
+-	message = g_string_new ("");
+-	if (argc > 1) {
+-		for (i = 1; i < argc; i++) {
+-			if (i == 1)
+-				g_string_append_c (message, ' ');
+-			g_string_append (message, argv[i]);
+-		}
+-	}
+-
+ 	if (!write_all (fd, (const guchar *)message->str, message->len)) {
+ 		g_string_free (message, TRUE);
+ 		return -1;
+diff --git a/gcr/meson.build b/gcr/meson.build
+index 6b6f435..24e73c7 100644
+--- a/gcr/meson.build
++++ b/gcr/meson.build
+@@ -237,10 +237,11 @@ pkgconfig.generate(gcr_lib,
+ # gcr4-ssh-askpass binary
+ gcr_ssh_askpass = executable('gcr4-ssh-askpass',
+   'gcr-ssh-askpass.c',
+-  dependencies: [ glib_deps, libegg_dep ],
++  dependencies: [ gcr_deps, gcr_dep ],
+   c_args: [
+     '-DGCR_SSH_ASKPASS_TOOL',
+     '-DGCR_COMPILATION',
++    '-DGCR_API_SUBJECT_TO_CHANGE',
+   ],
+   include_directories: config_h_dir,
+   install: true,
+diff --git a/gcr/test-ssh-askpass.c b/gcr/test-ssh-askpass.c
+index 0229436..25ebc71 100644
+--- a/gcr/test-ssh-askpass.c
++++ b/gcr/test-ssh-askpass.c
+@@ -22,12 +22,16 @@
+ #include "config.h"
+ 
+ #include "gcr/gcr.h"
++#include "gcr/gcr-ssh-askpass-prompt.h"
+ 
+ #include "egg/egg-testing.h"
+ #include "egg/mock-interaction.h"
+ 
+ #include <glib/gstdio.h>
+ 
++#include <fcntl.h>
++#include <unistd.h>
++
+ extern const char *gcr_ssh_askpass_executable;
+ 
+ typedef struct {
+@@ -144,6 +148,176 @@ test_cancelled (Test *test,
+ 	g_assert_no_error (error);
+ }
+ 
++/* Records the message the askpass relayed, and answers with "yes" */
++typedef struct {
++	GTlsInteraction parent;
++	gchar *description;
++} RecordingInteraction;
++
++typedef struct {
++	GTlsInteractionClass parent;
++} RecordingInteractionClass;
++
++static GType recording_interaction_get_type (void);
++G_DEFINE_TYPE (RecordingInteraction, recording_interaction, G_TYPE_TLS_INTERACTION);
++
++static void
++recording_interaction_init (RecordingInteraction *self)
++{
++}
++
++static void
++recording_interaction_finalize (GObject *obj)
++{
++	g_free (((RecordingInteraction *)obj)->description);
++	G_OBJECT_CLASS (recording_interaction_parent_class)->finalize (obj);
++}
++
++static GTlsInteractionResult
++recording_interaction_ask_password (GTlsInteraction *interaction,
++                                    GTlsPassword *password,
++                                    GCancellable *cancellable,
++                                    GError **error)
++{
++	RecordingInteraction *self = (RecordingInteraction *)interaction;
++
++	g_free (self->description);
++	self->description = g_strdup (g_tls_password_get_description (password));
++	g_tls_password_set_value (password, (const guchar *)"yes", 3);
++	return G_TLS_INTERACTION_HANDLED;
++}
++
++static void
++recording_interaction_class_init (RecordingInteractionClass *klass)
++{
++	G_OBJECT_CLASS (klass)->finalize = recording_interaction_finalize;
++	G_TLS_INTERACTION_CLASS (klass)->ask_password = recording_interaction_ask_password;
++}
++
++/* The test log handler prints g_setenv()'s debug message to stdout,
++ * which here is the askpass output being checked */
++static void
++quiet_child_setup (gpointer askpass)
++{
++	int saved_stdout = dup (STDOUT_FILENO);
++	int devnull = open ("/dev/null", O_WRONLY);
++
++	dup2 (devnull, STDOUT_FILENO);
++	close (devnull);
++	gcr_ssh_askpass_child_setup (askpass);
++	dup2 (saved_stdout, STDOUT_FILENO);
++	close (saved_stdout);
++}
++
++static gchar *
++run_askpass (GcrSshAskpass *askpass,
++             const gchar *prompt_mode,
++             gchar **args,
++             gint *exit_status)
++{
++	GError *error = NULL;
++	GPtrArray *argv;
++	gchar buffer[64] = { 0, };
++	gssize count;
++	gint output;
++	gint status = -1;
++	GPid pid;
++
++	argv = g_ptr_array_new ();
++	g_ptr_array_add (argv, (gchar *)_GCR_TEST_SSH_ASKPASS_PATH);
++	for (; *args; args++)
++		g_ptr_array_add (argv, *args);
++	g_ptr_array_add (argv, NULL);
++
++	/* Set in this process rather than through envp, which would replace
++	 * what gcr_ssh_askpass_child_setup() adds in the child */
++	g_unsetenv ("GCR_SSH_ASKPASS_SOCKET");
++	/* No prompter is reachable: a notification must give up right away */
++	g_setenv ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus", TRUE);
++	if (prompt_mode)
++		g_setenv ("SSH_ASKPASS_PROMPT", prompt_mode, TRUE);
++	else
++		g_unsetenv ("SSH_ASKPASS_PROMPT");
++
++	g_spawn_async_with_pipes (NULL, (gchar **)argv->pdata, NULL,
++	                          G_SPAWN_DO_NOT_REAP_CHILD,
++	                          askpass ? quiet_child_setup : NULL, askpass,
++	                          &pid, NULL, &output, NULL, &error);
++	g_unsetenv ("SSH_ASKPASS_PROMPT");
++	g_ptr_array_free (argv, TRUE);
++	g_assert_no_error (error);
++
++	g_child_watch_add (pid, on_ssh_child, &status);
++	while (status == -1)
++		g_main_context_iteration (NULL, TRUE);
++
++	count = read (output, buffer, sizeof (buffer) - 1);
++	g_close (output, NULL);
++	g_assert_cmpint (count, >=, 0);
++
++	*exit_status = status;
++	return g_strndup (buffer, count);
++}
++
++static void
++test_message (void)
++{
++	RecordingInteraction *interaction;
++	GcrSshAskpass *askpass;
++	gchar *args[] = { "Enter", "passphrase:", NULL };
++	gchar *output;
++	gint status;
++
++	interaction = g_object_new (recording_interaction_get_type (), NULL);
++	askpass = gcr_ssh_askpass_new (G_TLS_INTERACTION (interaction));
++
++	output = run_askpass (askpass, NULL, args, &status);
++	g_assert_true (g_spawn_check_wait_status (status, NULL));
++	g_assert_cmpstr (output, ==, "yes");
++	g_assert_cmpstr (interaction->description, ==, "Enter passphrase:");
++
++	g_free (output);
++	g_object_unref (askpass);
++	g_object_unref (interaction);
++}
++
++static void
++test_confirmation (void)
++{
++	RecordingInteraction *interaction;
++	GcrSshAskpass *askpass;
++	gchar *args[] = { "Allow use of key?", NULL };
++	gchar *output;
++	gint status;
++
++	interaction = g_object_new (recording_interaction_get_type (), NULL);
++	askpass = gcr_ssh_askpass_new (G_TLS_INTERACTION (interaction));
++
++	output = run_askpass (askpass, "confirm", args, &status);
++	g_assert_true (g_spawn_check_wait_status (status, NULL));
++	g_assert_cmpstr (output, ==, "yes");
++	g_assert_cmpstr (interaction->description, ==,
++	                 GCR_SSH_ASKPASS_CONFIRM_PREFIX "Allow use of key?");
++
++	g_free (output);
++	g_object_unref (askpass);
++	g_object_unref (interaction);
++}
++
++static void
++test_notification (void)
++{
++	gchar *args[] = { "Confirm user presence for key ED25519-SK SHA256:x", NULL };
++	gchar *output;
++	gint status;
++
++	/* No GCR_SSH_ASKPASS_SOCKET needed: with no prompter reachable it
++	 * just gives up, and still succeeds */
++	output = run_askpass (NULL, "none", args, &status);
++	g_assert_true (g_spawn_check_wait_status (status, NULL));
++	g_free (output);
++}
++
+ static void
+ test_properties (Test *test,
+                  gconstpointer unused)
+@@ -168,6 +342,9 @@ main (int argc, char **argv)
+ 	g_test_add ("/gcr/ssh-askpass/ssh-keygen", Test, "booo", setup, test_ssh_keygen, teardown);
+ 	g_test_add ("/gcr/ssh-askpass/cancelled", Test, NULL, setup, test_cancelled, teardown);
+ 	g_test_add ("/gcr/ssh-askpass/properties", Test, NULL, setup, test_properties, teardown);
++	g_test_add_func ("/gcr/ssh-askpass/message", test_message);
++	g_test_add_func ("/gcr/ssh-askpass/confirmation", test_confirmation);
++	g_test_add_func ("/gcr/ssh-askpass/notification", test_notification);
+ 
+ 	return g_test_run ();
+ }

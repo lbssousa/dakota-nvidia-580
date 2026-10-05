@@ -5,7 +5,8 @@
 # dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
 # branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
 # (Goodix 538d) + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
-# pamu2fcfg), baked in via downstream
+# pamu2fcfg) + OpenSSH and GCR's ssh-agent patched for security key
+# (FIDO) PIN/touch prompts, baked in via downstream
 # OCI image layering — not via forking the upstream BuildStream build.
 # See README.md for the full reasoning (why downstream instead of a
 # BuildStream fork) and known limitations.
@@ -72,6 +73,17 @@ ARG PAM_U2F_REF=pam_u2f-1.4.0
 # bumped with it rather than silently downgrading ssh.
 ARG OPENSSH_VERSION=10.5p1
 ARG OPENSSH_SHA256=d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11
+
+# GCR's ssh-agent wrapper (gcr-ssh-agent) and askpass (gcr4-ssh-askpass),
+# rebuilt with files/gcr-ssh-agent-fido-prompts.patch so FIDO ("sk") keys
+# work through it: as shipped, the ssh-agent it spawns has no askpass, so
+# the security key PIN prompt fails and the touch request is never shown
+# (see the patch header; based on gcr!173, which is still open). Only
+# the two executables are replaced; they link the base's own libgcr-4,
+# so GCR_REF MUST be the base's gcr version: gcr-probe fails the build
+# otherwise. Drop this once a release carries the fix.
+ARG GCR_REPO=https://gitlab.gnome.org/GNOME/gcr.git
+ARG GCR_REF=4.4.1
 
 # Identity this downstream image reports as, in place of the upstream
 # Dakota base it's layered on. Rewritten in the final stage below into
@@ -304,6 +316,22 @@ RUN set -eux; \
     echo "Base image ships OpenSSH $(cat /openssh-version)" >&2
 
 # ---------------------------------------------------------------------
+# gcr-probe — records the gcr version the base image ships, for
+# gcr-builder to compare against GCR_REF. Read from libgcr-4's file name:
+# gcr 4.x builds it as libgcr-4.so.4.<minor>.<micro>, i.e. the first
+# three components of the release version (4.4.0.1 ships 4.4.0).
+# ---------------------------------------------------------------------
+FROM dakota-base AS gcr-probe
+RUN set -eux; \
+    so="$(find /usr/lib* -name 'libgcr-4.so.4.*' 2>/dev/null | head -n1)"; \
+    if [ -z "$so" ]; then \
+        echo "ERROR: libgcr-4.so.4.* not found in this Dakota base image." >&2; \
+        exit 1; \
+    fi; \
+    basename "$so" | sed -E 's/^libgcr-4\.so\.//' > /gcr-version; \
+    echo "Base image ships gcr $(cat /gcr-version) ($so)" >&2
+
+# ---------------------------------------------------------------------
 # nvidia-libdir-probe — same idea as libfprint-probe/pam-u2f-probe
 # above, applied to NVIDIA's userspace libraries: locates the real
 # 64-bit library directory already used in the Dakota base image by
@@ -501,6 +529,45 @@ RUN set -eux; \
     install -D -m0755 ssh ssh-agent ssh-keygen -t /out/usr/bin/
 
 # ---------------------------------------------------------------------
+# gcr-builder — builds gcr at the base's version with
+# files/gcr-ssh-agent-fido-prompts.patch, runs the ssh-agent/askpass
+# tests, and keeps only /usr/libexec/gcr-ssh-agent and
+# /usr/libexec/gcr4-ssh-askpass. The libraries built along the way are
+# discarded: both executables use only libgcr-4/gck-2's public API and
+# load the base's copies at runtime, next to a glib (2.90) no older than
+# this Fedora's. GTK, introspection and docs are off (not needed for
+# these two). find_program() resolves ssh-agent/ssh-add to /usr/bin,
+# which is where the base has them too.
+# ---------------------------------------------------------------------
+FROM fedora:44 AS gcr-builder
+ARG GCR_REPO
+ARG GCR_REF
+RUN dnf install -y meson ninja-build gcc git gettext pkgconf-pkg-config \
+        glib2-devel libgcrypt-devel p11-kit-devel libsecret-devel \
+        systemd-devel "pkgconfig(systemd)" openssh-clients gnupg2 patch && \
+    dnf clean all
+COPY --from=gcr-probe /gcr-version /gcr-version
+COPY files/gcr-ssh-agent-fido-prompts.patch /gcr-ssh-agent-fido-prompts.patch
+RUN set -eux; \
+    if [ "$(cat /gcr-version)" != "$(echo "${GCR_REF}" | cut -d. -f1-3)" ]; then \
+        echo "ERROR: the base image ships gcr $(cat /gcr-version) but GCR_REF is ${GCR_REF}." >&2; \
+        echo "Bump GCR_REF in the Containerfile (and check the patch still applies)." >&2; \
+        exit 1; \
+    fi; \
+    git clone --branch "${GCR_REF}" --depth 1 "${GCR_REPO}" /src; \
+    cd /src; \
+    patch -Np1 -i /gcr-ssh-agent-fido-prompts.patch; \
+    meson setup build --prefix=/usr --libexecdir=/usr/libexec \
+        -Dgtk4=false -Dintrospection=false -Dvapi=false -Dgtk_doc=false \
+        -Dcrypto=libgcrypt -Dssh_agent=true -Dsystemd=enabled \
+        -Dgpg_path=/usr/bin/gpg; \
+    ninja -C build; \
+    meson test -C build --print-errorlogs --suite gcr-ssh-agent; \
+    meson test -C build --print-errorlogs ssh-askpass; \
+    install -D -m0755 build/gcr/gcr-ssh-agent build/gcr/gcr4-ssh-askpass \
+        -t /out/usr/libexec/
+
+# ---------------------------------------------------------------------
 # final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
@@ -519,6 +586,7 @@ COPY --from=nvidia-builder /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
+COPY --from=gcr-builder /out/usr/ /usr/
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Module options for nvidia.ko / nvidia-drm.ko, applied at load time.

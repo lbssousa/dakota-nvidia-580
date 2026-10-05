@@ -1,7 +1,7 @@
 # dakota-nvidia-580
 
 A customized [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
-image with four components baked in via downstream OCI image layering
+image with the components below baked in via downstream OCI image layering
 (not by forking the upstream BuildStream build — see ["Why downstream
 instead of forking
 BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
@@ -58,6 +58,33 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `OPENSSH_VERSION`/`OPENSSH_SHA256` together with a base that moves to
   a new OpenSSH. Only the three programs that call `notify_start()` are
   replaced; `sshd` and `ssh-sk-helper` stay as shipped.
+- **GCR's ssh-agent with security key prompts** — `gcr-ssh-agent` and
+  `gcr4-ssh-askpass` rebuilt from gcr (pinned to the base's version)
+  plus `files/gcr-ssh-agent-fido-prompts.patch`. As shipped,
+  `gcr-ssh-agent` starts OpenSSH's `ssh-agent` with no askpass, and
+  signing with a FIDO ("sk") key happens inside that `ssh-agent`. It
+  falls back to `/usr/libexec/ssh-askpass`, which Dakota doesn't have,
+  so the PIN prompt fails ("agent refused operation") and the touch
+  request is never shown
+  ([gcr#116](https://gitlab.gnome.org/GNOME/gcr/-/issues/116),
+  [gcr#136](https://gitlab.gnome.org/GNOME/gcr/-/issues/136)).
+  `gcr4-ssh-askpass` also turned confirmations (`ssh-add -c` keys) and
+  touch notifications into password prompts. With the patch:
+  - the PIN prompt is a GNOME system prompt, and the PIN is never
+    looked up in or saved to the login keyring;
+  - an `ssh-add -c` key gets an Allow/Cancel prompt;
+  - the touch request shows a prompt that closes by itself once the key
+    is touched.
+
+  The patch is based on the still-open
+  [gcr!173](https://gitlab.gnome.org/GNOME/gcr/-/merge_requests/173),
+  but differs from it in two ways. gcr!173 drops the touch notification,
+  while this patch shows it. gcr!173 also changes `libgcr-4`, while this
+  patch changes only the two executables, which keep using the base's
+  own `libgcr-4`/`gck-2`. `gcr-probe` fails the build when the base's gcr
+  differs from `GCR_REF`, so bump the two together. The
+  `gcr-ssh-agent.socket` user unit stays disabled, as on stock Dakota;
+  enable it with `systemctl --user enable --now gcr-ssh-agent.socket`.
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, published under three tags each — the same
@@ -480,17 +507,33 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
   │           to -DPAM_DIR=<probed dir> and pamu2fcfg to /usr/bin,
   │           DESTDIR=/out
   │
+  ├─→ openssh-probe           records the base's OpenSSH version
+  │     │
+  │     └─→ openssh-builder   (Fedora, build environment only)
+  │           builds that version + files/openssh-askpass-notify.patch,
+  │           keeping ssh, ssh-agent and ssh-keygen
+  │
+  ├─→ gcr-probe               records the base's gcr version
+  │     │                     (from libgcr-4's file name)
+  │     │
+  │     └─→ gcr-builder       (Fedora, build environment only)
+  │           builds that version + files/gcr-ssh-agent-fido-prompts.patch,
+  │           runs its ssh-agent/askpass tests, keeping only
+  │           gcr-ssh-agent and gcr4-ssh-askpass
+  │
   └─→ final (FROM dakota-base again)
         COPY of the /out trees (libfprint's overwrites the
         stock library in place; pam-u2f's adds new files alongside
-        it), nouveau blacklist, p11-kit OpenSC whitelist (see
+        it; openssh's and gcr's overwrite the stock executables),
+        nouveau blacklist, p11-kit OpenSC whitelist (see
         "Making the YubiKey visible to GnuPG at boot"),
         depmod + ldconfig -r, signing policy (scripts/configure-signing-policy.sh —
         see "Verification"), bootc container lint
 ```
 
-The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`
-and `pam-u2f-builder` stages use Fedora **only as a
+The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`,
+`pam-u2f-builder`, `openssh-builder` and `gcr-builder` stages use
+Fedora **only as a
 build environment** (it has `dnf`, `gcc`, `meson`, `cmake`,
 `rpm2cpio`...) — nothing from them ends up in the final image except
 what the scripts/build commands explicitly package into `/out`. The
@@ -1274,6 +1317,17 @@ reconstructs itself from upstream source + the image's own shipped
   in `files/opensc-p11-kit.module`. Deliberate: the YubiKey on this
   machine is used for the OpenPGP card (via `scdaemon`) and FIDO2/U2F
   (via `pam_u2f`/`libfido2`), neither of which goes through PKCS#11.
+- **GCR's ssh-agent still advertises every `~/.ssh/*.pub`** whose
+  private key file exists, as if it were already loaded, and loads it
+  with `ssh-add` on the first signing request. A failed load leaves
+  that key refused for the session
+  ([gnome-keyring#193](https://gitlab.gnome.org/GNOME/gnome-keyring/-/issues/193),
+  same code in gcr). The GCR patch doesn't touch this.
+- **The touch prompt's button only hides the prompt**, it doesn't
+  cancel the signature: OpenSSH keeps waiting for the key until it is
+  touched or times out. When a PIN is needed, OpenSSH asks for it first
+  and then waits for the touch without a separate notification (its PIN
+  prompt already says "Enter PIN and confirm user presence").
 - **Actually enabling YubiKey PAM auth (`/etc/pam.d` wiring) is out of
   scope here** — this repo only ensures `pam_u2f.so`/`pamu2fcfg` exist
   in the image; see the pam-u2f bullet near the top of this README.
