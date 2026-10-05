@@ -60,6 +60,19 @@ ARG LIBFPRINT_REF=v1.94.10-goodix538d.2
 ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
+# OpenSSH, rebuilt with files/openssh-askpass-notify.patch. The base
+# image's ssh is plain upstream 10.5p1; the patch makes notify_start()
+# (the "Confirm user presence for key ..." request for FIDO keys) honour
+# SSH_ASKPASS_REQUIRE the way read_passphrase() already does, so with
+# SSH_ASKPASS_REQUIRE=prefer the touch request goes to the askpass dialog
+# instead of a terminal nobody is looking at (proposed upstream; drop
+# this stage once a release carries it). The version MUST equal the
+# base image's: openssh-probe fails the build when it doesn't, so a base
+# bump that moves to a new OpenSSH needs this pin (and the checksum)
+# bumped with it rather than silently downgrading ssh.
+ARG OPENSSH_VERSION=10.5p1
+ARG OPENSSH_SHA256=d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11
+
 # Identity this downstream image reports as, in place of the upstream
 # Dakota base it's layered on. Rewritten in the final stage below into
 # both /etc/os-release's IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF
@@ -282,6 +295,15 @@ RUN set -eux; \
     echo "Found PAM modules at: $so (dir: $(cat /pam-u2f-libdir))" >&2
 
 # ---------------------------------------------------------------------
+# openssh-probe — records the OpenSSH version the base image ships, for
+# openssh-builder to compare against OPENSSH_VERSION.
+# ---------------------------------------------------------------------
+FROM dakota-base AS openssh-probe
+RUN set -eux; \
+    ssh -V 2>&1 | sed -E 's/^OpenSSH_([0-9]+\.[0-9]+p[0-9]+).*/\1/' > /openssh-version; \
+    echo "Base image ships OpenSSH $(cat /openssh-version)" >&2
+
+# ---------------------------------------------------------------------
 # nvidia-libdir-probe — same idea as libfprint-probe/pam-u2f-probe
 # above, applied to NVIDIA's userspace libraries: locates the real
 # 64-bit library directory already used in the Dakota base image by
@@ -443,6 +465,42 @@ RUN pamdir="$(cat /pam-u2f-libdir)" && \
     DESTDIR=/out cmake --install /src/build
 
 # ---------------------------------------------------------------------
+# openssh-builder — builds ssh, ssh-agent and ssh-keygen (the three
+# programs that call notify_start(); see files/openssh-askpass-notify.patch)
+# from the upstream tarball plus that patch. Only those three are
+# replaced in the final image: they link nothing but libcrypto, libz and
+# glibc, all present in the base at an equal or newer version than this
+# Fedora's. ssh-sk-helper, which needs the base's own libfido2/libcbor,
+# and sshd, which is built against PAM/audit, are deliberately left
+# alone — neither calls notify_start().
+#
+# Paths match the base's build (/usr/libexec helpers, /etc/ssh config).
+# The tarball is pinned by checksum rather than PGP signature.
+# ---------------------------------------------------------------------
+FROM fedora:44 AS openssh-builder
+ARG OPENSSH_VERSION
+ARG OPENSSH_SHA256
+RUN dnf install -y gcc make openssl-devel zlib-devel patch curl && \
+    dnf clean all
+COPY --from=openssh-probe /openssh-version /openssh-version
+COPY files/openssh-askpass-notify.patch /openssh-askpass-notify.patch
+RUN set -eux; \
+    if [ "$(cat /openssh-version)" != "${OPENSSH_VERSION}" ]; then \
+        echo "ERROR: the base image ships OpenSSH $(cat /openssh-version) but OPENSSH_VERSION is ${OPENSSH_VERSION}." >&2; \
+        echo "Bump OPENSSH_VERSION and OPENSSH_SHA256 in the Containerfile." >&2; \
+        exit 1; \
+    fi; \
+    curl -fsSL -o /openssh.tar.gz "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz"; \
+    echo "${OPENSSH_SHA256}  /openssh.tar.gz" | sha256sum -c -; \
+    tar -xzf /openssh.tar.gz -C /; \
+    cd "/openssh-${OPENSSH_VERSION}"; \
+    patch -Np1 -i /openssh-askpass-notify.patch; \
+    ./configure --prefix=/usr --sysconfdir=/etc/ssh --libexecdir=/usr/libexec \
+        --with-privsep-path=/var/empty; \
+    make -j"$(nproc)" ssh ssh-agent ssh-keygen; \
+    install -D -m0755 ssh ssh-agent ssh-keygen -t /out/usr/bin/
+
+# ---------------------------------------------------------------------
 # final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
@@ -460,6 +518,7 @@ COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
+COPY --from=openssh-builder /out/usr/ /usr/
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Module options for nvidia.ko / nvidia-drm.ko, applied at load time.

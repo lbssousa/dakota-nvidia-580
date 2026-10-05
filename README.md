@@ -45,6 +45,19 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   turns out to be a plain, directly-editable file (confirmed by
   inspecting the published image), not `authselect`-templated, so that
   gap may be easier to close than documented there.
+- **OpenSSH with a touch-prompt patch** — `ssh`, `ssh-agent` and
+  `ssh-keygen` rebuilt from the upstream tarball plus
+  `files/openssh-askpass-notify.patch`, which makes `notify_start()`
+  honour `SSH_ASKPASS_REQUIRE`. Stock OpenSSH sends the "Confirm user
+  presence for key …" request to the terminal whenever stderr is a tty,
+  even with `SSH_ASKPASS_REQUIRE=prefer`, so a FIDO/resident key's PIN
+  shows up in the graphical askpass dialog but the YubiKey touch
+  request doesn't. With the patch both go to the dialog. Same patch as
+  lbssousa/omarchy-setup's `openssh-askpass` playbook. The version must
+  match the base's (`openssh-probe` fails the build otherwise); bump
+  `OPENSSH_VERSION`/`OPENSSH_SHA256` together with a base that moves to
+  a new OpenSSH. Only the three programs that call `notify_start()` are
+  replaced; `sshd` and `ssh-sk-helper` stay as shipped.
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, published under three tags each — the same
