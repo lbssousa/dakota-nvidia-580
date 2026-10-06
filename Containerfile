@@ -498,7 +498,11 @@ RUN pamdir="$(cat /pam-u2f-libdir)" && \
 # from the upstream tarball plus that patch. Only those three are
 # replaced in the final image: they link nothing but libcrypto, libz and
 # glibc, all present in the base at an equal or newer version than this
-# Fedora's. ssh-sk-helper, which needs the base's own libfido2/libcbor,
+# Fedora's. --with-security-key-builtin only makes "internal" (the base's
+# ssh-sk-helper) the default SK provider, as in the base's own build;
+# without it `ssh-keygen -K` fails with "Cannot download keys without
+# provider". libfido2-devel is needed by configure, nothing links it.
+# ssh-sk-helper, which needs the base's own libfido2/libcbor,
 # and sshd, which is built against PAM/audit, are deliberately left
 # alone — neither calls notify_start().
 #
@@ -508,7 +512,7 @@ RUN pamdir="$(cat /pam-u2f-libdir)" && \
 FROM fedora:44 AS openssh-builder
 ARG OPENSSH_VERSION
 ARG OPENSSH_SHA256
-RUN dnf install -y gcc make openssl-devel zlib-devel patch curl && \
+RUN dnf install -y gcc make openssl-devel zlib-devel libfido2-devel patch curl && \
     dnf clean all
 COPY --from=openssh-probe /openssh-version /openssh-version
 COPY files/openssh-askpass-notify.patch /openssh-askpass-notify.patch
@@ -524,8 +528,10 @@ RUN set -eux; \
     cd "/openssh-${OPENSSH_VERSION}"; \
     patch -Np1 -i /openssh-askpass-notify.patch; \
     ./configure --prefix=/usr --sysconfdir=/etc/ssh --libexecdir=/usr/libexec \
-        --with-privsep-path=/var/empty; \
+        --with-privsep-path=/var/empty --with-security-key-builtin; \
     make -j"$(nproc)" ssh ssh-agent ssh-keygen; \
+    grep -q '^#define ENABLE_SK_INTERNAL' config.h || \
+        { echo "ERROR: ENABLE_SK_INTERNAL is not set; ssh-keygen -K would have no default SK provider." >&2; exit 1; }; \
     install -D -m0755 ssh ssh-agent ssh-keygen -t /out/usr/bin/
 
 # ---------------------------------------------------------------------

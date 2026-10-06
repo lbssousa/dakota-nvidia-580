@@ -57,7 +57,11 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   match the base's (`openssh-probe` fails the build otherwise); bump
   `OPENSSH_VERSION`/`OPENSSH_SHA256` together with a base that moves to
   a new OpenSSH. Only the three programs that call `notify_start()` are
-  replaced; `sshd` and `ssh-sk-helper` stay as shipped.
+  replaced; `sshd` and `ssh-sk-helper` stay as shipped. It is configured
+  with `--with-security-key-builtin` so `ssh`/`ssh-keygen` default to the
+  `internal` SK provider (the base's `ssh-sk-helper`) like the base's own
+  build; without it `ssh-keygen -K` fails with "Cannot download keys
+  without provider".
 - **GCR's ssh-agent with security key prompts** — `gcr-ssh-agent` and
   `gcr4-ssh-askpass` rebuilt from gcr (pinned to the base's version)
   plus `files/gcr-ssh-agent-fido-prompts.patch`. As shipped,
