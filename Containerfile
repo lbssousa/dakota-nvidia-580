@@ -141,8 +141,8 @@ ARG IMAGE_TAG=testing
 # Containerfile changes needed. Keeping both pins here, not only in
 # the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:testing@sha256:9d7596053c652eb38f0e0a77edbc5856f353bbed0cef97b50eb2aa62339ff970
-ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:339d92970c617573c2feb99a3b292d464add4bda3104ab8ae65c1f2b0257c5cb
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:testing@sha256:110fdf396bd1a11d5665616c86e5b86a1513c389d617a423eb0f4a446b6b87df
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:c3f06bbb395d46bf97c500b4d4a5ea7a8c634e235541012f5741e429cfd74f10
 # ^ resolved via (re-run before every build — these drift):
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota:testing | jq -r .Digest
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Digest
@@ -583,7 +583,12 @@ ARG IMAGE_TAG
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
-COPY --from=libfprint-builder /out/usr/ /usr/
+# TEMPORARILY DISABLED: the libfprint fork is not baked into the image for
+# now; it is installed at runtime via lbssousa/bluefin-initial-setup
+# (`just libfprint-dakota`). Re-enable by uncommenting the line below.
+# The libfprint-probe/libfprint-builder stages are kept: BuildKit skips
+# stages that the final image doesn't reference.
+# COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
 COPY --from=gcr-builder /out/usr/ /usr/
