@@ -1,0 +1,24 @@
+cfPDFPagesFP: flush the temporary PDF before PDFio opens it
+
+cfPDFPagesFP() copies its input to a temporary file through stdio and
+then hands the file name to pdfioFileOpen() without flushing. The
+unwritten tail can hold the cross-reference table and trailer, so the
+page count fails with "Missing Root object" / "Unexpected page count"
+and PDF-to-raster / PDF-to-PCL-XL jobs stop with "universal filter
+failed".
+
+Backport of OpenPrinting/libcupsfilters#167 (e14bad4), reduced to its
+functional fflush(). Also carried by projectbluefin/dakota#1724 in the
+SDK patch queue; drop when the base's libcupsfilters has it (see the
+Containerfile's libcupsfilters-builder).
+
+--- a/cupsfilters/pdf.c
++++ b/cupsfilters/pdf.c
+@@ -165,6 +165,7 @@
+     fwrite(buffer, 1, bytes_read, temp_fp);
+   }
+ 
++  fflush(temp_fp);
+   // Open the temp file with pdfio
+   pdfio_file_t *pdf = pdfioFileOpen(temp_filename, NULL, NULL, NULL, NULL);
+ 

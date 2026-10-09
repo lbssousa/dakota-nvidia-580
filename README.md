@@ -89,6 +89,20 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   differs from `GCR_REF`, so bump the two together. The
   `gcr-ssh-agent.socket` user unit stays disabled, as on stock Dakota;
   enable it with `systemctl --user enable --now gcr-ssh-agent.socket`.
+- **Printing fixes in libcupsfilters** — `libcupsfilters.so.2` rebuilt
+  from the base's version (2.2.1) plus two upstream fixes, so printing
+  works: `files/libcupsfilters-flush-pdf-before-page-count.patch`
+  ([libcupsfilters#167](https://github.com/OpenPrinting/libcupsfilters/pull/167),
+  PDF jobs failing with "Missing Root object"; also in the base as
+  projectbluefin/dakota#1724) and
+  `files/libcupsfilters-banner-close-output.patch`
+  ([libcupsfilters#249](https://github.com/OpenPrinting/libcupsfilters/pull/249),
+  the CUPS test page failing with "universal filter failed";
+  see projectbluefin/dakota#1707). `libcupsfilters-probe` fails the build
+  when the base's version differs from `LIBCUPSFILTERS_VERSION`. Built
+  `--without-jpegxl` because the builder's libjxl (0.11) is older than the
+  base's (0.12), so JPEG XL input images are not converted by the image
+  filters. Drop the stage once the base carries both fixes.
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, published under three tags each — the same
@@ -524,6 +538,13 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
   │           builds that version + files/gcr-ssh-agent-fido-prompts.patch,
   │           runs its ssh-agent/askpass tests, keeping only
   │           gcr-ssh-agent and gcr4-ssh-askpass
+  │
+  ├─→ libcupsfilters-probe    records the base's libcupsfilters version
+  │     │                     (from the installed CHANGES.md)
+  │     │
+  │     └─→ libcupsfilters-builder   (Fedora, build environment only)
+  │           builds that version + files/libcupsfilters-*.patch,
+  │           keeping only libcupsfilters.so.2.0.0
   │
   └─→ final (FROM dakota-base again)
         COPY of the /out trees (libfprint's overwrites the

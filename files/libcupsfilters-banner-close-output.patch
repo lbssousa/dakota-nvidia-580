@@ -1,0 +1,32 @@
+cfFilterBannerToPDF: close the output stream on the success path
+
+cfFilterBannerToPDF() never closes (or flushes) its output stream. When
+it runs inside cfFilterChain(), as in the "universal" filter, the
+parent closes the raw file descriptor and exits right after it returns,
+so the buffered tail of the generated PDF (xref table and %%EOF) is
+lost and the next filter, pdftopdf, gets a truncated PDF. The CUPS test
+page (application/vnd.cups-pdf-banner) then fails with "universal
+filter failed".
+
+Backport of OpenPrinting/libcupsfilters#249 (fixes #212, merged
+2026-09-14). Drop once the base's libcupsfilters includes it (see the
+Containerfile's libcupsfilters-builder).
+
+--- a/cupsfilters/bannertopdf.c
++++ b/cupsfilters/bannertopdf.c
+@@ -1021,6 +1021,14 @@
+   unlink(tempfile);
+   if (inputfp)
+     fclose(inputfp);
+-  
++  // The output stream has to be flushed and closed here. When this filter
++  // function is called from cfFilterChain() (as the "universal" filter does),
++  // the parent closes the raw output file descriptor and exits right after
++  // this function returns, so a still buffered tail of the generated PDF
++  // (cross-reference table and "%%EOF") would be lost and the following
++  // filter in the chain would fail to parse the file.
++  if (outputfp)
++    fclose(outputfp);
++
+   return (ret);
+ }

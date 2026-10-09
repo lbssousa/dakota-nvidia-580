@@ -85,6 +85,14 @@ ARG OPENSSH_SHA256=d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218d
 ARG GCR_REPO=https://gitlab.gnome.org/GNOME/gcr.git
 ARG GCR_REF=4.4.1
 
+# libcupsfilters, rebuilt with the two printing fixes in
+# files/libcupsfilters-*.patch so PDF jobs and the CUPS test page print
+# (OpenPrinting/libcupsfilters#167 and #249; see projectbluefin/dakota#1707).
+# The version MUST equal the base's: libcupsfilters-probe fails the build
+# otherwise. Drop the stage once the base's release carries both fixes.
+ARG LIBCUPSFILTERS_VERSION=2.2.1
+ARG LIBCUPSFILTERS_SHA256=0a22b849d5068c4c86b20fbb4192d3faa3dabcc9ee844c8fd73710ed821d4860
+
 # Identity this downstream image reports as, in place of the upstream
 # Dakota base it's layered on. Rewritten in the final stage below into
 # both /etc/os-release's IMAGE_NAME/IMAGE_VENDOR/IMAGE_TAG/IMAGE_REF
@@ -332,6 +340,19 @@ RUN set -eux; \
     echo "Base image ships gcr $(cat /gcr-version) ($so)" >&2
 
 # ---------------------------------------------------------------------
+# libcupsfilters-probe — records the libcupsfilters release the base
+# image ships, for libcupsfilters-builder to compare against
+# LIBCUPSFILTERS_VERSION. Read from the CHANGES.md header the package
+# installs ("# CHANGES - OpenPrinting libcupsfilters v2.2.1 - ...").
+# ---------------------------------------------------------------------
+FROM dakota-base AS libcupsfilters-probe
+RUN set -eux; \
+    sed -nE '1s/^.* v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' /usr/share/doc/libcupsfilters/CHANGES.md > /libcupsfilters-version; \
+    test -s /libcupsfilters-version; \
+    test -f /usr/lib/x86_64-linux-gnu/libcupsfilters.so.2.0.0; \
+    echo "Base image ships libcupsfilters $(cat /libcupsfilters-version)" >&2
+
+# ---------------------------------------------------------------------
 # nvidia-libdir-probe — same idea as libfprint-probe/pam-u2f-probe
 # above, applied to NVIDIA's userspace libraries: locates the real
 # 64-bit library directory already used in the Dakota base image by
@@ -574,6 +595,56 @@ RUN set -eux; \
         -t /out/usr/libexec/
 
 # ---------------------------------------------------------------------
+# libcupsfilters-builder — builds libcupsfilters at the base's version
+# with the two printing fixes below, and keeps only the shared library:
+#   files/libcupsfilters-flush-pdf-before-page-count.patch
+#       (OpenPrinting/libcupsfilters#167; PDF jobs failing with
+#       "Missing Root object"; also in projectbluefin/dakota#1724)
+#   files/libcupsfilters-banner-close-output.patch
+#       (OpenPrinting/libcupsfilters#249; the CUPS test page,
+#       application/vnd.cups-pdf-banner, failing with "universal filter
+#       failed"; see projectbluefin/dakota#1707)
+# The filters under /usr/lib/cups/filter and cupsd's helpers link the
+# library dynamically, so replacing libcupsfilters.so.2.0.0 is enough.
+# Its dependencies are soname-stable and already in the base, except
+# libjxl: this Fedora has 0.11, the base 0.12, so the library would not
+# load. It is therefore built --without-jpegxl (JPEG XL *input images*
+# are no longer converted by the image filters; nothing else changes).
+# Revisit if this Fedora catches up to the base's libjxl.
+# LIBCUPSFILTERS_VERSION MUST be the base's: the probe fails the build
+# otherwise, so a base bump with a newer libcupsfilters (which may carry
+# these fixes) is looked at instead of silently downgraded.
+# ---------------------------------------------------------------------
+FROM fedora:44 AS libcupsfilters-builder
+ARG LIBCUPSFILTERS_VERSION
+ARG LIBCUPSFILTERS_SHA256
+RUN dnf install -y gcc gcc-c++ make patch curl xz pkgconf-pkg-config \
+        cups-devel pdfio-devel poppler-cpp-devel poppler-devel \
+        ghostscript ghostscript-devel lcms2-devel libjpeg-turbo-devel libpng-devel \
+        libtiff-devel libexif-devel fontconfig-devel \
+        dbus-devel qpdf-devel mupdf poppler-utils cups-ipptool && \
+    dnf clean all
+COPY --from=libcupsfilters-probe /libcupsfilters-version /libcupsfilters-version
+COPY files/libcupsfilters-flush-pdf-before-page-count.patch files/libcupsfilters-banner-close-output.patch /
+RUN set -eux; \
+    if [ "$(cat /libcupsfilters-version)" != "${LIBCUPSFILTERS_VERSION}" ]; then \
+        echo "ERROR: the base image ships libcupsfilters $(cat /libcupsfilters-version) but LIBCUPSFILTERS_VERSION is ${LIBCUPSFILTERS_VERSION}." >&2; \
+        echo "Bump LIBCUPSFILTERS_VERSION/SHA256 (or drop this stage if the base carries the fixes)." >&2; \
+        exit 1; \
+    fi; \
+    curl -fsSL -o /src.tar.xz "https://github.com/OpenPrinting/libcupsfilters/releases/download/${LIBCUPSFILTERS_VERSION}/libcupsfilters-${LIBCUPSFILTERS_VERSION}.tar.xz"; \
+    echo "${LIBCUPSFILTERS_SHA256}  /src.tar.xz" | sha256sum -c -; \
+    tar -xJf /src.tar.xz -C /; \
+    cd "/libcupsfilters-${LIBCUPSFILTERS_VERSION}"; \
+    patch -Np1 -i /libcupsfilters-flush-pdf-before-page-count.patch; \
+    patch -Np1 -i /libcupsfilters-banner-close-output.patch; \
+    ./configure --prefix=/usr --libdir=/usr/lib/x86_64-linux-gnu \
+        --sysconfdir=/etc --localstatedir=/var --disable-static \
+        --without-jpegxl; \
+    make -j"$(nproc)"; \
+    install -D -m0755 .libs/libcupsfilters.so.2.0.0 -t /out/usr/lib/x86_64-linux-gnu/
+
+# ---------------------------------------------------------------------
 # final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
@@ -598,6 +669,7 @@ COPY --from=nvidia-builder /out/ /
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
 COPY --from=gcr-builder /out/usr/ /usr/
+COPY --from=libcupsfilters-builder /out/usr/ /usr/
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Module options for nvidia.ko / nvidia-drm.ko, applied at load time.
