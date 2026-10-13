@@ -49,15 +49,11 @@ ARG LIBFPRINT_REF=v1.94.10-goodix538d.2
 # PAM authentication — neither can come from Homebrew, since PAM modules
 # must live in the system's PAM module directory to be loadable by
 # gdm/sudo/su at all (a module under /home/linuxbrew is not on that
-# path). Its own runtime dependency, libfido2, IS left to `brew install
-# libfido2`, matching what lbssousa/bluefin-initial-setup
-# (playbooks/yubikey.yml) already documents/assumes for Fedora Dakota
-# hosts — not independently verified here that ldconfig actually
-# resolves the Homebrew-provided libfido2.so for a module living in
-# /usr on THIS image; this repo's base image ships no linuxbrew
-# ld.so.conf.d entry out of the box (checked directly), so that must
-# come from whatever installs Homebrew on the running host. Re-verify
-# before relying on this at login/sudo time.
+# path). Its runtime dependency, libfido2 (with libcbor, the fido2-*
+# tools and systemd's 60-fido-id.rules for hidraw access), already
+# ships in the Dakota base under /usr/lib/x86_64-linux-gnu, so no
+# Homebrew copy is needed; the final stage fails the build if
+# pam_u2f.so/pamu2fcfg stop resolving it there.
 ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
@@ -486,9 +482,9 @@ RUN libdir="$(cat /libfprint-libdir)" && \
 # this task's scope (libraries + executables only).
 #
 # libfido2-devel is a BUILD-time only dependency here (needed to link
-# pam_u2f.so/pamu2fcfg against libfido2's headers/.so) — the runtime
-# libfido2.so itself is deliberately not copied into the final image;
-# see the PAM_U2F_REPO/REF comment near the top of this file for why.
+# pam_u2f.so/pamu2fcfg against libfido2's headers/.so) — at runtime
+# they load the base's own libfido2.so.1, so nothing of Fedora's is
+# copied into the final image.
 #
 # pam_u2f.so is installed into the exact directory pam-u2f-probe found
 # (-DPAM_DIR), same reasoning as libfprint-builder's --libdir above.
@@ -850,5 +846,20 @@ RUN kver="$(cat /kernel-version)" && \
     depmod -a "$kver" && \
     ldconfig -r / && \
     rm -f /kernel-version
+
+# YubiKey FIDO2/U2F: pam_u2f.so and pamu2fcfg rely on the base's
+# libfido2 (see the PAM_U2F_REPO comment at the top), as do
+# ssh-sk-helper and the fido2-token/-cred/-assert tools. Fail here if a
+# base bump drops it or changes its soname, instead of shipping a PAM
+# module that can't load at login/sudo time.
+RUN set -eux; \
+    pam_u2f="$(find /usr/lib* -name 'pam_u2f.so' -print -quit)"; \
+    test -n "${pam_u2f}"; \
+    for f in "${pam_u2f}" /usr/bin/pamu2fcfg /usr/libexec/ssh-sk-helper; do \
+        ldd "$f" | grep -q 'libfido2\.so\.1 => /usr/'; \
+        if ldd "$f" | grep -q 'not found'; then ldd "$f" >&2; exit 1; fi; \
+    done; \
+    command -v fido2-token; \
+    test -f /usr/lib/udev/rules.d/60-fido-id.rules
 
 RUN bootc container lint

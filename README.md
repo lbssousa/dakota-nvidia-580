@@ -30,11 +30,12 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   needed to authenticate with a YubiKey over FIDO2/U2F. Neither can
   come from Homebrew: PAM modules must live in the system's PAM module
   directory (found by `pam-u2f-probe`, same trick as `libfprint-probe`
-  below) to be loadable by `gdm`/`sudo`/`su` at all. Its own runtime
-  dependency, `libfido2`, is deliberately **not** baked in here — it's
-  left to `brew install libfido2`, matching what
-  [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
-  (`playbooks/yubikey.yml`) already documents for Fedora Dakota hosts.
+  below) to be loadable by `gdm`/`sudo`/`su` at all. Its runtime
+  dependency, `libfido2` (plus `libcbor`, the `fido2-token`/`-cred`/
+  `-assert` tools and systemd's `60-fido-id.rules`, which grants the
+  logged-in user access to the key's hidraw node), already ships in the
+  Dakota base, so no `brew install libfido2` is needed; the build fails
+  if that ever stops being true.
   Actually wiring `pam_u2f.so` into `/etc/pam.d` (enabling YubiKey PAM
   auth) is **out of scope for this image** — this repo only ensures
   the library and executable exist; see
@@ -664,13 +665,14 @@ existing PAM modules.
 `pam_u2f.so`/`pamu2fcfg` are built directly against Fedora's
 `libfido2-devel` (build-time only — nothing from that dnf install
 lands in `/out`/the final image). At runtime, their only dependency
-not already present in the Dakota base image (confirmed: `libpam.so.0`
-and `libcrypto.so.3` both are) is `libfido2.so.1` itself, which this
-repo deliberately does **not** bake in — see the `PAM_U2F_REPO`/`REF`
-comment in the `Containerfile` and ["Known
-limitations"](#known-limitations) below for why that's left to
-`brew install libfido2`, and why that hasn't been independently
-verified to actually resolve at runtime for a module living in `/usr`.
+are `libpam.so.0`, `libcrypto.so.3` and `libfido2.so.1`, all of which
+the Dakota base already ships in `/usr/lib/x86_64-linux-gnu` (its
+`libfido2` is 1.17.0, the same soname Fedora's `libfido2-devel` links
+against). The final stage checks with `ldd` that `pam_u2f.so`,
+`pamu2fcfg` and `ssh-sk-helper` resolve it there, and that
+`fido2-token` and `60-fido-id.rules` are present, so a base bump that
+drops or renames any of them fails the build instead of producing an
+image whose YubiKey PAM module can't load.
 
 ## Making the YubiKey visible to GnuPG at boot
 
@@ -1324,14 +1326,6 @@ reconstructs itself from upstream source + the image's own shipped
   userspace libraries are
   installed"](#how-the-nvidia-userspace-libraries-are-installed).
 - **libfprint overwrite ABI assumption** — see the section above.
-- **pam-u2f's runtime dependency on a Homebrew-provided `libfido2` is
-  unverified** — see ["How pam-u2f is
-  installed"](#how-pam-u2f-is-installed). This image's base ships no
-  `linuxbrew` entry in `/etc/ld.so.conf.d` out of the box (checked
-  directly), so whether `pam_u2f.so`/`pamu2fcfg` can actually resolve
-  `libfido2.so.1` at runtime depends entirely on how Homebrew itself
-  gets installed/registered on the running host. Re-verify with `ldd`
-  against the real host before relying on this for login/`sudo`.
 - **PKCS#11 smartcard login in GUI programs is switched off** — the
   `enable-in` whitelist described in ["Making the YubiKey visible to
   GnuPG at boot"](#making-the-yubikey-visible-to-gnupg-at-boot) keeps
