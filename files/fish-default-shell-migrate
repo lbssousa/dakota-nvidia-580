@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+# Moves every existing regular account still on bash over to fish, the
+# image's default login shell (see /etc/default/useradd). Runs once per
+# machine: the marker below is written on success, so anyone who later
+# goes back to bash with chsh is left alone on every boot after that.
+set -euo pipefail
+
+marker=/var/lib/dakota-nvidia-580/fish-default-shell-migrated
+fish=/usr/bin/fish
+
+[ -e "$marker" ] && exit 0
+
+while IFS=: read -r name _ uid _ _ _ shell; do
+    [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || continue
+    case "$shell" in
+        /bin/bash|/usr/bin/bash)
+            echo "Switching ${name}'s login shell from ${shell} to ${fish}"
+            usermod -s "$fish" "$name"
+            ;;
+    esac
+done < /etc/passwd
+
+mkdir -p "$(dirname "$marker")"
+touch "$marker"

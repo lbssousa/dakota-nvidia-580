@@ -1,0 +1,15 @@
+# /etc/default/useradd — shipped by dakota-nvidia-580.
+#
+# Only SHELL differs from shadow's built-in defaults: new accounts
+# (useradd, and therefore AccountsService / gnome-initial-setup, which
+# call useradd without -s) get fish as their login shell. Bash stays
+# installed; `chsh -s /usr/bin/bash` switches back.
+# Existing accounts are moved over once by
+# fish-default-shell-migrate.service.
+GROUP=100
+HOME=/home
+INACTIVE=-1
+EXPIRE=
+SHELL=/usr/bin/fish
+SKEL=/etc/skel
+CREATE_MAIL_SPOOL=no

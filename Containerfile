@@ -6,8 +6,9 @@
 # branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
 # (Goodix 538d) + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
 # pamu2fcfg) + OpenSSH and GCR's ssh-agent patched for security key
-# (FIDO) PIN/touch prompts, baked in via downstream
-# OCI image layering — not via forking the upstream BuildStream build.
+# (FIDO) PIN/touch prompts + fish as the default login shell, baked in
+# via downstream OCI image layering — not via forking the upstream
+# BuildStream build.
 # See README.md for the full reasoning (why downstream instead of a
 # BuildStream fork) and known limitations.
 #
@@ -43,7 +44,7 @@ ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 # release point, so bumping this value is a deliberate, visible change.
 # Check https://github.com/lbssousa/libfprint/tags for newer releases
 # before bumping.
-ARG LIBFPRINT_REF=v1.94.10-goodix538d.2
+ARG LIBFPRINT_REF=v1.94.100-goodix538d.1
 # pam-u2f (upstream Yubico, not a fork): provides pam_u2f.so + pamu2fcfg,
 # the PAM module and enrollment CLI needed to use a YubiKey for FIDO2/U2F
 # PAM authentication — neither can come from Homebrew, since PAM modules
@@ -656,12 +657,7 @@ ARG IMAGE_TAG
 
 COPY --from=kernel-headers /kernel-version /kernel-version
 COPY --from=nvidia-builder /out/ /
-# TEMPORARILY DISABLED: the libfprint fork is not baked into the image for
-# now; it is installed at runtime via lbssousa/bluefin-initial-setup
-# (`just libfprint-dakota`). Re-enable by uncommenting the line below.
-# The libfprint-probe/libfprint-builder stages are kept: BuildKit skips
-# stages that the final image doesn't reference.
-# COPY --from=libfprint-builder /out/usr/ /usr/
+COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
 COPY --from=gcr-builder /out/usr/ /usr/
@@ -794,6 +790,54 @@ COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia.toml
 # Bluefin's desktop defaults (see the recipe for details).
 COPY files/60-custom.just /usr/share/ublue-os/just/60-custom.just
 
+# Login shells: fish (from the base) is the default for every regular
+# account; bash stays installed and both are listed in /etc/shells, so
+# `chsh` can switch either way.
+#  - /etc/default/useradd covers new accounts: AccountsService (hence
+#    gnome-initial-setup and GNOME Settings) runs useradd without -s.
+#  - fish-default-shell-migrate.service covers accounts that already
+#    exist on a machine switching to this image: once per machine, it
+#    moves those still on bash to fish (README.md, "Default shell").
+#  - Homebrew already ships its fish hook in the base
+#    (vendor_conf.d/ublue-brew.fish); the build checks it is still there.
+# Enabled by a /usr symlink, not a preset — see the NVIDIA units above.
+COPY files/useradd-defaults /etc/default/useradd
+COPY files/fish-default-shell-migrate /usr/libexec/fish-default-shell-migrate
+COPY files/fish-default-shell-migrate.service /usr/lib/systemd/system/fish-default-shell-migrate.service
+# The base defines `caffeinate` (hold off sleep, like macOS) only in
+# /etc/profile.d/caffeinate.sh, which fish never reads; this is the same
+# function for fish. Drop it if projectbluefin/common ships its own.
+COPY files/caffeinate.fish /usr/share/fish/vendor_functions.d/caffeinate.fish
+RUN set -eux; \
+    for sh in /usr/bin/bash /usr/bin/fish; do \
+        test -x "$sh"; \
+        grep -qx "$sh" /etc/shells || echo "$sh" >> /etc/shells; \
+    done; \
+    ln -s ../fish-default-shell-migrate.service \
+        /usr/lib/systemd/system/multi-user.target.wants/; \
+    useradd -D | grep -qx 'SHELL=/usr/bin/fish'; \
+    command -v usermod; \
+    test -f /usr/share/fish/vendor_conf.d/ublue-brew.fish
+
+# `ujust bluefin-cli` (Dakota's system.just) runs ublue-bling, which
+# appends a `source .../bling.fish` block to ~/.config/fish/config.fish
+# when $SHELL is fish — but never creates that directory, so it fails
+# with "No such file or directory" for anyone whose fish hasn't run yet.
+# Bash never hits this (~/.bashrc lives in $HOME itself). Otherwise
+# bling.fish matches bling.sh: the same aliases (as abbreviations), and
+# direnv/starship/zoxide/mise hooks, with `open` covered by fish's own
+# function. Fixed in place with a mkdir before the append; the build
+# fails if ublue-bling changes so that the sed no longer applies (drop
+# this then, if upstream fixed it). Upstream:
+# projectbluefin/common, system_files/shared/usr/bin/ublue-bling.
+RUN set -eux; \
+    f=/usr/bin/ublue-bling; \
+    grep -q '^    cat<<EOF >> "${TARGET_CONFIG_FILE}"$' "$f"; \
+    sed -i 's|^    cat<<EOF >> "${TARGET_CONFIG_FILE}"$|    mkdir -p "$(dirname "${TARGET_CONFIG_FILE}")"\n&|' "$f"; \
+    grep -q '^    mkdir -p "$(dirname "${TARGET_CONFIG_FILE}")"$' "$f"; \
+    grep -q 'BLING_SCRIPT_SOURCE="bling.fish"' "$f"; \
+    test -f /usr/share/ublue-os/bling/bling.fish
+
 # Rewrite this downstream image's identity into /etc/os-release,
 # overwriting the upstream Dakota base's own IMAGE_NAME/IMAGE_VENDOR/
 # IMAGE_TAG/IMAGE_REF fields (a Universal Blue os-release convention;
@@ -861,5 +905,22 @@ RUN set -eux; \
     done; \
     command -v fido2-token; \
     test -f /usr/lib/udev/rules.d/60-fido-id.rules
+
+# libfprint fork: fprintd must load OUR libfprint-2.so.2, from the
+# libdir libfprint-probe found (i.e. the copy that overwrote the stock
+# one, carrying the fork-only goodixtls53xd driver), with everything it
+# needs resolving in the base. Catches a fork bump that changes the
+# soname or picks up a dependency the base lacks.
+COPY --from=libfprint-probe /libfprint-libdir /libfprint-libdir
+RUN set -eux; \
+    libdir="$(cat /libfprint-libdir)"; \
+    fprintd="$(command -v fprintd || find /usr/libexec /usr/lib* -name fprintd -type f -print -quit)"; \
+    test -n "${fprintd}"; \
+    ldd "${fprintd}" | grep -q "libfprint-2\.so\.2 => ${libdir}/"; \
+    for f in "${fprintd}" "${libdir}/libfprint-2.so.2"; do \
+        if ldd "$f" | grep -q 'not found'; then ldd "$f" >&2; exit 1; fi; \
+    done; \
+    grep -q goodixtls53xd "${libdir}/libfprint-2.so.2"; \
+    rm -f /libfprint-libdir
 
 RUN bootc container lint

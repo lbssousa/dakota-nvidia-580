@@ -11,7 +11,7 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   the official `dakota-nvidia`/`dakota-nvidia-gaming` variants, which
   track the newer branch (~610.x/615.x as of 2026).
 - **[lbssousa/libfprint](https://github.com/lbssousa/libfprint) fork**
-  (pinned to tag `v1.94.10-goodix538d.2`), adding support for the
+  (pinned to tag `v1.94.100-goodix538d.1`), adding support for the
   Goodix 538d fingerprint reader — the same fork used in
   [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
   (`playbooks/dakota/libfprint.yml`), which installs it at **runtime**
@@ -104,6 +104,10 @@ BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
   `--without-jpegxl` because the builder's libjxl (0.11) is older than the
   base's (0.12), so JPEG XL input images are not converted by the image
   filters. Drop the stage once the base carries both fixes.
+- **fish as the default login shell, with bash kept** — both come from
+  the Dakota base. New accounts get fish through `/etc/default/useradd`;
+  existing ones are switched once per machine. See ["Default
+  shell"](#default-shell).
 
 Like the upstream project, this repo builds two variants from the same
 `Containerfile`, published under three tags each — the same
@@ -551,6 +555,7 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
         COPY of the /out trees (libfprint's overwrites the
         stock library in place; pam-u2f's adds new files alongside
         it; openssh's and gcr's overwrite the stock executables),
+        fish as default shell (see "Default shell"),
         nouveau blacklist, p11-kit OpenSC whitelist (see
         "Making the YubiKey visible to GnuPG at boot"),
         depmod + ldconfig -r, signing policy (scripts/configure-signing-policy.sh —
@@ -1071,6 +1076,39 @@ ujust gnome-pure-toggle bluefin   # back to Bluefin's defaults
   skipped.
 - Both directions overwrite the user's own values for those keys.
 
+## Default shell
+
+fish is every regular account's login shell; bash stays installed and
+both are listed in `/etc/shells`, so `chsh -s /usr/bin/bash` switches
+back at any time.
+
+- **New accounts** — `/etc/default/useradd` (`files/useradd-defaults`)
+  sets `SHELL=/usr/bin/fish`. AccountsService, which gnome-initial-setup
+  and GNOME Settings go through, runs `useradd` without `-s`, so this
+  covers them. The build fails if `useradd -D` doesn't report it.
+- **Existing accounts** — `fish-default-shell-migrate.service` runs
+  once per machine, before user sessions start. It moves every account
+  with UID 1000–59999 still on `/bin/bash` or `/usr/bin/bash` to fish,
+  then writes `/var/lib/dakota-nvidia-580/fish-default-shell-migrated`.
+  Because of that marker, someone who later goes back to bash with
+  `chsh` stays on bash. Delete the marker to run it again.
+- **Environment** — Homebrew's fish hook ships in the base
+  (`/usr/share/fish/vendor_conf.d/ublue-brew.fish`, which the build
+  checks for), so `brew` is on PATH in fish as in bash.
+- **`caffeinate`** — the base defines it (keep the machine awake, like
+  macOS) only in `/etc/profile.d/caffeinate.sh`, which fish doesn't
+  read. The image adds the same function for fish in
+  `/usr/share/fish/vendor_functions.d/caffeinate.fish`.
+- **`ujust bluefin-cli`** works the same in fish as in bash: Dakota's
+  `ublue-bling` picks `bling.fish` when `$SHELL` is fish, which gives the
+  same aliases as `bling.sh` (as abbreviations) and the same
+  direnv/starship/zoxide/mise hooks; fish's own `open` function stands in
+  for bling.sh's `open` alias. One fix is applied in place: `ublue-bling`
+  appends to `~/.config/fish/config.fish` without creating
+  `~/.config/fish/`, so it failed for anyone whose fish had never run.
+  The image adds the missing `mkdir -p`, and the build fails if upstream
+  changes the script so that this edit no longer applies.
+
 ## Why downstream instead of forking BuildStream
 
 Dakota has no `dnf`/`rpm`/`akmods` — you can't `rpm-ostree install
@@ -1430,7 +1468,8 @@ including on the kernel.
 
 A reboot is required afterwards. Validate `modprobe nvidia`,
 `nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
-`fprintd-verify`) before considering the
+`fprintd-verify`) and the login shell (`getent passwd $USER` ends in
+`/usr/bin/fish`) before considering the
 migration done — and keep a way back (`bootc switch` to the original
 `dakota:stable`/`dakota-gaming:stable` image) until you've validated
 it on real hardware.
