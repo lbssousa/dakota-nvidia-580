@@ -1,0 +1,13 @@
+[Unit]
+Description=Switch existing users' login shell from bash to fish (once)
+Documentation=file:///usr/libexec/fish-default-shell-migrate
+ConditionPathExists=!/var/lib/dakota-nvidia-580/fish-default-shell-migrated
+After=local-fs.target systemd-sysusers.service
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/fish-default-shell-migrate
+
+[Install]
+WantedBy=multi-user.target
