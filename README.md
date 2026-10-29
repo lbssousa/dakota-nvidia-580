@@ -1095,6 +1095,15 @@ back at any time.
 - **Environment** — Homebrew's fish hook ships in the base
   (`/usr/share/fish/vendor_conf.d/ublue-brew.fish`, which the build
   checks for), so `brew` is on PATH in fish as in bash.
+- **`ujust bluefin-cli`** works the same in fish as in bash: Dakota's
+  `ublue-bling` picks `bling.fish` when `$SHELL` is fish, which gives the
+  same aliases as `bling.sh` (as abbreviations) and the same
+  direnv/starship/zoxide/mise hooks; fish's own `open` function stands in
+  for bling.sh's `open` alias. One fix is applied in place: `ublue-bling`
+  appends to `~/.config/fish/config.fish` without creating
+  `~/.config/fish/`, so it failed for anyone whose fish had never run.
+  The image adds the missing `mkdir -p`, and the build fails if upstream
+  changes the script so that this edit no longer applies.
 
 ## Why downstream instead of forking BuildStream
 

@@ -815,6 +815,25 @@ RUN set -eux; \
     command -v usermod; \
     test -f /usr/share/fish/vendor_conf.d/ublue-brew.fish
 
+# `ujust bluefin-cli` (Dakota's system.just) runs ublue-bling, which
+# appends a `source .../bling.fish` block to ~/.config/fish/config.fish
+# when $SHELL is fish — but never creates that directory, so it fails
+# with "No such file or directory" for anyone whose fish hasn't run yet.
+# Bash never hits this (~/.bashrc lives in $HOME itself). Otherwise
+# bling.fish matches bling.sh: the same aliases (as abbreviations), and
+# direnv/starship/zoxide/mise hooks, with `open` covered by fish's own
+# function. Fixed in place with a mkdir before the append; the build
+# fails if ublue-bling changes so that the sed no longer applies (drop
+# this then, if upstream fixed it). Upstream:
+# projectbluefin/common, system_files/shared/usr/bin/ublue-bling.
+RUN set -eux; \
+    f=/usr/bin/ublue-bling; \
+    grep -q '^    cat<<EOF >> "${TARGET_CONFIG_FILE}"$' "$f"; \
+    sed -i 's|^    cat<<EOF >> "${TARGET_CONFIG_FILE}"$|    mkdir -p "$(dirname "${TARGET_CONFIG_FILE}")"\n&|' "$f"; \
+    grep -q '^    mkdir -p "$(dirname "${TARGET_CONFIG_FILE}")"$' "$f"; \
+    grep -q 'BLING_SCRIPT_SOURCE="bling.fish"' "$f"; \
+    test -f /usr/share/ublue-os/bling/bling.fish
+
 # Rewrite this downstream image's identity into /etc/os-release,
 # overwriting the upstream Dakota base's own IMAGE_NAME/IMAGE_VENDOR/
 # IMAGE_TAG/IMAGE_REF fields (a Universal Blue os-release convention;
