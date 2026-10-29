@@ -320,8 +320,10 @@ failure mode that makes `conftest.sh` pick the wrong API:
 - A `__kcrctab` section anywhere means `CONFIG_MODVERSIONS=y`, where real
   CRCs matter and cannot be derived. The generator refuses rather than
   emit zeros that would make every module unloadable.
-- Compressed modules (`.ko.xz`/`.ko.zst`) are a hard error too, rather
-  than being skipped.
+- Compressed modules are decompressed in memory and read like any
+  other (`.ko.zst` through Python 3.14's `compression.zstd`, plus
+  `.ko.xz`/`.ko.gz`). Signed Dakota bases ship every module
+  zstd-compressed. Any other `.ko.*` is a hard error, not skipped.
 
 One consequence to know: the assembled tree has no `vmlinux`, so kbuild
 skips BTF generation for modules built against it —

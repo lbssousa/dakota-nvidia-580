@@ -70,9 +70,16 @@ if [[ "${kver}" == *-ogc* ]]; then
     rm -rf src/.git
 else
     series="${kver%%.*}"
+    # kernel.org names a series' first release without its .0 sublevel
+    # (linux-7.3.tar.xz, not linux-7.3.0.tar.xz), though its Makefile
+    # still reports kernelrelease 7.3.0.
+    tarball="linux-${kver}"
+    if [[ "${kver}" =~ ^[0-9]+\.[0-9]+\.0$ ]]; then
+        tarball="linux-${kver%.0}"
+    fi
     echo "==> ${kver} looks like a plain upstream release; downloading vanilla kernel.org source (series ${series}.x)"
     curl -fL --retry 3 --retry-delay 5 -o linux.tar.xz \
-        "https://cdn.kernel.org/pub/linux/kernel/v${series}.x/linux-${kver}.tar.xz"
+        "https://cdn.kernel.org/pub/linux/kernel/v${series}.x/${tarball}.tar.xz"
     mkdir src
     tar -xf linux.tar.xz -C src --strip-components=1
 fi
