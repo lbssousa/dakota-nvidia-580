@@ -59,7 +59,7 @@ ARG PAM_U2F_REPO=https://github.com/Yubico/pam-u2f.git
 ARG PAM_U2F_REF=pam_u2f-1.4.0
 
 # OpenSSH, rebuilt with files/openssh-askpass-notify.patch. The base
-# image's ssh is plain upstream 10.5p1; the patch makes notify_start()
+# image's ssh is plain upstream 10.6p1; the patch makes notify_start()
 # (the "Confirm user presence for key ..." request for FIDO keys) honour
 # SSH_ASKPASS_REQUIRE the way read_passphrase() already does, so with
 # SSH_ASKPASS_REQUIRE=prefer the touch request goes to the askpass dialog
@@ -68,8 +68,8 @@ ARG PAM_U2F_REF=pam_u2f-1.4.0
 # base image's: openssh-probe fails the build when it doesn't, so a base
 # bump that moves to a new OpenSSH needs this pin (and the checksum)
 # bumped with it rather than silently downgrading ssh.
-ARG OPENSSH_VERSION=10.5p1
-ARG OPENSSH_SHA256=d44d28a839ea9daf969cc69150fde59910b2b39361dad81a3bd6cbd19218db11
+ARG OPENSSH_VERSION=10.6p1
+ARG OPENSSH_SHA256=a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39
 
 # GCR's ssh-agent wrapper (gcr-ssh-agent) and askpass (gcr4-ssh-askpass),
 # rebuilt with files/gcr-ssh-agent-fido-prompts.patch so FIDO ("sk") keys
@@ -146,8 +146,8 @@ ARG IMAGE_TAG=testing
 # Containerfile changes needed. Keeping both pins here, not only in
 # the workflow, gives Renovate a single place to bump digests in.
 # ---------------------------------------------------------------------
-ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:testing@sha256:110fdf396bd1a11d5665616c86e5b86a1513c389d617a423eb0f4a446b6b87df
-ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:c3f06bbb395d46bf97c500b4d4a5ea7a8c634e235541012f5741e429cfd74f10
+ARG BASE_IMAGE=ghcr.io/projectbluefin/dakota:testing@sha256:f0220d0cb68d5628de4101c620202a630739733c315b246ff849c54978835933
+ARG BASE_IMAGE_GAMING=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:eaba6dc03f30db9122e5aa4e2f32d6bc3e8e725e518786f9baf48114a9828fa3
 # ^ resolved via (re-run before every build — these drift):
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota:testing | jq -r .Digest
 #   skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Digest
@@ -440,6 +440,32 @@ COPY scripts/build-nvidia.sh /build-nvidia.sh
 RUN chmod +x /build-nvidia.sh && /build-nvidia.sh "${NVIDIA_VERSION}" /kernel-src /out "$(cat /nvidia-libdir)"
 
 # ---------------------------------------------------------------------
+# nvidia-signer — signs the modules nvidia-builder packaged with this
+# repo's module signing key, which users enroll as a MOK. Required, not
+# optional: the Dakota base boots with lockdown=integrity even with
+# Secure Boot off, and lockdown refuses unsigned modules. See README.md,
+# "Secure Boot and module signing".
+#
+# A stage of its own, like upstream's nvidia-signed-modules.bst, so the
+# slow driver build stays cached however the key changes. The key is a
+# build secret: mounted for this one RUN, never written to a layer.
+# Builds without it fail unless ALLOW_UNSIGNED_MODULES=1 (local tests
+# only; CI never sets it).
+# ---------------------------------------------------------------------
+FROM fedora:44 AS nvidia-signer
+ARG ALLOW_UNSIGNED_MODULES=0
+RUN dnf install -y openssl kmod && dnf clean all
+COPY --from=nvidia-builder /out/ /out/
+COPY --from=kernel-src-builder /out/ /kernel-src/
+COPY --from=kernel-headers /kernel-version /kernel-version
+COPY files/secure-boot/module-signing.crt /module-signing.crt
+COPY scripts/sign-modules.sh /sign-modules.sh
+RUN --mount=type=secret,id=module_signing_key,required=false \
+    chmod +x /sign-modules.sh && \
+    ALLOW_UNSIGNED_MODULES="${ALLOW_UNSIGNED_MODULES}" /sign-modules.sh \
+        /out /kernel-src /module-signing.crt /run/secrets/module_signing_key
+
+# ---------------------------------------------------------------------
 # libfprint-builder — same fork/ref used in
 # lbssousa/bluefin-initial-setup (playbooks/dakota/libfprint.yml,
 # dakota_libfprint_repo/_ref vars in group_vars/all/dakota.yml), which
@@ -656,7 +682,7 @@ ARG IMAGE_VENDOR
 ARG IMAGE_TAG
 
 COPY --from=kernel-headers /kernel-version /kernel-version
-COPY --from=nvidia-builder /out/ /
+COPY --from=nvidia-signer /out/ /
 COPY --from=libfprint-builder /out/usr/ /usr/
 COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
@@ -879,6 +905,27 @@ COPY scripts/configure-signing-policy.sh /configure-signing-policy.sh
 RUN chmod +x /configure-signing-policy.sh && \
     /configure-signing-policy.sh /cosign.pub && \
     rm -f /cosign.pub /configure-signing-policy.sh
+
+# Secure Boot / lockdown: the NVIDIA modules only load once our
+# certificate is enrolled as a MOK, and enrollment rides on the base's
+# own shim chain (`ujust enroll-nvidia-secure-boot-key` runs Dakota's
+# dakota-secure-boot first). Fail if a base bump drops any of that, or
+# if a module reached this stage unsigned without ALLOW_UNSIGNED_MODULES.
+# See README.md, "Secure Boot and module signing".
+ARG ALLOW_UNSIGNED_MODULES=0
+RUN set -eux; \
+    test -x /usr/libexec/dakota-secure-boot; \
+    test -f /usr/lib/dakota/secure-boot/shimx64.efi; \
+    command -v mokutil; \
+    test -f /usr/lib/dakota-nvidia-580/secure-boot/module-signing.der; \
+    [ "${ALLOW_UNSIGNED_MODULES}" = 1 ] && exit 0; \
+    kver="$(cat /kernel-version)"; \
+    signer="$(openssl x509 -inform DER -noout -subject -nameopt multiline \
+        -in /usr/lib/dakota-nvidia-580/secure-boot/module-signing.der \
+        | sed -n 's/^ *commonName *= *//p')"; \
+    for ko in /usr/lib/modules/"$kver"/extra/nvidia*.ko; do \
+        [ "$(modinfo -F signer "$ko")" = "$signer" ]; \
+    done
 
 # Post-install steps. depmod is our own addition (specific to having
 # added an out-of-tree kernel module); ldconfig -r is the same step

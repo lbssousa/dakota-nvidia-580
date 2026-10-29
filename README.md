@@ -186,8 +186,11 @@ limitations"](#known-limitations) below:
   matter (the `goodixtls53xd` SIGFM matcher), not something this
   image-build repo's `Containerfile` controls — it only bundles that
   fork's build output.
-- Secure Boot / module signing for the out-of-tree NVIDIA kmod hasn't
-  been exercised.
+- Module signing (see ["Secure Boot and module
+  signing"](#secure-boot-and-module-signing)) has been checked at build
+  time only: that the modules carry our signature. Whether the kernel
+  takes our MOK and loads them under `lockdown=integrity` hasn't been
+  tried on real hardware yet.
 
 ## Why `/usr/lib/modules/<kver>/build` is missing (and how this repo works around it)
 
@@ -514,6 +517,12 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
   │                 (scripts/module-abi.py verify), runs nvidia-installer
   │                 --no-kernel-module, and packages the result via a
   │                 filesystem diff (scripts/build-nvidia.sh)
+  │                 │
+  │                 └─→ nvidia-signer   (Fedora, build environment only)
+  │                       signs the .ko files with this repo's module
+  │                       signing key (a build secret) and adds its
+  │                       certificate as DER (scripts/sign-modules.sh —
+  │                       see "Secure Boot and module signing")
   │
   ├─→ libfprint-probe         locates libfprint-2.so's exact libdir
   │     │                     in the Dakota base image
@@ -560,11 +569,12 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
         fish as default shell (see "Default shell"),
         nouveau blacklist, p11-kit OpenSC whitelist (see
         "Making the YubiKey visible to GnuPG at boot"),
-        depmod + ldconfig -r, signing policy (scripts/configure-signing-policy.sh —
+        checks the modules are signed and the base still ships
+        Dakota's shim chain, depmod + ldconfig -r, signing policy (scripts/configure-signing-policy.sh —
         see "Verification"), bootc container lint
 ```
 
-The `kernel-src-builder`, `nvidia-builder`, `libfprint-builder`,
+The `kernel-src-builder`, `nvidia-builder`, `nvidia-signer`, `libfprint-builder`,
 `pam-u2f-builder`, `openssh-builder` and `gcr-builder` stages use
 Fedora **only as a
 build environment** (it has `dnf`, `gcc`, `meson`, `cmake`,
@@ -1111,6 +1121,82 @@ back at any time.
   The image adds the missing `mkdir -p`, and the build fails if upstream
   changes the script so that this edit no longer applies.
 
+## Secure Boot and module signing
+
+Since [projectbluefin/dakota#1781](https://github.com/projectbluefin/dakota/pull/1781)
+(October 2026) upstream publishes signed images. They ship Fedora's
+Microsoft-signed shim, systemd-boot and the kernel signed with Dakota's
+key, and a kernel that has that key built in and enforces module
+signatures. They also boot with **`lockdown=integrity`** (from
+`/usr/lib/bootc/kargs.d/20-lockdown.toml`) **whether or not Secure Boot
+is on**. In integrity mode the kernel refuses every module it can't
+verify. Upstream's own NVIDIA modules are signed with Dakota's key in
+its CI. Ours are built here, and Dakota's private key never leaves
+upstream's CI, so the NVIDIA 580 modules need a key of their own that
+the kernel trusts:
+
+- **Signing at build time.** The `nvidia-signer` stage signs every
+  `.ko` with this repo's key (`sign-file sha512`, the only hash Dakota's
+  kernel accepts). It uses `scripts/sign-file` from the reconstructed
+  kernel tree. It's a separate stage so the slow driver build stays
+  cached. The private key is a BuildKit secret (`--secret
+  id=module_signing_key,...`), mounted only for that `RUN` and never
+  written to a layer. In CI it comes from the `MODULE_SIGNING_KEY`
+  repository secret. Without it the build fails, except on pull requests
+  that can't see secrets (forks), which build unsigned only to validate
+  and never push. The final stage checks that every `nvidia*.ko` names
+  our certificate as its signer.
+- **Trust at boot.** The certificate
+  (`files/secure-boot/module-signing.crt`, shipped as
+  `/usr/lib/dakota-nvidia-580/secure-boot/module-signing.der`) has to be
+  enrolled as a **MOK**. Shim passes enrolled MOKs to the kernel's
+  `.machine` keyring (`CONFIG_INTEGRITY_MACHINE_KEYRING`, enabled in
+  Dakota's kernel), which module verification trusts. This only works
+  when the machine boots **through shim**, so the chain that
+  `dakota-secure-boot` installs is needed even with Secure Boot off.
+- **Enrolling: `ujust enroll-nvidia-secure-boot-key`.** It first runs
+  Dakota's own `dakota-secure-boot enroll` (the same thing as
+  `ujust enroll-secure-boot-key`: shim chain on the ESP, firmware boot
+  entry, Dakota's key queued, TPM disk unlock kept working), then queues
+  our key with the same password. On the next boot a single MokManager
+  visit enrolls both keys: **Enroll MOK → Continue → Yes → password
+  `dakota` → Reboot**. After that, turning Secure Boot on in the
+  firmware is optional for the NVIDIA modules.
+  `ujust nvidia-secure-boot-status` shows whether the key is enrolled,
+  whether the kernel loaded it, and whether `nvidia` is loaded.
+- **Easy Anti-Cheat.** `ujust check-anticheat` reports our key under
+  "Only well-known Machine Owner Keys" as not well-known. That's the
+  price of a custom kmod: EAC's list only has distribution keys.
+
+### First boot after moving to a signed base
+
+Until the key is enrolled, the NVIDIA modules don't load. Because
+`nvidia-kargs.toml` disables simpledrm, the screen can stay **black**,
+TTYs included. So the first time a machine moves to an image built on
+a signed base (from an older `dakota-nvidia-580` or from stock Dakota):
+
+1. Boot it. If the screen comes up (or over SSH), run
+   `ujust enroll-nvidia-secure-boot-key` and reboot into MokManager.
+2. If the screen stays black, reboot and pick the previous deployment
+   in the systemd-boot menu. There, edit the new deployment's entry in
+   `/boot/loader/entries/` (the `options` line, as `ujust kargs`
+   explains) and remove `lockdown=integrity`. Boot the new deployment:
+   unsigned-module checks are no longer enforced and nvidia loads. Run
+   step 1. The removal only lasts for that deployment, since the next
+   `bootc upgrade` writes the karg back, and by then the key is
+   enrolled.
+
+### Rotating the key
+
+`scripts/module-signing-keygen.sh <private-key-path>` creates a new
+pair. It writes the certificate to `files/secure-boot/module-signing.crt`
+and refuses to overwrite one. Put the key in the secret with `gh secret
+set MODULE_SIGNING_KEY < <private-key-path>` and keep an offline backup.
+Losing the key means every machine has to enroll a new one. A leaked
+key lets anyone build modules those machines will load (`mokutil
+--delete` the old certificate after rotating). A machine must enroll
+the new certificate **before** it boots an image signed with it.
+
 ## Why downstream instead of forking BuildStream
 
 Dakota has no `dnf`/`rpm`/`akmods` — you can't `rpm-ostree install
@@ -1297,17 +1383,16 @@ reconstructs itself from upstream source + the image's own shipped
   unlikely to affect the reconstructed headers/scripts/objtool this
   repo actually needs — but this is a deliberate fidelity gap, not a
   verified equivalence.
-- **Gaming variant: `CONFIG_MODULE_SIG_ALL=y`** (standard variant has
-  `CONFIG_MODULE_SIG` unset). If the real machine has Secure Boot
-  enabled and kernel lockdown active, this makes it *more* likely an
-  unsigned out-of-tree module gets rejected at load time on `-gaming`
-  specifically, on top of the general Secure Boot risk below.
-- **Secure Boot / module signing** — Dakota uses a UKI
-  (`systemd-boot` + unified kernel image). An unsigned out-of-tree
-  module can be rejected at boot under kernel lockdown with Secure
-  Boot enabled. If `modprobe nvidia` fails silently on first boot,
-  start here (disable Secure Boot, or set up MOK enrollment + module
-  signing in the build). Not tested in this repo yet.
+- **Module signing / lockdown, untested on hardware.** Both variants
+  now boot with `CONFIG_MODULE_SIG` and `lockdown=integrity`, and the
+  modules are signed with our own key (see ["Secure Boot and module
+  signing"](#secure-boot-and-module-signing)). The build proves the
+  signature is there. It doesn't prove the kernel trusts the MOK: that
+  needs shim to export `MokListTrustedRT`, which shim ≥ 15.6 does by
+  default (`sudo mokutil --trust-mok` otherwise). Shim also has to pass
+  MokList on when Secure Boot is off. If `nvidia` doesn't load, run
+  `ujust nvidia-secure-boot-status` and
+  `journalctl -k -b | grep -i -e 'X.509' -e lockdown -e nvidia`.
 - **nouveau blacklist alone is not enough** —
   `files/nvidia-blacklist-nouveau.conf` doesn't stop nouveau from
   claiming the GPU, since it binds the PCI device during the
@@ -1413,12 +1498,18 @@ skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Di
 ./scripts/check-kernel-headers.sh testing dakota-gaming
 
 # 3. Build the standard variant (uses the Containerfile's BASE_IMAGE
-#    default, no override needed):
-podman build --file Containerfile --tag localhost/dakota-nvidia-580:dev .
+#    default, no override needed). The NVIDIA modules are signed with
+#    the module signing key (see "Secure Boot and module signing"):
+podman build --file Containerfile \
+  --secret id=module_signing_key,src=/path/to/module-signing.key \
+  --tag localhost/dakota-nvidia-580:dev .
+#    Without the key, add --build-arg ALLOW_UNSIGNED_MODULES=1 instead:
+#    the build succeeds, but those modules won't load on Dakota.
 
 #    ...or the gaming variant (override BASE_IMAGE with the pinned
 #    BASE_IMAGE_GAMING value from the Containerfile):
 podman build --file Containerfile \
+  --secret id=module_signing_key,src=/path/to/module-signing.key \
   --build-arg BASE_IMAGE=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:<digest> \
   --tag localhost/dakota-nvidia-580-gaming:dev .
 
@@ -1427,6 +1518,7 @@ podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-drm
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-uvm
 podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-modeset
+podman run --rm localhost/dakota-nvidia-580:dev modinfo -F signer nvidia
 podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
 
 # The built image contains both the kernel's vmlinux and the modules, so
@@ -1468,7 +1560,10 @@ and `:next` (nightly, upstream GNOME master base) if you want the
 bleeding edge — but expect `:next` to be visibly ahead of `:testing`,
 including on the kernel.
 
-A reboot is required afterwards. Validate `modprobe nvidia`,
+A reboot is required afterwards. The NVIDIA modules only load once
+this image's key is enrolled as a MOK; on a black first boot, see
+["First boot after moving to a signed
+base"](#first-boot-after-moving-to-a-signed-base). Validate `modprobe nvidia`,
 `nvidia-smi`, the fingerprint reader (`fprintd-list $USER`,
 `fprintd-verify`) and the login shell (`getent passwd $USER` ends in
 `/usr/bin/fish`) before considering the
@@ -1510,7 +1605,9 @@ cosign verify-attestation --key cosign.pub --type spdxjson --insecure-ignore-tlo
 The signing key itself is never committed — CI holds it as the
 `SIGNING_SECRET` (private key) and `COSIGN_PASSWORD` (its passphrase)
 repository secrets, set once with `cosign generate-key-pair` +
-`gh secret set`.
+`gh secret set`. The kernel module signing key is a different key, held
+as `MODULE_SIGNING_KEY` (see ["Secure Boot and module
+signing"](#secure-boot-and-module-signing)).
 
 ## CI and automatic updates
 
