@@ -804,6 +804,10 @@ COPY files/60-custom.just /usr/share/ublue-os/just/60-custom.just
 COPY files/useradd-defaults /etc/default/useradd
 COPY files/fish-default-shell-migrate /usr/libexec/fish-default-shell-migrate
 COPY files/fish-default-shell-migrate.service /usr/lib/systemd/system/fish-default-shell-migrate.service
+# The base defines `caffeinate` (hold off sleep, like macOS) only in
+# /etc/profile.d/caffeinate.sh, which fish never reads; this is the same
+# function for fish. Drop it if projectbluefin/common ships its own.
+COPY files/caffeinate.fish /usr/share/fish/vendor_functions.d/caffeinate.fish
 RUN set -eux; \
     for sh in /usr/bin/bash /usr/bin/fish; do \
         test -x "$sh"; \

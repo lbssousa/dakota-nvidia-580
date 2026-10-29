@@ -1095,6 +1095,10 @@ back at any time.
 - **Environment** — Homebrew's fish hook ships in the base
   (`/usr/share/fish/vendor_conf.d/ublue-brew.fish`, which the build
   checks for), so `brew` is on PATH in fish as in bash.
+- **`caffeinate`** — the base defines it (keep the machine awake, like
+  macOS) only in `/etc/profile.d/caffeinate.sh`, which fish doesn't
+  read. The image adds the same function for fish in
+  `/usr/share/fish/vendor_functions.d/caffeinate.fish`.
 - **`ujust bluefin-cli`** works the same in fish as in bash: Dakota's
   `ublue-bling` picks `bling.fish` when `$SHELL` is fish, which gives the
   same aliases as `bling.sh` (as abbreviations) and the same
