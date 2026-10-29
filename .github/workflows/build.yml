@@ -117,6 +117,27 @@ jobs:
             fi
           done
 
+      # The NVIDIA modules are signed with this repo's own key (README.md,
+      # "Secure Boot and module signing"); the Containerfile mounts it as a
+      # build secret for the nvidia-signer stage only. A pull_request run
+      # without the secret (a fork) still builds, unsigned, for validation
+      # — it never pushes. Every other run requires it.
+      - name: Write module signing key
+        env:
+          MODULE_SIGNING_KEY: ${{ secrets.MODULE_SIGNING_KEY }}
+        run: |
+          if [ -z "$MODULE_SIGNING_KEY" ]; then
+            if [ "${{ github.event_name }}" = pull_request ]; then
+              echo "::warning::MODULE_SIGNING_KEY unavailable; building UNSIGNED modules, validation only"
+              echo "ALLOW_UNSIGNED_MODULES=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "::error::MODULE_SIGNING_KEY is not configured"
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$MODULE_SIGNING_KEY" > "$RUNNER_TEMP/module-signing.key"
+
       - name: Build image (${{ matrix.variant }})
         run: |
           # IMAGE_NAME (the Containerfile ARG, not this job's env var of
@@ -131,13 +152,23 @@ jobs:
           # :stable is deliberately absent: it's a retag of an
           # already-signed :testing digest (promote-stable.yml), never a
           # build of its own, exactly as upstream does it.
+          secret=()
+          if [ -s "$RUNNER_TEMP/module-signing.key" ]; then
+            secret=(--secret "id=module_signing_key,src=$RUNNER_TEMP/module-signing.key")
+          fi
           podman build \
             --file Containerfile \
+            "${secret[@]}" \
+            --build-arg "ALLOW_UNSIGNED_MODULES=${ALLOW_UNSIGNED_MODULES:-0}" \
             --build-arg "BASE_IMAGE=${{ steps.base.outputs.base_image }}" \
             --build-arg "IMAGE_NAME=dakota-nvidia-580${{ matrix.tag_suffix }}" \
             --build-arg "IMAGE_TAG=${{ steps.stream.outputs.stream_tag }}" \
             --tag "${IMAGE_NAME}${{ matrix.tag_suffix }}:${{ steps.stream.outputs.stream_tag }}" \
             .
+
+      - name: Remove module signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/module-signing.key"
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'

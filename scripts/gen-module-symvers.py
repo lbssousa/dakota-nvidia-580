@@ -70,6 +70,9 @@
 # ---------------------------------------------------------------------
 """Derive Module.symvers from a Dakota image's own vmlinux and modules."""
 
+import gzip
+import io
+import lzma
 import os
 import struct
 import sys
@@ -149,9 +152,29 @@ def exports_from_vmlinux(path):
         return out
 
 
+def _decompress(path):
+    """A .ko.{zst,xz,gz} as an in-memory stream, None for a plain .ko.
+
+    Signed Dakota bases (projectbluefin/dakota's signed-modules.bst) ship
+    every module zstd-compressed, the way kbuild's modules_install does.
+    """
+    if path.endswith(".ko"):
+        return None
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if path.endswith(".ko.zst"):
+        from compression import zstd  # Python >= 3.14, as on Dakota
+        return io.BytesIO(zstd.decompress(data))
+    if path.endswith(".ko.xz"):
+        return io.BytesIO(lzma.decompress(data))
+    if path.endswith(".ko.gz"):
+        return io.BytesIO(gzip.decompress(data))
+    raise Unsupported(f"{path}: unknown module compression")
+
+
 def exports_from_module(path):
-    """-> [(name, gpl_only, namespace)] for one relocatable .ko."""
-    with Elf(path) as elf:
+    """-> [(name, gpl_only, namespace)] for one relocatable .ko[.zst|.xz|.gz]."""
+    with Elf(path, _decompress(path)) as elf:
         _reject_modversions(elf)
         ksym = elf.find(KSYMTAB)
         if ksym is None or ksym.size == 0:
@@ -234,7 +257,6 @@ def main(argv):
         return 1
 
     lines = []
-    compressed = []
 
     def emit(entries, modname):
         for name, gpl, ns in entries:
@@ -248,10 +270,12 @@ def main(argv):
         ko_paths = []
         for root, _dirs, files in os.walk(kernel_dir):
             for fn in files:
-                if fn.endswith(".ko"):
+                if fn.endswith((".ko", ".ko.zst", ".ko.xz", ".ko.gz")):
                     ko_paths.append(os.path.join(root, fn))
                 elif ".ko." in fn:
-                    compressed.append(os.path.join(root, fn))
+                    raise Unsupported(
+                        f"{os.path.join(root, fn)}: unknown module compression; "
+                        f"its exports would be silently missing")
         ko_paths.sort()
 
         mod_total = 0
@@ -261,17 +285,6 @@ def main(argv):
             emit(entries, module_name_for(ko, kernel_dir))
     except Unsupported as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        return 1
-
-    if compressed:
-        # depmod handles .ko.xz/.zst transparently; this reader does not, and
-        # silently skipping them would produce a Module.symvers missing
-        # exports, which is the failure mode that makes NVIDIA's conftest.sh
-        # pick the wrong API. Fail instead.
-        print(f"ERROR: {len(compressed)} compressed module(s) found, e.g. "
-              f"{compressed[0]}.", file=sys.stderr)
-        print("This script reads uncompressed .ko only; their exports would "
-              "be silently missing.", file=sys.stderr)
         return 1
 
     with open(out_path, "w") as fh:

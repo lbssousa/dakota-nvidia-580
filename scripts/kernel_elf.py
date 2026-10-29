@@ -26,9 +26,11 @@ class Sym:
 
 
 class Elf:
-    def __init__(self, path):
+    def __init__(self, path, fileobj=None):
+        # fileobj: an already-open binary stream (e.g. a decompressed
+        # .ko.zst); path is then only used in messages.
         self.path = path
-        self.f = open(path, "rb")
+        self.f = fileobj if fileobj is not None else open(path, "rb")
         ident = self.f.read(16)
         if ident[:4] != b"\x7fELF":
             raise ValueError(f"{path}: not an ELF file")
